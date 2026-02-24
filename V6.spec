@@ -15,6 +15,8 @@ a = Analysis(
         ('dji_mimo.apk', '.'),
         ('filemanager.apk', '.'),
         ('Tasker.apk', '.'),
+        ('locale_changer.dex', '.'),
+        ('account_remover.dex', '.'),
     ],
     hiddenimports=[],
     hookspath=[],
