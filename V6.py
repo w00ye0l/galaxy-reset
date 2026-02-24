@@ -99,28 +99,41 @@ def select_language():
 
 
 def set_device_language(serial, locale):
-    """ADB를 통해 기기 언어를 변경합니다."""
+    """ADB를 통해 기기 언어를 변경합니다 (비루트 호환)."""
     if not locale:
         return
     logging.info('[%s] 언어 설정 변경: %s', serial, locale)
 
-    # persist.sys.locale 변경 (시스템 로케일)
-    run_command([
+    # Step 1: cmd locale (Android 13+, S23/S24/S25 모두 해당)
+    result = run_command([
         'adb', '-s', serial, 'shell',
-        'setprop', 'persist.sys.locale', locale
+        'cmd', 'locale', 'set-default', locale
     ])
 
-    # system_locales 설정 (OneUI 언어 목록)
+    # Step 2: settings put 조합 (폴백)
     run_command([
         'adb', '-s', serial, 'shell',
         'settings', 'put', 'system', 'system_locales', locale
     ])
 
-    # ActivityManager 설정 갱신
+    # Step 3: persist.sys.locale 시도 (적용될 수도 있음)
+    run_command([
+        'adb', '-s', serial, 'shell',
+        'setprop', 'persist.sys.locale', locale
+    ])
+
+    # Step 4: 로케일 변경 브로드캐스트
     run_command([
         'adb', '-s', serial, 'shell',
         'am', 'broadcast', '-a', 'android.intent.action.LOCALE_CHANGED'
     ])
+
+    # Step 5: SystemUI 재시작으로 변경 강제 적용
+    run_command([
+        'adb', '-s', serial, 'shell',
+        'am', 'force-stop', 'com.android.systemui'
+    ])
+    time.sleep(2)
 
     logging.info('[%s] 언어 설정 완료: %s', serial, locale)
 
@@ -193,7 +206,7 @@ def is_samsung_account(account_type):
 
 
 def remove_non_samsung_accounts(serial):
-    """삼성 계정을 제외한 모든 계정을 삭제합니다."""
+    """삼성 계정을 제외한 모든 계정을 삭제합니다 (비루트 호환)."""
     logging.info('[%s] 삼성 계정 제외 전체 계정 삭제 시작...', serial)
 
     accounts = get_device_accounts(serial)
@@ -213,11 +226,19 @@ def remove_non_samsung_accounts(serial):
 
     logging.info('[%s] 삼성 계정 %d개 보존, 삭제 대상 타입 %d개', serial, samsung_count, len(removed_types))
 
-    # Google 계정 관련 앱 데이터 초기화
+    # Step 1: 계정 관련 핵심 시스템 provider 초기화
+    logging.info('[%s] 계정 관련 시스템 provider 초기화 중...', serial)
     clear_app_data(serial, 'com.google.android.gms', 'Google Play 서비스')
     clear_app_data(serial, 'com.google.android.gsf', 'Google Services Framework')
+    clear_app_data(serial, 'com.android.providers.contacts', '연락처 Provider')
+    clear_app_data(serial, 'com.android.contacts', '연락처')
 
-    # 발견된 계정 타입에 매핑되는 앱 데이터 초기화
+    # Step 2: 계정 관련 앱 강제 종료
+    logging.info('[%s] 계정 관련 앱 강제 종료 중...', serial)
+    run_command(['adb', '-s', serial, 'shell', 'am', 'force-stop', 'com.google.android.gms'])
+    run_command(['adb', '-s', serial, 'shell', 'am', 'force-stop', 'com.google.android.gsf'])
+
+    # Step 3: 발견된 계정 타입에 매핑되는 앱 데이터 초기화
     cleared_packages = set()
     for account_type in removed_types:
         for prefix, packages in ACCOUNT_APPS.items():
@@ -225,16 +246,43 @@ def remove_non_samsung_accounts(serial):
                 for pkg in packages:
                     if pkg not in cleared_packages:
                         clear_app_data(serial, pkg, pkg)
+                        run_command(['adb', '-s', serial, 'shell', 'am', 'force-stop', pkg])
                         cleared_packages.add(pkg)
 
-    # AccountManagerService에서 비삼성 계정 직접 제거 시도
-    for account in accounts:
-        if not is_samsung_account(account['type']):
-            run_command([
-                'adb', '-s', serial, 'shell',
-                'am', 'start', '-a', 'android.settings.SYNC_SETTINGS'
-            ])
-            break  # 설정 화면은 한 번만 열면 됨
+    # Step 4: GSF 로그인 disable/enable 사이클 (계정 연결 해제 강제)
+    logging.info('[%s] GSF 로그인 disable/enable 사이클...', serial)
+    run_command([
+        'adb', '-s', serial, 'shell',
+        'pm', 'disable-user', '--user', '0', 'com.google.android.gsf.login'
+    ])
+    time.sleep(1)
+    run_command([
+        'adb', '-s', serial, 'shell',
+        'pm', 'enable', 'com.google.android.gsf.login'
+    ])
+
+    # Step 5: GMS 패키지도 disable/enable 사이클
+    logging.info('[%s] GMS disable/enable 사이클...', serial)
+    run_command([
+        'adb', '-s', serial, 'shell',
+        'pm', 'disable-user', '--user', '0', 'com.google.android.gms'
+    ])
+    time.sleep(1)
+    run_command([
+        'adb', '-s', serial, 'shell',
+        'pm', 'enable', 'com.google.android.gms'
+    ])
+
+    # Step 6: 계정 확인 — 남아있으면 로그 경고
+    time.sleep(2)
+    remaining = get_device_accounts(serial)
+    non_samsung_remaining = [a for a in remaining if not is_samsung_account(a['type'])]
+    if non_samsung_remaining:
+        logging.warning('[%s] 아직 남아있는 비삼성 계정 %d개:', serial, len(non_samsung_remaining))
+        for a in non_samsung_remaining:
+            logging.warning('[%s]   - %s (%s)', serial, a['name'], a['type'])
+    else:
+        logging.info('[%s] 비삼성 계정 모두 제거 완료', serial)
 
     logging.info('[%s] 삼성 계정 제외 전체 계정 삭제 완료', serial)
 
