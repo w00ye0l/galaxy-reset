@@ -1,0 +1,2 @@
+# Git LFS - APK 파일은 크기가 크므로 LFS로 관리
+*.apk filter=lfs diff=lfs merge=lfs -text
