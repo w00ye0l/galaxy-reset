@@ -392,12 +392,19 @@ def clear_logs_and_cache(serial):
 
 
 def clear_media_store(serial):
-    """MediaStore DB를 정리합니다."""
+    """MediaStore DB를 정리합니다 (이미지, 비디오, 오디오, 파일 전체)."""
     logging.info('[%s] MediaStore DB 정리 중...', serial)
-    run_command([
-        'adb', '-s', serial, 'shell',
-        'content', 'delete', '--uri', 'content://media/external/file'
-    ])
+    media_uris = [
+        'content://media/external/images/media',
+        'content://media/external/video/media',
+        'content://media/external/audio/media',
+        'content://media/external/file',
+    ]
+    for uri in media_uris:
+        run_command([
+            'adb', '-s', serial, 'shell',
+            'content', 'delete', '--uri', uri
+        ])
     logging.info('[%s] MediaStore DB 정리 완료', serial)
 
 
