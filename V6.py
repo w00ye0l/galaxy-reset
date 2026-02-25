@@ -109,26 +109,35 @@ def push_dex_if_needed(serial, dex_name):
     return True
 
 
+BASE_LOCALES = ['ko-KR', 'en-US', 'ja-JP']
+
+
 def set_device_language(serial, locale):
-    """app_process + DEX를 통해 기기 언어를 변경합니다 (비루트 호환)."""
+    """app_process + DEX를 통해 기기 언어를 변경합니다 (비루트 호환).
+
+    선택된 언어를 기본으로, 나머지 기본 언어(한국어/영어/일본어)를 보조로 설정합니다.
+    예: ja-JP 선택 → ja-JP, ko-KR, en-US
+    """
     if not locale:
         return
-    logging.info('[%s] 언어 설정 변경: %s', serial, locale)
+    # 선택된 언어를 맨 앞에, 나머지 기본 언어를 뒤에 배치
+    locale_list = [locale] + [l for l in BASE_LOCALES if l != locale]
+    logging.info('[%s] 언어 설정 변경: %s', serial, ', '.join(locale_list))
 
     # DEX 파일 푸시
     if not push_dex_if_needed(serial, 'locale_changer.dex'):
         logging.error('[%s] locale_changer.dex 없음 — 언어 변경 불가', serial)
         return
 
-    # app_process로 LocaleChanger 실행 (IActivityManager.updatePersistentConfiguration 호출)
+    # app_process로 LocaleChanger 실행 (여러 로케일을 인자로 전달)
     result = run_command([
         'adb', '-s', serial, 'shell',
         'CLASSPATH=/data/local/tmp/locale_changer.dex',
-        'app_process', '/system/bin', 'LocaleChanger', locale
-    ])
+        'app_process', '/system/bin', 'LocaleChanger'
+    ] + locale_list)
 
     if hasattr(result, 'stdout') and 'SUCCESS' in result.stdout:
-        logging.info('[%s] 언어 설정 완료: %s', serial, locale)
+        logging.info('[%s] 언어 설정 완료: %s', serial, ', '.join(locale_list))
     else:
         stderr = result.stderr if hasattr(result, 'stderr') else ''
         stdout = result.stdout if hasattr(result, 'stdout') else ''
