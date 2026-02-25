@@ -340,9 +340,7 @@ def delete_user_installed_apps(serial):
     exclude_apps = [
         'com.sec.android.app.popupcalculator',
         'com.nhn.android.nmap',
-        'dji.mimo',
         'com.alphainventor.filemanager',
-        'net.dinglisch.android.taskerm',
     ]
     output = subprocess.check_output([
         'adb', '-s', serial, 'shell',
@@ -393,7 +391,6 @@ def clear_logs_and_cache(serial):
     ])
 
     clear_app_data(serial, 'com.sec.android.gallery3d', '갤러리')
-    clear_app_data(serial, 'dji.mimo', 'Mimo')
     clear_app_data(serial, 'com.nhn.android.nmap', 'Nmap')
     clear_app_data(serial, 'com.sec.android.themestore', '테마')
     clear_app_data(serial, 'com.sec.android.app.vepreload', '삼성 스튜디오')
@@ -452,14 +449,6 @@ def push_default_wallpaper(serial, wallpaper_file):
         logging.warning('[%s] 배경화면 설정 결과 불확실: %s %s', serial, stdout.strip(), stderr.strip())
 
 
-def trigger_tasker_task(serial):
-    """Tasker 자동화 작업을 트리거합니다."""
-    run_command([
-        'adb', '-s', serial, 'shell',
-        'am', 'broadcast', '-a', 'com.example.CHANGE_SETTINGS'
-    ])
-    logging.info('[%s] Tasker 트리거 완료', serial)
-
 
 def wipe_internal_storage(serial):
     """내장 메모리 전체를 삭제합니다."""
@@ -473,9 +462,7 @@ def ensure_essential_apps_installed(serial):
     """필수 앱이 설치되어 있는지 확인하고 없으면 설치합니다."""
     apps = [
         {'package': 'com.nhn.android.nmap', 'name': 'Nmap', 'apk_path': resource_path('nmap.apk')},
-        {'package': 'dji.mimo', 'name': 'Mimo', 'apk_path': resource_path('dji_mimo.apk')},
         {'package': 'com.alphainventor.filemanager', 'name': 'File Manager', 'apk_path': resource_path('filemanager.apk')},
-        {'package': 'net.dinglisch.android.taskerm', 'name': 'Tasker', 'apk_path': resource_path('Tasker.apk')},
     ]
     output = subprocess.check_output([
         'adb', '-s', serial, 'shell', 'pm', 'list', 'packages'
@@ -527,7 +514,6 @@ def process_device(serial, locale=None):
         run_command(['adb', '-s', serial, 'shell', 'rm', '-rf', f'/sdcard/{d}/.thumbnails'])
 
     push_default_wallpaper(serial, wallpaper)
-    trigger_tasker_task(serial)
     ensure_essential_apps_installed(serial)
 
     logging.info('========================================')
@@ -558,6 +544,14 @@ def main():
                 t.join()
 
             logging.info('모든 기기 초기화 작업이 완료되었습니다.')
+
+            # 기기 종료 여부 확인
+            shutdown = input('기기를 종료하시겠습니까? (y/n): ').strip().lower()
+            if shutdown == 'y':
+                for serial in devices:
+                    logging.info('[%s] 기기 종료 중...', serial)
+                    run_command(['adb', '-s', serial, 'shell', 'reboot', '-p'])
+                logging.info('모든 기기 종료 명령 전송 완료')
 
         try:
             logging.info('추가로 작업하실 기기를 연결 완료 후 엔터를 눌러주세요. (종료하려면 Ctrl+C)')
