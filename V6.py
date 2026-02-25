@@ -194,14 +194,13 @@ def remove_non_samsung_accounts(serial):
     # 삭제 전 계정 현황 로깅
     accounts = get_device_accounts(serial)
     if not accounts:
-        logging.info('[%s] 등록된 계정이 없거나 조회 실패', serial)
-        return
-
-    for account in accounts:
-        if is_samsung_account(account['type']):
-            logging.info('[%s] 삼성 계정 보존 대상: %s (%s)', serial, account['name'], account['type'])
-        else:
-            logging.info('[%s] 계정 삭제 대상: %s (%s)', serial, account['name'], account['type'])
+        logging.info('[%s] 계정 조회 결과 없음 — DEX로 직접 삭제 시도', serial)
+    else:
+        for account in accounts:
+            if is_samsung_account(account['type']):
+                logging.info('[%s] 삼성 계정 보존 대상: %s (%s)', serial, account['name'], account['type'])
+            else:
+                logging.info('[%s] 계정 삭제 대상: %s (%s)', serial, account['name'], account['type'])
 
     # DEX 파일 푸시
     if not push_dex_if_needed(serial, 'account_remover.dex'):
