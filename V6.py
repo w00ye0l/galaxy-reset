@@ -273,6 +273,9 @@ def deep_clean_gallery_trash(serial):
         # 썸네일 캐시 (갤러리가 이걸 참조하여 삭제된 이미지 표시)
         '/sdcard/DCIM/.thumbnails',
         '/sdcard/Pictures/.thumbnails',
+        '/sdcard/Music/.thumbnails',
+        '/sdcard/Movies/.thumbnails',
+        '/sdcard/Download/.thumbnails',
         '/sdcard/Android/data/com.sec.android.gallery3d/files/.thumbnails',
         # 추가 캐시 경로
         '/sdcard/Android/data/com.android.chrome/cache',
@@ -481,10 +484,15 @@ def process_device(serial, locale=None):
     wipe_internal_storage(serial)
     clear_logs_and_cache(serial)
 
-    # [V6] 갤러리 휴지통 완전 정리
+    # [V6] 갤러리 휴지통 완전 정리 (clear_logs_and_cache 이후 재생성된 찌꺼기 포함)
     deep_clean_gallery_trash(serial)
 
     clear_media_store(serial)
+
+    # 최종 썸네일 잔여물 제거 (MediaStore 리프레시 후 재생성 방지)
+    for d in ['DCIM', 'Pictures', 'Music', 'Movies', 'Download']:
+        run_command(['adb', '-s', serial, 'shell', 'rm', '-rf', f'/sdcard/{d}/.thumbnails'])
+
     push_default_wallpaper(serial, wallpaper)
     trigger_tasker_task(serial)
     ensure_essential_apps_installed(serial)
