@@ -403,6 +403,9 @@ def clear_logs_and_cache(serial):
     clear_app_data(serial, 'com.sec.android.themestore', '테마')
     clear_app_data(serial, 'com.sec.android.app.vepreload', '삼성 스튜디오')
 
+    # 클립보드 기록 제거
+    clear_app_data(serial, 'com.samsung.clipboardsaveservice', '클립보드 기록')
+
 
 def clear_media_store(serial):
     """MediaStore DB를 정리합니다 (이미지, 비디오, 오디오, 파일 전체)."""
