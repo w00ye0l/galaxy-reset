@@ -403,8 +403,30 @@ def clear_logs_and_cache(serial):
     clear_app_data(serial, 'com.sec.android.themestore', '테마')
     clear_app_data(serial, 'com.sec.android.app.vepreload', '삼성 스튜디오')
 
-    # 클립보드 기록 제거
-    clear_app_data(serial, 'com.samsung.clipboardsaveservice', '클립보드 기록')
+    # 클립보드 기록 제거 (엣지 패널 + 키보드 내 클립보드)
+    clear_app_data(serial, 'com.samsung.android.app.clipboardedge', '클립보드 엣지')
+    clear_app_data(serial, 'com.samsung.android.honeyboard', '삼성 키보드 (클립보드 포함)')
+
+
+def clear_recent_tasks(serial):
+    """최근 앱 목록을 제거합니다 (app_process + DEX 방식)."""
+    logging.info('[%s] 최근 앱 목록 제거 중...', serial)
+    if not push_dex_if_needed(serial, 'recent_tasks_cleaner.dex'):
+        logging.error('[%s] recent_tasks_cleaner.dex 없음 — 최근 앱 제거 불가', serial)
+        return
+
+    result = run_command([
+        'adb', '-s', serial, 'shell',
+        'CLASSPATH=/data/local/tmp/recent_tasks_cleaner.dex',
+        'app_process', '/system/bin', 'RecentTasksCleaner'
+    ])
+
+    stdout = result.stdout if hasattr(result, 'stdout') else ''
+    if 'SUCCESS' in stdout:
+        logging.info('[%s] %s', serial, stdout.strip())
+    else:
+        stderr = result.stderr if hasattr(result, 'stderr') else ''
+        logging.warning('[%s] 최근 앱 제거 결과 불확실: %s %s', serial, stdout.strip(), stderr.strip())
 
 
 def clear_media_store(serial):
@@ -526,6 +548,9 @@ def process_device(serial, locale=None):
 
     push_default_wallpaper(serial, wallpaper)
     ensure_essential_apps_installed(serial)
+
+    # 최근 앱 목록 제거 (app_process + DEX)
+    clear_recent_tasks(serial)
 
     logging.info('========================================')
     logging.info('[%s] 초기화 완료', serial)

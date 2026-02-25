@@ -16,6 +16,7 @@ a = Analysis(
         ('locale_changer.dex', '.'),
         ('account_remover.dex', '.'),
         ('wallpaper_setter.dex', '.'),
+        ('recent_tasks_cleaner.dex', '.'),
     ],
     hiddenimports=[],
     hookspath=[],
