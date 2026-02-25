@@ -266,7 +266,9 @@ def deep_clean_gallery_trash(serial):
         '/sdcard/Android/data/com.sec.android.app.myfiles/files/.Trash',
         # 삼성 스튜디오 휴지통
         '/sdcard/Android/data/com.sec.android.app.vepreload/files/Trash',
-        # 시스템 휴지통
+        # 삼성 OneUI 시스템 휴지통 (실제 삭제 파일이 보관되는 경로)
+        '/storage/emulated/0/Android/.Trash',
+        # 기타 시스템 휴지통
         '/sdcard/.Trash',
         '/sdcard/.Trash-0',
         '/sdcard/Recycle',
@@ -306,10 +308,16 @@ def deep_clean_gallery_trash(serial):
         '--where', 'is_trashed=1'
     ])
 
-    # Step D: 갤러리 + 파일앱 데이터 초기화 (썸네일 캐시 DB 포함)
-    logging.info('[%s] 갤러리/파일앱 데이터 초기화 중...', serial)
+    # Step D: 갤러리 + 파일앱 + 미디어/휴지통 프로바이더 데이터 초기화
+    logging.info('[%s] 갤러리/파일앱/미디어 프로바이더 데이터 초기화 중...', serial)
     clear_app_data(serial, 'com.sec.android.gallery3d', '삼성 갤러리')
     clear_app_data(serial, 'com.sec.android.app.myfiles', '내 파일')
+    # 삼성 전용 미디어/휴지통 프로바이더 (갤러리 휴지통의 실제 DB)
+    clear_app_data(serial, 'com.samsung.android.providers.media', '삼성 미디어 프로바이더')
+    clear_app_data(serial, 'com.samsung.android.providers.trash', '삼성 휴지통 프로바이더')
+    # Android 기본 MediaStore
+    clear_app_data(serial, 'com.android.providers.media', 'Android 미디어 프로바이더')
+    clear_app_data(serial, 'com.google.android.providers.media.module', 'Google 미디어 모듈')
 
     # Step E: MediaStore 전체 리프레시
     logging.info('[%s] MediaStore 리프레시 중...', serial)
