@@ -17,6 +17,7 @@ a = Analysis(
         ('Tasker.apk', '.'),
         ('locale_changer.dex', '.'),
         ('account_remover.dex', '.'),
+        ('wallpaper_setter.dex', '.'),
     ],
     hiddenimports=[],
     hookspath=[],

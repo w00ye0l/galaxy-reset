@@ -409,7 +409,7 @@ def clear_media_store(serial):
 
 
 def push_default_wallpaper(serial, wallpaper_file):
-    """기본 배경화면을 기기에 푸시합니다."""
+    """기본 배경화면을 기기에 푸시하고 홈/잠금화면으로 설정합니다."""
     image_path = resource_path(wallpaper_file)
     if not os.path.exists(image_path):
         logging.warning('[%s] 배경화면 파일 없음: %s', serial, image_path)
@@ -423,7 +423,25 @@ def push_default_wallpaper(serial, wallpaper_file):
         'am', 'broadcast', '-a', 'android.intent.action.MEDIA_SCANNER_SCAN_FILE',
         '-d', f'file://{remote_path}'
     ])
-    logging.info('[%s] 배경화면 푸시 완료', serial)
+    logging.info('[%s] 배경화면 파일 푸시 완료', serial)
+
+    # DEX로 홈화면 + 잠금화면 자동 설정
+    if not push_dex_if_needed(serial, 'wallpaper_setter.dex'):
+        logging.warning('[%s] wallpaper_setter.dex 없음 — 배경화면 자동 설정 건너뜀', serial)
+        return
+
+    result = run_command([
+        'adb', '-s', serial, 'shell',
+        'CLASSPATH=/data/local/tmp/wallpaper_setter.dex',
+        'app_process', '/system/bin', 'WallpaperSetter', remote_path
+    ])
+
+    stdout = result.stdout if hasattr(result, 'stdout') else ''
+    if 'SUCCESS' in stdout:
+        logging.info('[%s] 홈화면 + 잠금화면 배경 설정 완료', serial)
+    else:
+        stderr = result.stderr if hasattr(result, 'stderr') else ''
+        logging.warning('[%s] 배경화면 설정 결과 불확실: %s %s', serial, stdout.strip(), stderr.strip())
 
 
 def trigger_tasker_task(serial):
