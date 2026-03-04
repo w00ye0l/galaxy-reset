@@ -375,6 +375,7 @@ def clear_google_apps_history(serial):
         'com.google.android.apps.docs': 'Google 드라이브',
         'com.google.android.calendar': 'Google 캘린더',
         'com.google.android.apps.photos': 'Google 포토',
+        'com.sec.android.app.sbrowser': '삼성 인터넷 브라우저',
     }
     logging.info('[%s] Google 앱 사용 기록 삭제 시작...', serial)
     for package, name in google_apps.items():
@@ -382,21 +383,142 @@ def clear_google_apps_history(serial):
     logging.info('[%s] Google 앱 사용 기록 삭제 완료.', serial)
 
 
+def clear_call_sms_contacts(serial):
+    """통화기록, SMS, 주소록을 DEX(ContentCleaner)를 통해 삭제합니다."""
+    logging.info('[%s] 통화기록/SMS/주소록 DEX 삭제 시작...', serial)
+
+    if not push_dex_if_needed(serial, 'content_cleaner.dex'):
+        logging.warning('[%s] content_cleaner.dex 없음 — 폴백: pm clear 사용', serial)
+        clear_app_data(serial, 'com.android.providers.contacts', '주소록/통화기록')
+        clear_app_data(serial, 'com.android.providers.telephony', 'SMS/MMS')
+        return
+
+    result = run_command([
+        'adb', '-s', serial, 'shell',
+        'CLASSPATH=/data/local/tmp/content_cleaner.dex',
+        'app_process', '/system/bin', 'ContentCleaner'
+    ])
+
+    stdout = result.stdout if hasattr(result, 'stdout') else ''
+    needs_fallback = {'CALL_LOG': False, 'SMS': False, 'CONTACTS': False}
+
+    for line in stdout.splitlines():
+        line = line.strip()
+        if line.startswith('OK:'):
+            parts = line.split(':', 3)
+            if len(parts) >= 3:
+                logging.info('[%s] %s 삭제 완료: %s', serial, parts[1], parts[2])
+        elif line.startswith('PERMISSION_DENIED:') or line.startswith('FALLBACK:'):
+            parts = line.split(':', 3)
+            if len(parts) >= 2:
+                label = parts[1]
+                logging.warning('[%s] %s 권한 부족 — pm clear 폴백', serial, label)
+                needs_fallback[label] = True
+        elif line.startswith('FAIL:'):
+            parts = line.split(':', 3)
+            if len(parts) >= 2:
+                logging.warning('[%s] %s 삭제 실패: %s', serial, parts[1],
+                              parts[2] if len(parts) > 2 else '')
+
+    # 실패한 항목에 대해 pm clear 폴백
+    if needs_fallback.get('CALL_LOG') or needs_fallback.get('CONTACTS'):
+        clear_app_data(serial, 'com.android.providers.contacts', '주소록/통화기록 (폴백)')
+    if needs_fallback.get('SMS'):
+        clear_app_data(serial, 'com.android.providers.telephony', 'SMS/MMS (폴백)')
+
+    # 삼성 메시지 앱 데이터 초기화 (임시저장 문자 등 앱 자체 DB 삭제)
+    clear_app_data(serial, 'com.samsung.android.messaging', '삼성 메시지 (임시저장 포함)')
+    clear_app_data(serial, 'com.samsung.android.providers.contacts', '삼성 연락처 프로바이더')
+    clear_app_data(serial, 'com.samsung.android.app.contacts', '삼성 연락처 앱')
+    clear_app_data(serial, 'com.samsung.android.dsms', '삼성 DSMS')
+    clear_app_data(serial, 'com.android.mms.service', 'MMS 서비스')
+
+    logging.info('[%s] 통화기록/SMS/주소록 삭제 완료', serial)
+
+
+def delete_esim_profiles(serial):
+    """e-SIM 프로필을 감지하고 비활성화 + 삭제합니다."""
+    logging.info('[%s] e-SIM 프로필 확인 시작...', serial)
+
+    if not push_dex_if_needed(serial, 'esim_manager.dex'):
+        logging.warning('[%s] esim_manager.dex 없음 — e-SIM 처리 건너뜀', serial)
+        return
+
+    # DEX로 e-SIM 프로필 비활성화 + 삭제
+    result = run_command([
+        'adb', '-s', serial, 'shell',
+        'CLASSPATH=/data/local/tmp/esim_manager.dex',
+        'app_process', '/system/bin', 'EsimManager', 'delete-all'
+    ])
+
+    stdout = result.stdout if hasattr(result, 'stdout') else ''
+    stderr = result.stderr if hasattr(result, 'stderr') else ''
+    esim_found = False
+    all_deleted = False
+    all_disabled = False
+    delete_failed = False
+
+    for line in stdout.splitlines():
+        line = line.strip()
+        if line.startswith('ESIM:'):
+            esim_found = True
+            parts = line.split(':', 6)
+            if len(parts) >= 4:
+                logging.info('[%s] e-SIM 발견: subId=%s iccId=%s 캐리어=%s',
+                            serial, parts[1], parts[2], parts[3])
+        elif line.startswith('SUCCESS:NO_ESIM'):
+            logging.info('[%s] e-SIM 프로필 없음', serial)
+            return
+        elif line.startswith('OK:ESIM_DISABLED'):
+            logging.info('[%s] e-SIM 비활성화 완료: %s', serial, line.split(':', 2)[-1])
+        elif line.startswith('SUCCESS:ALL_ESIM_DISABLED'):
+            all_disabled = True
+            logging.info('[%s] 모든 e-SIM 프로필 비활성화 완료', serial)
+        elif line.startswith('OK:ESIM_DELETED'):
+            logging.info('[%s] e-SIM 삭제 완료: %s', serial, line.split(':', 2)[-1])
+        elif line.startswith('SUCCESS:ALL_ESIM_DELETED'):
+            all_deleted = True
+            logging.info('[%s] 모든 e-SIM 프로필 삭제 완료', serial)
+        elif line.startswith('FAIL:ESIM_DELETE'):
+            delete_failed = True
+            logging.warning('[%s] e-SIM 삭제 실패: %s', serial, line.split(':', 2)[-1])
+        elif line.startswith('FAIL:ESIM_DISABLE'):
+            logging.warning('[%s] e-SIM 비활성화 실패: %s', serial, line.split(':', 2)[-1])
+        elif line.startswith('FAIL:ALL_ESIM_DELETE_FAILED'):
+            delete_failed = True
+            logging.warning('[%s] 모든 e-SIM 삭제 실패', serial)
+        elif line.startswith('DISABLE_METHOD:') or line.startswith('DELETE_METHOD:'):
+            logging.info('[%s] %s', serial, line)
+
+    if stderr:
+        for line in stderr.splitlines():
+            line = line.strip()
+            if line:
+                logging.warning('[%s] [stderr] %s', serial, line)
+
+    # 삭제 실패시에만 수동 안내
+    if esim_found and delete_failed and not all_deleted:
+        run_command([
+            'adb', '-s', serial, 'shell',
+            'am', 'start', '-a', 'android.telephony.euicc.action.MANAGE_EMBEDDED_SUBSCRIPTIONS'
+        ])
+        print()
+        print('=' * 60)
+        print('  ⚠  e-SIM 프로필 자동 삭제에 실패했습니다!')
+        print('  기기 화면에서 수동으로 삭제해주세요.')
+        print()
+        print('  👉 SIM 관리자 > eSIM 선택 > 삭제')
+        print('=' * 60)
+        print()
+        logging.warning('[%s] ⚠ e-SIM 수동 삭제 필요 — SIM 관리자 화면을 열었습니다.', serial)
+
+    logging.info('[%s] e-SIM 프로필 처리 완료', serial)
+
+
 def clear_logs_and_cache(serial):
     """로그, 통화기록, 주소록, 앱 캐시를 삭제합니다."""
-    clear_app_data(serial, 'com.android.providers.telephony', 'SMS')
-
-    logging.info('[%s] 통화 기록 삭제 중...', serial)
-    run_command([
-        'adb', '-s', serial, 'shell',
-        'content', 'delete', '--uri', 'content://call_log/calls'
-    ])
-
-    logging.info('[%s] 주소록 삭제 중...', serial)
-    run_command([
-        'adb', '-s', serial, 'shell',
-        'content', 'delete', '--uri', 'content://contacts/people'
-    ])
+    # DEX 기반 통화기록/SMS/주소록 삭제
+    clear_call_sms_contacts(serial)
 
     clear_app_data(serial, 'com.sec.android.gallery3d', '갤러리')
     clear_app_data(serial, 'com.nhn.android.nmap', 'Nmap')
@@ -532,6 +654,10 @@ def process_device(serial, locale=None):
 
     # [V6] 삼성 계정 제외 모든 계정 삭제
     remove_non_samsung_accounts(serial)
+
+    # [V6] e-SIM 프로필 삭제 (다른 사용자에게 넘기기 전 완전 삭제)
+    delete_esim_profiles(serial)
+
     clear_google_apps_history(serial)
     delete_user_installed_apps(serial)
     wipe_internal_storage(serial)

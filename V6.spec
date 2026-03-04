@@ -17,6 +17,8 @@ a = Analysis(
         ('account_remover.dex', '.'),
         ('wallpaper_setter.dex', '.'),
         ('recent_tasks_cleaner.dex', '.'),
+        ('content_cleaner.dex', '.'),
+        ('esim_manager.dex', '.'),
     ],
     hiddenimports=[],
     hookspath=[],
