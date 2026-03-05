@@ -256,14 +256,6 @@ def deep_clean_gallery_trash(serial):
     """삼성 갤러리 휴지통을 완전히 정리합니다."""
     logging.info('[%s] 갤러리 휴지통 완전 정리 시작...', serial)
 
-    # Step A: 갤러리 앱 강제 종료
-    logging.info('[%s] 갤러리 앱 강제 종료', serial)
-    run_command(['adb', '-s', serial, 'shell', 'am', 'force-stop', 'com.sec.android.gallery3d'])
-    run_command(['adb', '-s', serial, 'shell', 'am', 'force-stop', 'com.sec.android.app.myfiles'])
-    time.sleep(1)
-
-    # Step B: 휴지통 물리 파일 삭제 (확장된 경로 목록)
-    logging.info('[%s] 휴지통 물리 파일 삭제 중...', serial)
     trash_paths = [
         # 삼성 갤러리 휴지통
         '/sdcard/Android/data/com.sec.android.gallery3d/files/Trash',
@@ -292,43 +284,36 @@ def deep_clean_gallery_trash(serial):
         '/sdcard/Android/data/dji.mimo/cache',
         '/sdcard/Android/data/com.nhn.android.nmap/cache',
     ]
-    for path in trash_paths:
-        run_command(['adb', '-s', serial, 'shell', 'rm', '-rf', path])
 
-    # Step C: MediaStore에서 휴지통 레코드 삭제
-    logging.info('[%s] MediaStore 휴지통 레코드 삭제 중...', serial)
-    run_command([
-        'adb', '-s', serial, 'shell',
-        'content', 'delete',
-        '--uri', 'content://media/external/file',
-        '--where', 'is_trashed=1'
-    ])
-    run_command([
-        'adb', '-s', serial, 'shell',
-        'content', 'delete',
-        '--uri', 'content://media/external/images/media',
-        '--where', 'is_trashed=1'
-    ])
-    run_command([
-        'adb', '-s', serial, 'shell',
-        'content', 'delete',
-        '--uri', 'content://media/external/video/media',
-        '--where', 'is_trashed=1'
-    ])
+    clear_packages = [
+        'com.sec.android.gallery3d',
+        'com.sec.android.app.myfiles',
+        'com.samsung.android.providers.media',
+        'com.samsung.android.providers.trash',
+        'com.android.providers.media',
+        'com.google.android.providers.media.module',
+    ]
 
-    # Step D: 갤러리 + 파일앱 + 미디어/휴지통 프로바이더 데이터 초기화
-    logging.info('[%s] 갤러리/파일앱/미디어 프로바이더 데이터 초기화 중...', serial)
-    clear_app_data(serial, 'com.sec.android.gallery3d', '삼성 갤러리')
-    clear_app_data(serial, 'com.sec.android.app.myfiles', '내 파일')
-    # 삼성 전용 미디어/휴지통 프로바이더 (갤러리 휴지통의 실제 DB)
-    clear_app_data(serial, 'com.samsung.android.providers.media', '삼성 미디어 프로바이더')
-    clear_app_data(serial, 'com.samsung.android.providers.trash', '삼성 휴지통 프로바이더')
-    # Android 기본 MediaStore
-    clear_app_data(serial, 'com.android.providers.media', 'Android 미디어 프로바이더')
-    clear_app_data(serial, 'com.google.android.providers.media.module', 'Google 미디어 모듈')
+    # 배치 실행: force-stop → rm -rf → pm clear (개별 ADB 호출 → 단일 호출)
+    force_stops = (
+        'am force-stop com.sec.android.gallery3d; '
+        'am force-stop com.sec.android.app.myfiles'
+    )
+    rm_cmd = 'rm -rf ' + ' '.join(trash_paths)
+    pm_clears = '; '.join(f'pm clear {pkg}' for pkg in clear_packages)
 
-    # Step E: MediaStore 전체 리프레시
-    logging.info('[%s] MediaStore 리프레시 중...', serial)
+    full_cmd = f'{force_stops}; {rm_cmd}; {pm_clears}'
+
+    logging.info('[%s] 갤러리/미디어 배치 정리 실행 중...', serial)
+    result = run_command(['adb', '-s', serial, 'shell', full_cmd])
+
+    # pm clear 실패 감지
+    stdout = result.stdout if hasattr(result, 'stdout') else ''
+    for line in stdout.splitlines():
+        if 'Exception' in line or 'Error' in line:
+            logging.warning('[%s] 배치 명령 경고: %s', serial, line.strip())
+
+    # MediaStore 전체 리프레시 (pm clear 후 provider 재기동 트리거)
     run_command([
         'adb', '-s', serial, 'shell',
         'am', 'broadcast', '-a', 'android.intent.action.MEDIA_MOUNTED',
