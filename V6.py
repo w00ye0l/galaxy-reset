@@ -41,21 +41,25 @@ def get_connected_devices():
     return devices
 
 
-def detect_series_from_serial(serial_number, mapping_file='device_serial_map.json'):
-    """시리얼 번호를 기반으로 디바이스 시리즈를 감지합니다."""
-    path = resource_path(mapping_file)
-    try:
-        with open(path, 'r', encoding='utf-8') as f:
-            mapping = json.load(f)
-        if serial_number in mapping:
-            series = mapping[serial_number]
-            logging.info('[%s] 시리즈 감지: %s', serial_number, series)
-            return series
-        logging.warning('[%s] 시리얼 매핑 없음 — 기본값 S24 사용', serial_number)
-        return 'S24'
-    except Exception as e:
-        logging.warning('[%s] 매핑 파일 로드 실패: %s — 기본값 S24 사용', serial_number, e)
-        return 'S24'
+MODEL_TO_SERIES = {
+    'S91': 'S23', 'S92': 'S24', 'S93': 'S25', 'S94': 'S26',
+}
+
+
+def detect_series(serial):
+    """모델명(getprop)으로 디바이스 시리즈를 자동 감지합니다."""
+    result = run_command(['adb', '-s', serial, 'shell', 'getprop', 'ro.product.model'])
+    model = result.stdout.strip() if hasattr(result, 'stdout') and result.stdout else ''
+    if model:
+        # SM-S948N → S94 → S26
+        for prefix, series in MODEL_TO_SERIES.items():
+            if prefix in model:
+                logging.info('[%s] 모델: %s → 시리즈: %s', serial, model, series)
+                return series
+        logging.warning('[%s] 모델 %s — 매칭 없음, 기본값 S24 사용', serial, model)
+    else:
+        logging.warning('[%s] 모델명 조회 실패 — 기본값 S24 사용', serial)
+    return 'S24'
 
 
 def clear_app_data(serial, package, desc):
@@ -570,6 +574,12 @@ def push_default_wallpaper(serial, wallpaper_file):
     ])
     logging.info('[%s] 배경화면 파일 푸시 완료', serial)
 
+    # 삼성 라이브 배경화면/잠금화면 오버레이 초기화 (잠금화면 적용에 필수)
+    for pkg in ['com.samsung.android.wallpaper.live',
+                'com.samsung.android.dynamiclock',
+                'com.samsung.android.app.dressroom']:
+        run_command(['adb', '-s', serial, 'shell', 'pm', 'clear', pkg])
+
     # DEX로 홈화면 + 잠금화면 자동 설정
     if not push_dex_if_needed(serial, 'wallpaper_setter.dex'):
         logging.warning('[%s] wallpaper_setter.dex 없음 — 배경화면 자동 설정 건너뜀', serial)
@@ -631,8 +641,8 @@ def process_device(serial, locale=None):
     logging.info('[%s] 초기화 시작', serial)
     logging.info('========================================')
 
-    series = detect_series_from_serial(serial)
-    wallpaper = f'{series}.png' if series in ('S23', 'S24', 'S25') else 'S24.png'
+    series = detect_series(serial)
+    wallpaper = f'{series}.png'
 
     # [V6] 언어 설정 변경
     set_device_language(serial, locale)
