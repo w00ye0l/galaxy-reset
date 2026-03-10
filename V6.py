@@ -557,7 +557,7 @@ def clear_media_store(serial):
     logging.info('[%s] MediaStore DB 정리 완료', serial)
 
 
-def push_default_wallpaper(serial, wallpaper_file):
+def push_default_wallpaper(serial, wallpaper_file, series=None):
     """기본 배경화면을 기기에 푸시하고 홈/잠금화면으로 설정합니다."""
     image_path = resource_path(wallpaper_file)
     if not os.path.exists(image_path):
@@ -574,11 +574,12 @@ def push_default_wallpaper(serial, wallpaper_file):
     ])
     logging.info('[%s] 배경화면 파일 푸시 완료', serial)
 
-    # 삼성 라이브 배경화면/잠금화면 오버레이 초기화 (잠금화면 적용에 필수)
-    for pkg in ['com.samsung.android.wallpaper.live',
-                'com.samsung.android.dynamiclock',
-                'com.samsung.android.app.dressroom']:
-        run_command(['adb', '-s', serial, 'shell', 'pm', 'clear', pkg])
+    # S26(Android 16)에서만 삼성 오버레이 앱 초기화 (잠금화면 적용에 필수)
+    if series == 'S26':
+        for pkg in ['com.samsung.android.wallpaper.live',
+                    'com.samsung.android.dynamiclock',
+                    'com.samsung.android.app.dressroom']:
+            run_command(['adb', '-s', serial, 'shell', 'pm', 'clear', pkg])
 
     # DEX로 홈화면 + 잠금화면 자동 설정
     if not push_dex_if_needed(serial, 'wallpaper_setter.dex'):
@@ -667,7 +668,7 @@ def process_device(serial, locale=None):
     for d in ['DCIM', 'Pictures', 'Music', 'Movies', 'Download']:
         run_command(['adb', '-s', serial, 'shell', 'rm', '-rf', f'/sdcard/{d}/.thumbnails'])
 
-    push_default_wallpaper(serial, wallpaper)
+    push_default_wallpaper(serial, wallpaper, series)
     ensure_essential_apps_installed(serial)
 
     # 최근 앱 목록 제거 (app_process + DEX)
