@@ -8,6 +8,8 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * 배경화면 설정 유틸리티 (app_process로 실행)
@@ -58,6 +60,8 @@ public class WallpaperSetter {
     private static void setWallpaperForFlag(Object wm, String imagePath, int flag, String label) {
         // Android 16 (11-arg): setWallpaper(String, String, WallpaperDescription, boolean, Bundle, int, callback, int, int, boolean, Bundle)
         if (tryAndroid16(wm, imagePath, flag, label)) return;
+        // Samsung One UI (12-arg): setWallpaper(String, String, int[], List, boolean, Bundle, int, callback, int, int, boolean, Bundle)
+        if (trySamsung12arg(wm, imagePath, flag, label)) return;
         // Android 14-15 (8-arg): setWallpaper(String, String, Rect, boolean, Bundle, int, callback, int)
         if (tryAndroid14(wm, imagePath, flag, label)) return;
         // Android 12-13 (7-arg): setWallpaper(String, Rect, boolean, Bundle, int, callback, int)
@@ -104,6 +108,37 @@ public class WallpaperSetter {
         } catch (Exception e) {
             String msg = e.getCause() != null ? e.getCause().getMessage() : e.getMessage();
             System.out.println("WARN:" + label + ":Android16:" + msg);
+        }
+        return false;
+    }
+
+    private static boolean trySamsung12arg(Object wm, String imagePath, int flag, String label) {
+        try {
+            Class<?> callbackClass = Class.forName("android.app.IWallpaperManagerCallback");
+            Method setWallpaper = wm.getClass().getMethod("setWallpaper",
+                String.class, String.class, int[].class, List.class,
+                boolean.class, Bundle.class, int.class,
+                callbackClass, int.class, int.class,
+                boolean.class, Bundle.class);
+
+            Bundle extras = new Bundle();
+            Bundle outParams = new Bundle();
+            ParcelFileDescriptor pfd = (ParcelFileDescriptor) setWallpaper.invoke(wm,
+                "WallpaperSetter", "com.android.shell", (int[]) null, (List<?>) null,
+                false, extras, flag,
+                null, 0, 0,
+                false, outParams);
+
+            if (pfd != null) {
+                writeImageToPfd(pfd, imagePath);
+                System.out.println("OK:" + label + ":Samsung12arg");
+                return true;
+            }
+        } catch (NoSuchMethodException e) {
+            // not Samsung — try next
+        } catch (Exception e) {
+            String msg = e.getCause() != null ? e.getCause().getMessage() : e.getMessage();
+            System.out.println("WARN:" + label + ":Samsung12arg:" + msg);
         }
         return false;
     }
