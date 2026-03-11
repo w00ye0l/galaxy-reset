@@ -594,6 +594,7 @@ def push_default_wallpaper(serial, wallpaper_file, series=None):
                     'com.samsung.android.dynamiclock',
                     'com.samsung.android.app.dressroom']:
             run_command(['adb', '-s', serial, 'shell', 'pm', 'clear', pkg])
+        time.sleep(3)
 
     # DEX로 홈화면 + 잠금화면 자동 설정
     if not push_dex_if_needed(serial, 'wallpaper_setter.dex'):
@@ -609,8 +610,39 @@ def push_default_wallpaper(serial, wallpaper_file, series=None):
     stdout = result.stdout if hasattr(result, 'stdout') else ''
     if 'SUCCESS' in stdout:
         logging.info('[%s] 홈화면 + 잠금화면 배경 설정 완료', serial)
+        # S26: 잠금화면이 실제 적용됐는지 검증 — 오버레이 앱이 덮어쓸 수 있음
+        if series == 'S26':
+            time.sleep(2)
+            verify = run_command([
+                'adb', '-s', serial, 'shell',
+                'dumpsys', 'wallpaper'
+            ])
+            verify_out = verify.stdout if hasattr(verify, 'stdout') else ''
+            # 잠금화면 wallpaper가 WallpaperSetter가 아닌 다른 것으로 덮어씌워졌는지 확인
+            if 'mLockWallpaperMap' in verify_out and 'WallpaperSetter' not in verify_out:
+                logging.warning('[%s] 잠금화면 오버레이 감지 — pm clear 후 재설정', serial)
+                for pkg in ['com.samsung.android.wallpaper.live',
+                            'com.samsung.android.dynamiclock',
+                            'com.samsung.android.app.dressroom']:
+                    run_command(['adb', '-s', serial, 'shell', 'pm', 'clear', pkg])
+                time.sleep(3)
+                result = run_command([
+                    'adb', '-s', serial, 'shell',
+                    'CLASSPATH=/data/local/tmp/wallpaper_setter.dex',
+                    'app_process', '/system/bin', 'WallpaperSetter', remote_path
+                ])
+                stdout2 = result.stdout if hasattr(result, 'stdout') else ''
+                if 'SUCCESS' in stdout2:
+                    logging.info('[%s] 잠금화면 재설정 성공', serial)
+                else:
+                    logging.warning('[%s] 잠금화면 재설정 실패: %s', serial, stdout2.strip())
     elif 'FAIL' in stdout:
-        logging.warning('[%s] 배경화면 설정 실패, 3초 후 재시도: %s', serial, stdout.strip())
+        logging.warning('[%s] 배경화면 설정 실패, pm clear 후 재시도: %s', serial, stdout.strip())
+        if series == 'S26':
+            for pkg in ['com.samsung.android.wallpaper.live',
+                        'com.samsung.android.dynamiclock',
+                        'com.samsung.android.app.dressroom']:
+                run_command(['adb', '-s', serial, 'shell', 'pm', 'clear', pkg])
         time.sleep(3)
         result = run_command([
             'adb', '-s', serial, 'shell',
