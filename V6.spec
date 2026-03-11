@@ -11,6 +11,7 @@ a = Analysis(
         ('S23.png', '.'),
         ('S24.png', '.'),
         ('S25.png', '.'),
+        ('S26.png', '.'),
         ('nmap.apk', '.'),
         ('filemanager.apk', '.'),
         ('locale_changer.dex', '.'),
