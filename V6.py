@@ -24,7 +24,11 @@ def run_command(cmd, check=False, timeout=60, retries=1):
     """주어진 명령어를 실행하고 결과를 반환합니다. 실패 시 재시도합니다."""
     for attempt in range(1 + retries):
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=check, timeout=timeout)
+            result = subprocess.run(cmd, capture_output=True, text=True, check=check, timeout=timeout, encoding='utf-8', errors='replace')
+            # 보안 폴더(user 150) 접근 에러는 무시 — shell 권한으로 접근 불가
+            if result.stderr and 'SecurityException' in result.stderr and 'user 150' in result.stderr:
+                logging.debug('[보안폴더] 무시: %s', result.stderr.strip().split('\n')[0])
+                result = subprocess.CompletedProcess(cmd, returncode=0, stdout=result.stdout, stderr='')
             if result.returncode == 0 or not check:
                 return result
         except subprocess.TimeoutExpired:
@@ -586,6 +590,12 @@ def push_default_wallpaper(serial, wallpaper_file, series=None):
         'am', 'broadcast', '-a', 'android.intent.action.MEDIA_SCANNER_SCAN_FILE',
         '-d', f'file://{remote_path}'
     ])
+    # 전체 미디어 스캔 트리거 (MEDIA_SCANNER_SCAN_FILE이 무시되는 최신 기기 대응)
+    run_command([
+        'adb', '-s', serial, 'shell',
+        'am', 'broadcast', '-a', 'android.intent.action.MEDIA_MOUNTED',
+        '-d', 'file:///sdcard'
+    ])
     logging.info('[%s] 배경화면 파일 푸시 완료', serial)
 
     # S26(Android 16)에서만 삼성 오버레이 앱 초기화 (잠금화면 적용에 필수)
@@ -751,7 +761,7 @@ def main():
             # [V6] 언어 선택 메뉴
             locale = select_language()
 
-            max_workers = min(3, len(devices))
+            max_workers = min(5, len(devices))
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = {executor.submit(process_device, serial, locale): serial for serial in devices}
                 for future in as_completed(futures):
