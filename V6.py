@@ -336,11 +336,19 @@ def deep_clean_gallery_trash(serial):
             logging.warning('[%s] pm clear 경고: %s', serial, line.strip())
 
     # MediaStore 전체 리프레시 (pm clear 후 provider 재기동 트리거)
-    run_command([
+    # Android 16에서 MEDIA_MOUNTED는 SecurityException 발생 → 폴백으로 MediaProvider 재시작
+    result = run_command([
         'adb', '-s', serial, 'shell',
         'am', 'broadcast', '-a', 'android.intent.action.MEDIA_MOUNTED',
         '-d', 'file:///sdcard'
     ])
+    stderr = result.stderr if hasattr(result, 'stderr') else ''
+    if 'SecurityException' in stderr:
+        logging.info('[%s] MEDIA_MOUNTED 권한 거부 — MediaProvider 재시작으로 폴백', serial)
+        run_command(['adb', '-s', serial, 'shell',
+                     'am', 'force-stop', 'com.android.providers.media'])
+        run_command(['adb', '-s', serial, 'shell',
+                     'am', 'force-stop', 'com.google.android.providers.media.module'])
     time.sleep(2)
 
     logging.info('[%s] 갤러리 휴지통 완전 정리 완료', serial)
@@ -590,21 +598,18 @@ def push_default_wallpaper(serial, wallpaper_file, series=None):
         'am', 'broadcast', '-a', 'android.intent.action.MEDIA_SCANNER_SCAN_FILE',
         '-d', f'file://{remote_path}'
     ])
-    # 전체 미디어 스캔 트리거 (MEDIA_SCANNER_SCAN_FILE이 무시되는 최신 기기 대응)
-    run_command([
-        'adb', '-s', serial, 'shell',
-        'am', 'broadcast', '-a', 'android.intent.action.MEDIA_MOUNTED',
-        '-d', 'file:///sdcard'
-    ])
     logging.info('[%s] 배경화면 파일 푸시 완료', serial)
 
-    # S26(Android 16)에서만 삼성 오버레이 앱 초기화 (잠금화면 적용에 필수)
-    if series == 'S26':
-        for pkg in ['com.samsung.android.wallpaper.live',
+    # 삼성 라이브 배경화면 오버레이 앱 강제 종료 + 초기화
+    # (dressroom이 라이브 배경을 자동 복원하므로 force-stop → pm clear 순서 필수)
+    overlay_pkgs = ['com.samsung.android.wallpaper.live',
                     'com.samsung.android.dynamiclock',
-                    'com.samsung.android.app.dressroom']:
-            run_command(['adb', '-s', serial, 'shell', 'pm', 'clear', pkg])
-        time.sleep(3)
+                    'com.samsung.android.app.dressroom']
+    for pkg in overlay_pkgs:
+        run_command(['adb', '-s', serial, 'shell', 'am', 'force-stop', pkg])
+    for pkg in overlay_pkgs:
+        run_command(['adb', '-s', serial, 'shell', 'pm', 'clear', pkg])
+    time.sleep(3)
 
     # DEX로 홈화면 + 잠금화면 자동 설정
     if not push_dex_if_needed(serial, 'wallpaper_setter.dex'):
@@ -618,41 +623,11 @@ def push_default_wallpaper(serial, wallpaper_file, series=None):
     ])
 
     stdout = result.stdout if hasattr(result, 'stdout') else ''
-    if 'SUCCESS' in stdout:
-        logging.info('[%s] 홈화면 + 잠금화면 배경 설정 완료', serial)
-        # S26: 잠금화면이 실제 적용됐는지 검증 — 오버레이 앱이 덮어쓸 수 있음
-        if series == 'S26':
-            time.sleep(2)
-            verify = run_command([
-                'adb', '-s', serial, 'shell',
-                'dumpsys', 'wallpaper'
-            ])
-            verify_out = verify.stdout if hasattr(verify, 'stdout') else ''
-            # 잠금화면 wallpaper가 WallpaperSetter가 아닌 다른 것으로 덮어씌워졌는지 확인
-            if 'mLockWallpaperMap' in verify_out and 'WallpaperSetter' not in verify_out:
-                logging.warning('[%s] 잠금화면 오버레이 감지 — pm clear 후 재설정', serial)
-                for pkg in ['com.samsung.android.wallpaper.live',
-                            'com.samsung.android.dynamiclock',
-                            'com.samsung.android.app.dressroom']:
-                    run_command(['adb', '-s', serial, 'shell', 'pm', 'clear', pkg])
-                time.sleep(3)
-                result = run_command([
-                    'adb', '-s', serial, 'shell',
-                    'CLASSPATH=/data/local/tmp/wallpaper_setter.dex',
-                    'app_process', '/system/bin', 'WallpaperSetter', remote_path
-                ])
-                stdout2 = result.stdout if hasattr(result, 'stdout') else ''
-                if 'SUCCESS' in stdout2:
-                    logging.info('[%s] 잠금화면 재설정 성공', serial)
-                else:
-                    logging.warning('[%s] 잠금화면 재설정 실패: %s', serial, stdout2.strip())
-    elif 'FAIL' in stdout:
-        logging.warning('[%s] 배경화면 설정 실패, pm clear 후 재시도: %s', serial, stdout.strip())
-        if series == 'S26':
-            for pkg in ['com.samsung.android.wallpaper.live',
-                        'com.samsung.android.dynamiclock',
-                        'com.samsung.android.app.dressroom']:
-                run_command(['adb', '-s', serial, 'shell', 'pm', 'clear', pkg])
+    if 'FAIL' in stdout:
+        logging.warning('[%s] 배경화면 설정 실패 — 오버레이 재정리 후 재시도: %s', serial, stdout.strip())
+        for pkg in overlay_pkgs:
+            run_command(['adb', '-s', serial, 'shell', 'am', 'force-stop', pkg])
+            run_command(['adb', '-s', serial, 'shell', 'pm', 'clear', pkg])
         time.sleep(3)
         result = run_command([
             'adb', '-s', serial, 'shell',
@@ -660,13 +635,37 @@ def push_default_wallpaper(serial, wallpaper_file, series=None):
             'app_process', '/system/bin', 'WallpaperSetter', remote_path
         ])
         stdout = result.stdout if hasattr(result, 'stdout') else ''
-        if 'SUCCESS' in stdout:
-            logging.info('[%s] 배경화면 재시도 성공', serial)
-        else:
-            logging.warning('[%s] 배경화면 재시도 후에도 실패: %s', serial, stdout.strip())
+
+    if 'SUCCESS' in stdout:
+        logging.info('[%s] 홈화면 + 잠금화면 배경 설정 완료', serial)
     else:
         stderr = result.stderr if hasattr(result, 'stderr') else ''
         logging.warning('[%s] 배경화면 설정 결과 불확실: %s %s', serial, stdout.strip(), stderr.strip())
+
+    # 설정 후 검증: 라이브 배경이 다시 덮어씌웠는지 확인 (5초 대기 후 체크)
+    time.sleep(5)
+    verify = run_command(['adb', '-s', serial, 'shell', 'dumpsys', 'wallpaper'])
+    verify_out = verify.stdout if hasattr(verify, 'stdout') else ''
+
+    # 홈화면 또는 잠금화면에 라이브 배경 컴포넌트가 있으면 재설정
+    live_override = ('InfinityWallpaper' in verify_out or 'wallpaper.live' in verify_out) \
+        and 'mName=WallpaperSetter' not in verify_out
+    if live_override:
+        logging.warning('[%s] 라이브 배경 오버레이 감지 — force-stop + pm clear 후 재설정', serial)
+        for pkg in overlay_pkgs:
+            run_command(['adb', '-s', serial, 'shell', 'am', 'force-stop', pkg])
+            run_command(['adb', '-s', serial, 'shell', 'pm', 'clear', pkg])
+        time.sleep(5)
+        result = run_command([
+            'adb', '-s', serial, 'shell',
+            'CLASSPATH=/data/local/tmp/wallpaper_setter.dex',
+            'app_process', '/system/bin', 'WallpaperSetter', remote_path
+        ])
+        stdout2 = result.stdout if hasattr(result, 'stdout') else ''
+        if 'SUCCESS' in stdout2:
+            logging.info('[%s] 배경화면 재설정 성공 (오버레이 제거 후)', serial)
+        else:
+            logging.warning('[%s] 배경화면 재설정 실패: %s', serial, stdout2.strip())
 
 
 
