@@ -3,8 +3,8 @@ import os
 import sys
 import logging
 import json
-import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logging.basicConfig(
     level=logging.INFO,
@@ -20,14 +20,24 @@ def resource_path(relative_path):
     return os.path.join(os.path.abspath('.'), relative_path)
 
 
-def run_command(cmd, check=False):
-    """주어진 명령어를 실행하고 결과를 반환합니다."""
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=check)
-        return result
-    except subprocess.CalledProcessError as e:
-        logging.error('명령어 실행 실패: %s / %s', ' '.join(cmd), e.stderr)
-        return e
+def run_command(cmd, check=False, timeout=60, retries=1):
+    """주어진 명령어를 실행하고 결과를 반환합니다. 실패 시 재시도합니다."""
+    for attempt in range(1 + retries):
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=check, timeout=timeout)
+            if result.returncode == 0 or not check:
+                return result
+        except subprocess.TimeoutExpired:
+            logging.warning('명령어 타임아웃(%ds): %s (시도 %d/%d)', timeout, ' '.join(cmd), attempt + 1, 1 + retries)
+        except subprocess.CalledProcessError as e:
+            logging.error('명령어 실행 실패: %s / %s (시도 %d/%d)', ' '.join(cmd), e.stderr, attempt + 1, 1 + retries)
+            if attempt == retries:
+                return e
+        if attempt < retries:
+            logging.info('RETRY: %s', ' '.join(cmd))
+            time.sleep(2)
+    # 타임아웃 등으로 result가 없는 경우 빈 결과 반환
+    return subprocess.CompletedProcess(cmd, returncode=-1, stdout='', stderr='TIMEOUT')
 
 
 def get_connected_devices():
@@ -103,13 +113,18 @@ def select_language():
 
 
 def push_dex_if_needed(serial, dex_name):
-    """DEX 헬퍼 파일을 기기에 푸시합니다 (이미 존재하면 건너뜀)."""
+    """DEX 헬퍼 파일을 기기에 푸시합니다. push 후 리모트 존재 여부를 검증합니다."""
     local_path = resource_path(dex_name)
     remote_path = f'/data/local/tmp/{dex_name}'
     if not os.path.exists(local_path):
         logging.warning('[%s] DEX 파일 없음: %s', serial, local_path)
         return False
     run_command(['adb', '-s', serial, 'push', local_path, remote_path])
+    # 리모트 파일 존재 확인
+    check = run_command(['adb', '-s', serial, 'shell', 'ls', remote_path])
+    if hasattr(check, 'returncode') and check.returncode != 0:
+        logging.warning('[%s] DEX push 검증 실패, 재시도: %s', serial, dex_name)
+        run_command(['adb', '-s', serial, 'push', local_path, remote_path])
     return True
 
 
@@ -298,24 +313,23 @@ def deep_clean_gallery_trash(serial):
         'com.google.android.providers.media.module',
     ]
 
-    # 배치 실행: force-stop → rm -rf → pm clear (개별 ADB 호출 → 단일 호출)
-    force_stops = (
-        'am force-stop com.sec.android.gallery3d; '
-        'am force-stop com.sec.android.app.myfiles'
-    )
+    # Step 1: 갤러리/파일 앱 강제 종료
+    force_cmd = 'am force-stop com.sec.android.gallery3d; am force-stop com.sec.android.app.myfiles'
+    run_command(['adb', '-s', serial, 'shell', force_cmd])
+
+    # Step 2: 휴지통/캐시 물리 파일 삭제
     rm_cmd = 'rm -rf ' + ' '.join(trash_paths)
-    pm_clears = '; '.join(f'pm clear {pkg}' for pkg in clear_packages)
+    result = run_command(['adb', '-s', serial, 'shell', rm_cmd])
+    if hasattr(result, 'returncode') and result.returncode != 0:
+        logging.warning('[%s] rm -rf 일부 실패 (계속 진행)', serial)
 
-    full_cmd = f'{force_stops}; {rm_cmd}; {pm_clears}'
-
-    logging.info('[%s] 갤러리/미디어 배치 정리 실행 중...', serial)
-    result = run_command(['adb', '-s', serial, 'shell', full_cmd])
-
-    # pm clear 실패 감지
+    # Step 3: 미디어/갤러리 프로바이더 데이터 초기화
+    pm_cmd = '; '.join(f'pm clear {pkg}' for pkg in clear_packages)
+    result = run_command(['adb', '-s', serial, 'shell', pm_cmd], timeout=90)
     stdout = result.stdout if hasattr(result, 'stdout') else ''
     for line in stdout.splitlines():
         if 'Exception' in line or 'Error' in line:
-            logging.warning('[%s] 배치 명령 경고: %s', serial, line.strip())
+            logging.warning('[%s] pm clear 경고: %s', serial, line.strip())
 
     # MediaStore 전체 리프레시 (pm clear 후 provider 재기동 트리거)
     run_command([
@@ -595,6 +609,19 @@ def push_default_wallpaper(serial, wallpaper_file, series=None):
     stdout = result.stdout if hasattr(result, 'stdout') else ''
     if 'SUCCESS' in stdout:
         logging.info('[%s] 홈화면 + 잠금화면 배경 설정 완료', serial)
+    elif 'FAIL' in stdout:
+        logging.warning('[%s] 배경화면 설정 실패, 3초 후 재시도: %s', serial, stdout.strip())
+        time.sleep(3)
+        result = run_command([
+            'adb', '-s', serial, 'shell',
+            'CLASSPATH=/data/local/tmp/wallpaper_setter.dex',
+            'app_process', '/system/bin', 'WallpaperSetter', remote_path
+        ])
+        stdout = result.stdout if hasattr(result, 'stdout') else ''
+        if 'SUCCESS' in stdout:
+            logging.info('[%s] 배경화면 재시도 성공', serial)
+        else:
+            logging.warning('[%s] 배경화면 재시도 후에도 실패: %s', serial, stdout.strip())
     else:
         stderr = result.stderr if hasattr(result, 'stderr') else ''
         logging.warning('[%s] 배경화면 설정 결과 불확실: %s %s', serial, stdout.strip(), stderr.strip())
@@ -692,14 +719,15 @@ def main():
             # [V6] 언어 선택 메뉴
             locale = select_language()
 
-            threads = []
-            for serial in devices:
-                t = threading.Thread(target=process_device, args=(serial, locale))
-                t.start()
-                threads.append(t)
-
-            for t in threads:
-                t.join()
+            max_workers = min(3, len(devices))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(process_device, serial, locale): serial for serial in devices}
+                for future in as_completed(futures):
+                    serial = futures[future]
+                    try:
+                        future.result()
+                    except Exception as e:
+                        logging.error('[%s] 초기화 중 예외 발생: %s', serial, e)
 
             logging.info('모든 기기 초기화 작업이 완료되었습니다.')
 
