@@ -1,5 +1,6 @@
 import subprocess
 import os
+import re
 import sys
 import logging
 import json
@@ -677,6 +678,192 @@ def wipe_internal_storage(serial):
     logging.info('[%s] 내장 메모리 전체 삭제 완료', serial)
 
 
+def ensure_hotseat_apps(serial):
+    """Hot seat(하단 도크)에 배치될 핵심 앱이 활성화되어 있는지 보장합니다.
+
+    이 앱들이 disabled / uninstall-for-user 상태면 삼성 기본 레이아웃이 Hot seat
+    슬롯을 빈 칸으로 처리합니다. launcher clear 직전에 복원하여 기본 레이아웃이
+    정상적으로 Hot seat에 배치되도록 합니다.
+
+    - install-existing: 시스템 파티션 APK를 현재 user에 재연결 (누락 시 복원)
+    - pm enable: disabled 상태면 활성화
+    두 명령 모두 idempotent이므로 조건 없이 실행합니다.
+    """
+    hotseat_apps = [
+        ('com.samsung.android.dialer', '전화'),
+        ('com.samsung.android.messaging', '메시지'),
+        ('com.sec.android.app.sbrowser', '삼성 인터넷'),
+        ('com.sec.android.app.camera', '카메라'),
+    ]
+    for pkg, name in hotseat_apps:
+        # install-existing은 시스템 파티션에 APK가 있을 때만 성공.
+        # APK 자체가 삭제된 경우(이전 사용자가 root/adb로 완전 제거)엔 NameNotFoundException 발생.
+        result = run_command(['adb', '-s', serial, 'shell', 'cmd', 'package', 'install-existing', pkg])
+        stdout = result.stdout if hasattr(result, 'stdout') and result.stdout else ''
+        stderr = result.stderr if hasattr(result, 'stderr') and result.stderr else ''
+        if 'NameNotFoundException' in stdout or 'NameNotFoundException' in stderr or "doesn't exist" in stdout + stderr:
+            logging.warning('[%s] Hot seat 앱 누락(시스템 APK 없음): %s — 다음 사용자에게 placeholder 노출됨', serial, name)
+            continue
+        run_command(['adb', '-s', serial, 'shell', 'pm', 'enable', pkg])
+        logging.info('[%s] Hot seat 앱 보장: %s (%s)', serial, name, pkg)
+
+
+def reset_widgets_only(serial):
+    """launcher.db 보존하면서 위젯만 제거.
+
+    pm clear launcher를 하지 않으므로 default layout 적용 X → placeholder 생성 trigger 없음.
+    위젯 provider를 일시 disable → launcher force-stop + start 시 binding fail →
+    launcher.db의 위젯 row가 빈 슬롯으로 저장됨. 이후 provider re-enable해도 재등장 X.
+
+    이전 사용자의 홈 아이콘 배치/폴더는 그대로 유지됨.
+    (이전 사용자가 기기를 크게 커스터마이징하지 않았다면 실질적으로 깔끔한 결과)
+    """
+    logging.info('[%s] 위젯 전용 제거 — launcher.db 보존', serial)
+    result = run_command(['adb', '-s', serial, 'shell', 'dumpsys', 'appwidget'])
+    dump = result.stdout if hasattr(result, 'stdout') and result.stdout else ''
+
+    providers = set()
+    in_widgets_section = False
+    for line in dump.split('\n'):
+        stripped = line.strip()
+        if stripped.startswith('Widgets:'):
+            in_widgets_section = True
+            continue
+        if stripped.startswith('Hosts:') or stripped.startswith('Grants:'):
+            in_widgets_section = False
+            continue
+        if in_widgets_section and 'provider=ProviderId' in line:
+            match = re.search(r'cmp:ComponentInfo\{([^/]+)/', line)
+            if match:
+                providers.add(match.group(1))
+
+    if not providers:
+        logging.info('[%s] 바인딩된 위젯 없음 — 스킵', serial)
+        return
+
+    logging.info('[%s] 탐지된 위젯 provider (%d개): %s',
+                 serial, len(providers), ', '.join(sorted(providers)))
+
+    for pkg in providers:
+        run_command(['adb', '-s', serial, 'shell', 'pm', 'disable-user', '--user', '0', pkg])
+
+    # launcher clear 없이 재시작 → db row 검증 + 빈 슬롯 저장
+    run_command(['adb', '-s', serial, 'shell', 'am', 'force-stop', 'com.sec.android.app.launcher'])
+    time.sleep(1)
+    run_command(['adb', '-s', serial, 'shell', 'am', 'start', '-n',
+                 'com.sec.android.app.launcher/.activities.LauncherActivity'])
+    time.sleep(4)
+
+    for pkg in providers:
+        run_command(['adb', '-s', serial, 'shell', 'pm', 'enable', pkg])
+
+    logging.info('[%s] 위젯 제거 완료 — provider 재활성화됨', serial)
+
+
+def block_galaxy_store_auto_restore(serial):
+    """Samsung 계정 보존하면서 Galaxy Store 자동 복원으로 인한 placeholder 차단.
+
+    Samsung Cloud가 이전 기기의 설치 앱 목록을 복원 시도하면서
+    app drawer에 회색 '설치 중' placeholder가 생성됨. Galaxy Store + Samsung Cloud
+    데이터를 정리하고 일시 disable → launcher 재시작 → 남은 row 정리 → re-enable
+    순서로 자동 복원 큐 생성을 차단.
+
+    제한: Samsung 폴더 내부 placeholder는 launcher default layout XML 참조라
+    본 함수로 해결되지 않음 (root 필요).
+    """
+    logging.info('[%s] Galaxy Store 자동 복원 차단 시작', serial)
+    # Galaxy Store + Samsung Cloud 로컬 데이터/큐 삭제
+    run_command(['adb', '-s', serial, 'shell', 'pm', 'clear', 'com.sec.android.app.samsungapps'])
+    run_command(['adb', '-s', serial, 'shell', 'pm', 'clear', 'com.samsung.android.scloud'])
+    # 일시 disable (자동 복원 trigger 차단)
+    for pkg in ['com.sec.android.app.samsungapps', 'com.samsung.android.scloud']:
+        run_command(['adb', '-s', serial, 'shell', 'pm', 'disable-user', '--user', '0', pkg])
+    # launcher 재시작 - disabled 상태에서 db row 검증 trigger
+    run_command(['adb', '-s', serial, 'shell', 'am', 'force-stop', 'com.sec.android.app.launcher'])
+    time.sleep(1)
+    run_command(['adb', '-s', serial, 'shell', 'am', 'start', '-n',
+                 'com.sec.android.app.launcher/.activities.LauncherActivity'])
+    time.sleep(5)
+    # Galaxy Store/Cloud 재활성화 (기능 복원, launcher.db는 이미 정리됨)
+    for pkg in ['com.sec.android.app.samsungapps', 'com.samsung.android.scloud']:
+        run_command(['adb', '-s', serial, 'shell', 'pm', 'enable', pkg])
+    logging.info('[%s] Galaxy Store 자동 복원 차단 완료', serial)
+
+
+def reset_launcher_with_clean_home(serial):
+    """런처 초기화 + 홈화면에 바인딩된 모든 위젯 제거.
+
+    2-pass 전략으로 OEM/통신사 변종을 모두 처리:
+    1차: launcher clear → 삼성 기본 레이아웃 적용 → dumpsys로 바인딩된 위젯 provider 탐지
+    2차: 탐지된 provider들을 일시 disable → launcher clear → 위젯 슬롯 빈 칸으로 저장
+    최종: provider 재활성화 (앱 기능 복원, 이미 저장된 레이아웃은 변경되지 않음)
+
+    하드코딩된 provider 리스트를 쓰지 않으므로 KT/SKT/LGU+, Galaxy S23~S26 등
+    모든 변종에서 자동으로 작동합니다.
+    """
+    logging.info('[%s] 런처 초기화 1차 — 기본 레이아웃 적용 및 위젯 탐지', serial)
+    run_command(['adb', '-s', serial, 'shell', 'pm', 'clear', 'com.sec.android.app.launcher'])
+    time.sleep(1)  # 런처 프로세스 종료 + 재시작 대기
+    # Samsung 런처는 activity가 실제로 표시될 때 default layout을 적용하고 위젯을 바인딩.
+    # pm clear 직후엔 layout이 메모리에 없으므로, am start로 launcher activity를 강제 기동해야 함.
+    run_command(['adb', '-s', serial, 'shell', 'am', 'start', '-n',
+                 'com.sec.android.app.launcher/.activities.LauncherActivity'])
+    time.sleep(4)  # default layout 적용 + 위젯 바인딩 완료 대기
+
+    # 런처 호스트에 바인딩된 위젯의 provider 패키지 추출
+    result = run_command(['adb', '-s', serial, 'shell', 'dumpsys', 'appwidget'])
+    dump = result.stdout if hasattr(result, 'stdout') and result.stdout else ''
+
+    providers = set()
+    in_widgets_section = False
+    for line in dump.split('\n'):
+        stripped = line.strip()
+        if stripped.startswith('Widgets:'):
+            in_widgets_section = True
+            continue
+        if stripped.startswith('Hosts:') or stripped.startswith('Grants:'):
+            in_widgets_section = False
+            continue
+        if in_widgets_section and 'provider=ProviderId' in line:
+            match = re.search(r'cmp:ComponentInfo\{([^/]+)/', line)
+            if match:
+                providers.add(match.group(1))
+
+    if not providers:
+        logging.info('[%s] 바인딩된 위젯 없음 — 2차 clear 생략', serial)
+        return
+
+    logging.info('[%s] 탐지된 위젯 provider (%d개): %s',
+                 serial, len(providers), ', '.join(sorted(providers)))
+
+    # Provider 일시 disable
+    for pkg in providers:
+        run_command(['adb', '-s', serial, 'shell', 'pm', 'disable-user', '--user', '0', pkg])
+
+    # 위젯 + placeholder 제거: launcher.db 보존하면서 launcher만 재시작.
+    # force-stop + start 시점에 launcher가 db row의 패키지 존재성 재검증 →
+    # 누락된 위젯과 app drawer placeholder를 자동 정리.
+    # (pm clear는 launcher.db를 새로 만들어 default layout 다시 적용 → placeholder 재발생)
+    #
+    # 모델별로 launcher의 자동 sweep 타이밍이 다름. 일부 모델(S24 등)은
+    # background sweep job 완료까지 8초 이상 필요. KEYCODE_HOME으로 활성화도 trigger.
+    logging.info('[%s] 런처 재시작 — 위젯 + placeholder 자동 정리', serial)
+    run_command(['adb', '-s', serial, 'shell', 'am', 'force-stop', 'com.sec.android.app.launcher'])
+    time.sleep(1)
+    run_command(['adb', '-s', serial, 'shell', 'am', 'start', '-n',
+                 'com.sec.android.app.launcher/.activities.LauncherActivity'])
+    time.sleep(4)
+    # launcher가 화면에 노출되어야 background sweep이 trigger되는 모델 대응
+    run_command(['adb', '-s', serial, 'shell', 'input', 'keyevent', 'KEYCODE_HOME'])
+    time.sleep(8)  # background sweep job 완료 대기 (모델별로 4-10초 필요)
+
+    # Provider 재활성화 (앱 기능 복원)
+    for pkg in providers:
+        run_command(['adb', '-s', serial, 'shell', 'pm', 'enable', pkg])
+
+    logging.info('[%s] 런처 초기화 완료 — 위젯 제거됨, provider 재활성화됨', serial)
+
+
 def ensure_essential_apps_installed(serial):
     """필수 앱이 설치되어 있는지 확인하고 없으면 설치합니다."""
     apps = [
@@ -735,6 +922,17 @@ def process_device(serial, locale=None):
     # 최종 썸네일 잔여물 제거 (MediaStore 리프레시 후 재생성 방지)
     for d in ['DCIM', 'Pictures', 'Music', 'Movies', 'Download']:
         run_command(['adb', '-s', serial, 'shell', 'rm', '-rf', f'/sdcard/{d}/.thumbnails'])
+
+    # [V6] 홈 런처 초기화 — 이전 사용자의 홈 레이아웃/폴더/위젯 제거 + 위젯 완전 제거
+    # 반드시 배경화면 설정 직전에 실행 (clear 직후 런처 재시작되면서 배경 캐시 재생성)
+    #
+    # Hot seat에 전화/메시지/카메라 배치 보장 → 런처 초기화 (1차 clear로 위젯 탐지,
+    # provider 일시 disable 후 2차 clear로 위젯 억제) → provider 재활성화 순서로 진행.
+    ensure_hotseat_apps(serial)
+    reset_launcher_with_clean_home(serial)
+    # Galaxy Store 자동 복원으로 인한 회색 placeholder 예방 차단
+    # (Samsung 계정 유지 + Galaxy Store/Cloud 일시 disable → launcher 재시작 → re-enable)
+    block_galaxy_store_auto_restore(serial)
 
     push_default_wallpaper(serial, wallpaper, series)
     ensure_essential_apps_installed(serial)
