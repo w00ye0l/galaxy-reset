@@ -28,5 +28,5 @@ jobs:
       - name: Upload EXE artifact
         uses: actions/upload-artifact@v5
         with:
-          name: galaxy-reset-v6
-          path: dist/갤럭시 초기화 V6.exe
+          name: galaxy-reset-v8
+          path: dist/갤럭시 초기화 V8.exe

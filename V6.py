@@ -5,7 +5,11 @@ import sys
 import logging
 import json
 import time
+import shutil
+import threading
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -19,6 +23,272 @@ def resource_path(relative_path):
     if hasattr(sys, '_MEIPASS'):
         return os.path.join(sys._MEIPASS, relative_path)
     return os.path.join(os.path.abspath('.'), relative_path)
+
+
+# ============================================================
+# 0. 진행률 콘솔
+# ============================================================
+
+def _enable_ansi():
+    """Windows 콘솔에서 ANSI 이스케이프(색/커서 이동)를 활성화합니다."""
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+    if os.name != 'nt':
+        return True
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        return bool(kernel32.SetConsoleMode(handle, mode.value | 0x0004))
+    except Exception:
+        return False
+
+
+def _display_width(text):
+    """한글 등 전각 문자를 2칸으로 계산한 표시 폭."""
+    return sum(2 if unicodedata.east_asian_width(ch) in ('W', 'F') else 1 for ch in text)
+
+
+def _trim_to_width(text, limit):
+    """표시 폭 기준으로 문자열을 자릅니다(줄바꿈으로 커서 계산이 깨지는 것 방지)."""
+    if _display_width(text) <= limit:
+        return text
+    out, width = [], 0
+    for ch in text:
+        char_width = 2 if unicodedata.east_asian_width(ch) in ('W', 'F') else 1
+        if width + char_width > limit:
+            break
+        out.append(ch)
+        width += char_width
+    return ''.join(out)
+
+
+class ProgressConsole:
+    """기기별 초기화 진행률을 콘솔에 제자리 갱신으로 표시합니다.
+
+    5개 스레드가 동시에 진행 상황을 보고하지만 화면에 그리는 주체는
+    내부 렌더 스레드 하나뿐입니다. 각 워커는 락 안에서 상태만 갱신하고,
+    커서를 움직이는 것은 렌더 스레드가 전담해 출력이 섞이지 않습니다.
+    """
+
+    RESET = '\x1b[0m'
+    DIM = '\x1b[90m'
+    WHITE = '\x1b[97m'
+    GREEN = '\x1b[92m'
+    CYAN = '\x1b[96m'
+    YELLOW = '\x1b[93m'
+    RED = '\x1b[91m'
+    SPINNER = '|/-\\'
+
+    def __init__(self, total_steps):
+        self.total_steps = total_steps
+        self.states = {}
+        self.order = []
+        self.lock = threading.Lock()
+        self.active = False
+        self.started_at = 0.0
+        self.lines_drawn = 0
+        self.render_thread = None
+        self.stop_event = threading.Event()
+        self.console_handler = None
+        # 콘솔 코드페이지가 UTF-8이 아니면 블록 문자가 깨지므로 ASCII로 대체
+        self.fill_char, self.empty_char = self._pick_bar_chars()
+
+    @staticmethod
+    def _pick_bar_chars():
+        try:
+            '█░'.encode(sys.stdout.encoding or 'utf-8')
+            return '█', '░'
+        except Exception:
+            return '#', '-'
+
+    def start(self, serials):
+        """진행률 표시를 시작합니다. 콘솔 로그는 화면이 섞이지 않도록 잠시 끕니다."""
+        if not sys.stdout.isatty() or not _enable_ansi():
+            return False  # 출력이 리다이렉트된 경우 기존 로그 방식 유지
+        with self.lock:
+            self.order = list(serials)
+            self.states = {
+                serial: {'index': 0, 'label': '대기 중', 'status': 'wait',
+                         'model': '', 'series': '', 'note': '',
+                         'started_at': None, 'finished_at': None}
+                for serial in serials
+            }
+            self.started_at = time.time()
+            self.active = True
+        for handler in list(logging.getLogger().handlers):
+            if isinstance(handler, logging.StreamHandler):
+                self.console_handler = handler
+                logging.getLogger().removeHandler(handler)
+        self.stop_event.clear()
+        self.render_thread = threading.Thread(target=self._render_loop, daemon=True)
+        self.render_thread.start()
+        return True
+
+    def stop(self):
+        """마지막 화면을 한 번 더 그리고 콘솔 로그를 되돌립니다."""
+        if not self.active:
+            return
+        self.stop_event.set()
+        if self.render_thread:
+            self.render_thread.join(timeout=2)
+        self._draw()
+        self.active = False
+        if self.console_handler:
+            logging.getLogger().addHandler(self.console_handler)
+            self.console_handler = None
+        sys.stdout.write('\n')
+        sys.stdout.flush()
+
+    # --- 워커 스레드가 호출하는 보고용 메서드 ---
+
+    def set_info(self, serial, model, series):
+        self._update(serial, model=model, series=series)
+
+    def step(self, serial, index, label):
+        self._update(serial, index=index, label=label, status='run')
+
+    def note(self, serial, message):
+        """정상적으로 건너뛴 단계 등 참고 사항을 노란색으로 남깁니다."""
+        self._update(serial, note=message)
+
+    def done(self, serial):
+        self._update(serial, index=self.total_steps, label='초기화 완료',
+                     status='done', finished_at=time.time())
+
+    def fail(self, serial, message):
+        self._update(serial, label=message, status='fail', finished_at=time.time())
+
+    def _update(self, serial, **fields):
+        if not self.active:
+            return
+        with self.lock:
+            state = self.states.get(serial)
+            if state is None:
+                return
+            if state['started_at'] is None and fields.get('status') == 'run':
+                state['started_at'] = time.time()
+            state.update(fields)
+
+    # --- 렌더 스레드 전용 ---
+
+    def _render_loop(self):
+        while not self.stop_event.is_set():
+            self._draw()
+            self.stop_event.wait(0.15)
+
+    def _draw(self):
+        try:
+            columns = max(48, shutil.get_terminal_size((80, 25)).columns)
+        except Exception:
+            columns = 80
+        bar_width = max(10, min(40, columns - 30))
+
+        with self.lock:
+            states = {serial: dict(self.states[serial]) for serial in self.order}
+            order = list(self.order)
+            elapsed = time.time() - self.started_at
+
+        completed = sum(1 for s in states.values() if s['status'] == 'done')
+        failed = sum(1 for s in states.values() if s['status'] == 'fail')
+        all_settled = (completed + failed) == len(order) and order
+        rule = '═' * min(68, columns - 2)
+        lines = []
+
+        lines.append(' ' + self.WHITE + '갤럭시 초기화 V8' + self.RESET +
+                     self.DIM + '   기기 %d대' % len(order) + self.RESET)
+        summary_color = self.GREEN if (all_settled and not failed) else self.WHITE
+        summary = (self.DIM + ' 완료 ' + self.RESET + summary_color +
+                   '%d / %d' % (completed, len(order)) + self.RESET)
+        if failed:
+            summary += self.DIM + '     실패 ' + self.RESET + self.RED + str(failed) + self.RESET
+        summary += self.DIM + '     경과 ' + self.RESET + self.WHITE + self._mmss(elapsed) + self.RESET
+        lines.append(summary)
+        lines.append(self.DIM + rule + self.RESET)
+
+        for position, serial in enumerate(order, start=1):
+            state = states[serial]
+            status = state['status']
+            index = state['index']
+            fraction = min(1.0, index / float(self.total_steps)) if self.total_steps else 0.0
+
+            if status == 'done':
+                head_color, bar_color = self.GREEN, self.GREEN
+            elif status == 'fail':
+                head_color, bar_color = self.RED, self.RED
+            elif status == 'wait':
+                head_color, bar_color = self.DIM, self.DIM
+            else:
+                head_color, bar_color = self.WHITE, self.CYAN
+
+            model = (' ' + state['model']) if state['model'] else ''
+            series = (' ' + state['series']) if state['series'] else ''
+            lines.append(head_color + ' [%d] %s%s%s' % (position, serial, model, series) + self.RESET)
+
+            filled = int(round(fraction * bar_width))
+            bar = (self.DIM + '[' + self.RESET + bar_color + self.fill_char * filled + self.RESET +
+                   self.DIM + self.empty_char * (bar_width - filled) + ']' + self.RESET)
+            percent_color = self.GREEN if status == 'done' else (self.RED if status == 'fail' else self.WHITE)
+            lines.append('     ' + bar + '  ' + percent_color + '%3d%%' % round(fraction * 100) + self.RESET +
+                         self.DIM + '  %2d/%d' % (index, self.total_steps) + self.RESET)
+
+            if status == 'done':
+                spent = (state['finished_at'] or 0) - (state['started_at'] or state['finished_at'] or 0)
+                lines.append(self.GREEN + '     √ 초기화 완료' + self.RESET +
+                             self.DIM + '  (%s)' % self._mmss(spent) + self.RESET)
+            elif status == 'fail':
+                lines.append(self.RED + '     × ' + state['label'] + self.RESET)
+            elif status == 'wait':
+                lines.append(self.DIM + '     · 대기 중' + self.RESET)
+            elif state['note']:
+                lines.append(self.YELLOW + '     ! ' + state['note'] + self.RESET)
+            else:
+                spin = self.SPINNER[int(time.time() * 6) % len(self.SPINNER)]
+                lines.append(self.CYAN + '     %s %s' % (spin, state['label']) + self.RESET)
+
+        lines.append(self.DIM + rule + self.RESET)
+        if all_settled and failed:
+            lines.append(self.RED + ' 실패 %d대 — 해당 기기는 다시 초기화하세요.' % failed + self.RESET)
+        elif all_settled:
+            lines.append(self.GREEN + ' 모든 기기 초기화 완료.' + self.RESET)
+        else:
+            lines.append(self.DIM + ' 기기를 뽑지 마세요. 완료된 기기부터 분리할 수 있습니다.' + self.RESET)
+
+        buffer = []
+        if self.lines_drawn:
+            buffer.append('\x1b[%dA' % self.lines_drawn)  # 이전에 그린 만큼 커서를 위로
+        for line in lines:
+            buffer.append('\x1b[2K' + self._clip(line, columns - 1) + '\n')
+        sys.stdout.write(''.join(buffer))
+        sys.stdout.flush()
+        self.lines_drawn = len(lines)
+
+    def _clip(self, line, limit):
+        """ANSI 색 코드는 폭 계산에서 제외하고 자릅니다."""
+        parts = re.split(r'(\x1b\[[0-9;]*m)', line)
+        out, width = [], 0
+        for part in parts:
+            if part.startswith('\x1b['):
+                out.append(part)
+                continue
+            trimmed = _trim_to_width(part, limit - width)
+            out.append(trimmed)
+            width += _display_width(trimmed)
+        return ''.join(out) + self.RESET
+
+    @staticmethod
+    def _mmss(seconds):
+        seconds = max(0, int(seconds))
+        return '%02d:%02d' % (seconds // 60, seconds % 60)
+
+
+PROGRESS = None  # main()에서 기기 수를 알 때 생성
 
 
 def run_command(cmd, check=False, timeout=60, retries=1):
@@ -61,10 +331,15 @@ MODEL_TO_SERIES = {
 }
 
 
+def get_device_model(serial):
+    """모델명(예: SM-S948N)을 반환합니다. 조회 실패 시 빈 문자열."""
+    result = run_command(['adb', '-s', serial, 'shell', 'getprop', 'ro.product.model'])
+    return result.stdout.strip() if hasattr(result, 'stdout') and result.stdout else ''
+
+
 def detect_series(serial):
     """모델명(getprop)으로 디바이스 시리즈를 자동 감지합니다."""
-    result = run_command(['adb', '-s', serial, 'shell', 'getprop', 'ro.product.model'])
-    model = result.stdout.strip() if hasattr(result, 'stdout') and result.stdout else ''
+    model = get_device_model(serial)
     if model:
         # SM-S948N → S94 → S26
         for prefix, series in MODEL_TO_SERIES.items():
@@ -397,6 +672,72 @@ def clear_google_apps_history(serial):
     for package, name in google_apps.items():
         clear_app_data(serial, package, name)
     logging.info('[%s] Google 앱 사용 기록 삭제 완료.', serial)
+
+
+def reset_camera_settings(serial):
+    """카메라 앱 데이터를 초기화하여 설정(화면비, 워터마크, 격자 등)을 기본값으로 되돌립니다."""
+    camera_apps = {
+        'com.sec.android.app.camera': '카메라',
+        'com.samsung.android.app.cameraassistant': '카메라 어시스턴트',
+    }
+    logging.info('[%s] 카메라 설정 초기화 시작...', serial)
+    for package, name in camera_apps.items():
+        clear_app_data(serial, package, name)
+    logging.info('[%s] 카메라 설정 초기화 완료.', serial)
+
+
+def reset_navigation_bar(serial):
+    """내비게이션 바를 공장 기본값(3버튼, 최근앱-홈-뒤로가기 순서)으로 되돌립니다.
+
+    One UI는 내비게이션 모드를 RRO 오버레이로, 세부 옵션(버튼 순서 등)을
+    settings global/secure로 관리하므로 두 층을 모두 초기화해야 합니다.
+    공장 기본 상태 = 모든 navbar 오버레이 비활성 + 아래 settings 값 (S26 실측).
+    """
+    navbar_overlays = [
+        'com.samsung.internal.systemui.navbar.sec_gestural',
+        'com.samsung.internal.systemui.navbar.sec_gestural_no_hint',
+        'com.samsung.internal.systemui.navbar.gestural_no_hint',
+        'com.android.internal.systemui.navbar.gestural',
+        'com.android.internal.systemui.navbar.transparent',
+        'com.android.internal.systemui.navbar.threebutton',
+    ]
+    default_settings = [
+        ('global', 'navigation_bar_gesture_while_hidden', '0'),  # 제스처 → 버튼
+        ('secure', 'navigation_mode', '0'),                      # 3버튼 모드
+        ('global', 'navigationbar_key_order', '0'),              # 최근앱-홈-뒤로가기
+        ('secure', 'navigationbar_key_order', '0'),
+        ('global', 'navigation_bar_gesture_hint', '1'),          # 제스처 힌트 기본 on
+    ]
+    logging.info('[%s] 내비게이션 바 초기화 시작...', serial)
+    for overlay in navbar_overlays:
+        run_command(['adb', '-s', serial, 'shell',
+                     'cmd', 'overlay', 'disable', '--user', '0', overlay])
+    for namespace, key, value in default_settings:
+        run_command(['adb', '-s', serial, 'shell',
+                     'settings', 'put', namespace, key, value])
+    logging.info('[%s] 내비게이션 바 초기화 완료.', serial)
+
+
+def reset_font_settings(serial):
+    """글자 크기/굵기/글자체를 공장 기본값으로 되돌립니다.
+
+    system font_scale이 실제 렌더링을 결정하고(시스템 Configuration에 즉시 반영),
+    global font_size는 삼성 설정 UI의 슬라이더 위치(0~6, 기본 2)를 저장합니다.
+    두 값이 어긋나면 UI 슬라이더와 실제 크기가 따로 놀기 때문에 함께 맞춥니다.
+    """
+    default_settings = [
+        ('system', 'font_scale', '1.0'),          # 실제 렌더링 배율
+        ('system', 'device_font_scale', '1.0'),
+        ('global', 'font_size', '2'),             # 설정 UI 슬라이더 기본 위치
+        ('global', 'bold_text', '0'),             # 굵게 표시 해제
+        ('global', 'font_style_index', '0'),      # 기본 글자체
+        ('secure', 'enhanced_comfort_font_value', '0'),
+    ]
+    logging.info('[%s] 글자 크기/글자체 초기화 시작...', serial)
+    for namespace, key, value in default_settings:
+        run_command(['adb', '-s', serial, 'shell',
+                     'settings', 'put', namespace, key, value])
+    logging.info('[%s] 글자 크기/글자체 초기화 완료.', serial)
 
 
 def clear_call_sms_contacts(serial):
@@ -891,6 +1232,45 @@ def ensure_essential_apps_installed(serial):
 # 4. 메인 프로세스
 # ============================================================
 
+def build_pipeline(serial, locale, wallpaper, series):
+    """초기화 단계를 (표시 이름, 실행 함수) 순서대로 정의합니다.
+
+    순서에 의미가 있는 구간이 있으므로 아래 주석을 지키세요.
+    - 카메라 초기화는 ensure_hotseat_apps 이전 (clear 후 pm enable로 마무리)
+    - 런처 초기화는 배경화면 설정 직전 (clear 직후 런처가 배경 캐시를 재생성)
+    """
+    def clear_thumbnails():
+        # MediaStore 리프레시 후 썸네일이 되살아나는 것을 막는 마무리 단계
+        for folder in ['DCIM', 'Pictures', 'Music', 'Movies', 'Download']:
+            run_command(['adb', '-s', serial, 'shell', 'rm', '-rf', f'/sdcard/{folder}/.thumbnails'])
+
+    return [
+        ('언어 설정', lambda: set_device_language(serial, locale)),
+        ('계정 삭제', lambda: remove_non_samsung_accounts(serial)),
+        ('e-SIM 프로필 삭제', lambda: delete_esim_profiles(serial)),
+        ('Google 앱 기록 삭제', lambda: clear_google_apps_history(serial)),
+        ('사용자 설치 앱 삭제', lambda: delete_user_installed_apps(serial)),
+        ('내부 저장소 초기화', lambda: wipe_internal_storage(serial)),
+        ('로그·캐시 정리', lambda: clear_logs_and_cache(serial)),
+        ('갤러리 휴지통 정리', lambda: deep_clean_gallery_trash(serial)),
+        ('미디어 스토어 갱신', lambda: clear_media_store(serial)),
+        ('썸네일 잔여물 제거', clear_thumbnails),
+        ('카메라 설정 초기화', lambda: reset_camera_settings(serial)),
+        ('내비게이션 바 초기화', lambda: reset_navigation_bar(serial)),
+        ('글자 크기 초기화', lambda: reset_font_settings(serial)),
+        ('홈 독 앱 배치', lambda: ensure_hotseat_apps(serial)),
+        ('런처 초기화', lambda: reset_launcher_with_clean_home(serial)),
+        ('Galaxy Store 복원 차단', lambda: block_galaxy_store_auto_restore(serial)),
+        ('배경화면 적용', lambda: push_default_wallpaper(serial, wallpaper, series)),
+        ('필수 앱 설치', lambda: ensure_essential_apps_installed(serial)),
+        ('최근 앱 목록 제거', lambda: clear_recent_tasks(serial)),
+    ]
+
+
+# 단계를 추가/삭제해도 진행률 분모가 자동으로 따라가도록 실제 목록에서 센다
+PIPELINE_STEP_COUNT = len(build_pipeline('', None, '', ''))
+
+
 def process_device(serial, locale=None):
     """단일 기기에 대한 전체 초기화 프로세스를 실행합니다."""
     logging.info('========================================')
@@ -899,47 +1279,27 @@ def process_device(serial, locale=None):
 
     series = detect_series(serial)
     wallpaper = f'{series}.png'
+    model = get_device_model(serial)
+    if PROGRESS:
+        PROGRESS.set_info(serial, model, series)
 
-    # [V6] 언어 설정 변경
-    set_device_language(serial, locale)
+    steps = build_pipeline(serial, locale, wallpaper, series)
+    for number, (label, action) in enumerate(steps, start=1):
+        if PROGRESS:
+            PROGRESS.step(serial, number - 1, label)
+        logging.info('[%s] (%d/%d) %s', serial, number, len(steps), label)
+        try:
+            action()
+        except Exception as e:
+            # 기존 동작 유지 — 예외는 main()이 기기별로 잡아 기록하고 해당 기기만 중단
+            if PROGRESS:
+                PROGRESS.fail(serial, '%s 중 실패: %s' % (label, e))
+            raise
+        if PROGRESS:
+            PROGRESS.step(serial, number, label)
 
-    # [V6] 삼성 계정 제외 모든 계정 삭제
-    remove_non_samsung_accounts(serial)
-
-    # [V6] e-SIM 프로필 삭제 (다른 사용자에게 넘기기 전 완전 삭제)
-    delete_esim_profiles(serial)
-
-    clear_google_apps_history(serial)
-    delete_user_installed_apps(serial)
-    wipe_internal_storage(serial)
-    clear_logs_and_cache(serial)
-
-    # [V6] 갤러리 휴지통 완전 정리 (clear_logs_and_cache 이후 재생성된 찌꺼기 포함)
-    deep_clean_gallery_trash(serial)
-
-    clear_media_store(serial)
-
-    # 최종 썸네일 잔여물 제거 (MediaStore 리프레시 후 재생성 방지)
-    for d in ['DCIM', 'Pictures', 'Music', 'Movies', 'Download']:
-        run_command(['adb', '-s', serial, 'shell', 'rm', '-rf', f'/sdcard/{d}/.thumbnails'])
-
-    # [V6] 홈 런처 초기화 — 이전 사용자의 홈 레이아웃/폴더/위젯 제거 + 위젯 완전 제거
-    # 반드시 배경화면 설정 직전에 실행 (clear 직후 런처 재시작되면서 배경 캐시 재생성)
-    #
-    # Hot seat에 전화/메시지/카메라 배치 보장 → 런처 초기화 (1차 clear로 위젯 탐지,
-    # provider 일시 disable 후 2차 clear로 위젯 억제) → provider 재활성화 순서로 진행.
-    ensure_hotseat_apps(serial)
-    reset_launcher_with_clean_home(serial)
-    # Galaxy Store 자동 복원으로 인한 회색 placeholder 예방 차단
-    # (Samsung 계정 유지 + Galaxy Store/Cloud 일시 disable → launcher 재시작 → re-enable)
-    block_galaxy_store_auto_restore(serial)
-
-    push_default_wallpaper(serial, wallpaper, series)
-    ensure_essential_apps_installed(serial)
-
-    # 최근 앱 목록 제거 (app_process + DEX)
-    clear_recent_tasks(serial)
-
+    if PROGRESS:
+        PROGRESS.done(serial)
     logging.info('========================================')
     logging.info('[%s] 초기화 완료', serial)
     logging.info('========================================')
@@ -958,17 +1318,32 @@ def main():
             # [V6] 언어 선택 메뉴
             locale = select_language()
 
+            global PROGRESS
+            PROGRESS = ProgressConsole(PIPELINE_STEP_COUNT)
+            if not PROGRESS.start(devices):
+                PROGRESS = None  # 콘솔이 아니면 기존 로그 방식으로 진행
+
+            failures = []
             max_workers = min(5, len(devices))
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = {executor.submit(process_device, serial, locale): serial for serial in devices}
-                for future in as_completed(futures):
-                    serial = futures[future]
-                    try:
-                        future.result()
-                    except Exception as e:
-                        logging.error('[%s] 초기화 중 예외 발생: %s', serial, e)
+            try:
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = {executor.submit(process_device, serial, locale): serial for serial in devices}
+                    for future in as_completed(futures):
+                        serial = futures[future]
+                        try:
+                            future.result()
+                        except Exception as e:
+                            failures.append(serial)
+                            logging.error('[%s] 초기화 중 예외 발생: %s', serial, e)
+            finally:
+                if PROGRESS:
+                    PROGRESS.stop()
+                    PROGRESS = None
 
             logging.info('모든 기기 초기화 작업이 완료되었습니다.')
+            if failures:
+                logging.error('실패한 기기 %d대: %s — 다시 초기화하세요.',
+                              len(failures), ', '.join(failures))
 
             # 기기 종료 여부 확인
             shutdown = input('기기를 종료하시겠습니까? (y/n): ').strip().lower()

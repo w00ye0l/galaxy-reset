@@ -37,7 +37,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='갤럭시 초기화 V6',
+    name='갤럭시 초기화 V8',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
