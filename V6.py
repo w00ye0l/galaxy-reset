@@ -50,6 +50,43 @@ def _enable_ansi():
         return False
 
 
+def _console_size():
+    """콘솔 '창'의 (가로, 세로)를 반환합니다.
+
+    Windows에서 shutil.get_terminal_size()는 창이 아니라 화면 버퍼 크기를
+    돌려줄 수 있습니다. 버퍼가 창보다 넓으면 실제로는 줄바꿈이 일어나는데도
+    넉넉한 너비로 착각해 커서 계산이 어긋나므로, srWindow에서 직접 읽습니다.
+    """
+    if os.name == 'nt':
+        try:
+            import ctypes
+
+            class _COORD(ctypes.Structure):
+                _fields_ = [('X', ctypes.c_short), ('Y', ctypes.c_short)]
+
+            class _SMALL_RECT(ctypes.Structure):
+                _fields_ = [('Left', ctypes.c_short), ('Top', ctypes.c_short),
+                            ('Right', ctypes.c_short), ('Bottom', ctypes.c_short)]
+
+            class _SCREEN_BUFFER_INFO(ctypes.Structure):
+                _fields_ = [('dwSize', _COORD), ('dwCursorPosition', _COORD),
+                            ('wAttributes', ctypes.c_ushort), ('srWindow', _SMALL_RECT),
+                            ('dwMaximumWindowSize', _COORD)]
+
+            info = _SCREEN_BUFFER_INFO()
+            kernel32 = ctypes.windll.kernel32
+            if kernel32.GetConsoleScreenBufferInfo(kernel32.GetStdHandle(-11), ctypes.byref(info)):
+                window = info.srWindow
+                return (window.Right - window.Left + 1, window.Bottom - window.Top + 1)
+        except Exception:
+            pass
+    try:
+        size = shutil.get_terminal_size((80, 25))
+        return (size.columns, size.lines)
+    except Exception:
+        return (80, 25)
+
+
 def _display_width(text):
     """한글 등 전각 문자를 2칸으로 계산한 표시 폭."""
     return sum(2 if unicodedata.east_asian_width(ch) in ('W', 'F') else 1 for ch in text)
@@ -93,7 +130,6 @@ class ProgressConsole:
         self.lock = threading.Lock()
         self.active = False
         self.started_at = 0.0
-        self.lines_drawn = 0
         self.render_thread = None
         self.stop_event = threading.Event()
         self.console_handler = None
@@ -126,6 +162,11 @@ class ProgressConsole:
             if isinstance(handler, logging.StreamHandler):
                 self.console_handler = handler
                 logging.getLogger().removeHandler(handler)
+        # 전용 화면 버퍼로 전환 + 커서 숨김 + 자동 줄바꿈 해제.
+        # 매 프레임 좌상단(\x1b[H)부터 다시 그리므로 '몇 줄 올릴지' 계산이 필요 없고,
+        # 폭·높이 계산이 틀려도 출력이 아래로 누적될 수 없다.
+        sys.stdout.write('\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[2J')
+        sys.stdout.flush()
         self.stop_event.clear()
         self.render_thread = threading.Thread(target=self._render_loop, daemon=True)
         self.render_thread.start()
@@ -139,12 +180,15 @@ class ProgressConsole:
         if self.render_thread:
             self.render_thread.join(timeout=2)
         self._draw()
+        final_lines = self._compose()
         self.active = False
+        # 전용 화면을 빠져나오면 진행 화면은 사라지므로, 원래 화면에 결과를 다시 남긴다
+        sys.stdout.write('\x1b[?7h\x1b[?25h\x1b[?1049l')
+        sys.stdout.write('\n'.join(final_lines) + '\n\n')
+        sys.stdout.flush()
         if self.console_handler:
             logging.getLogger().addHandler(self.console_handler)
             self.console_handler = None
-        sys.stdout.write('\n')
-        sys.stdout.flush()
 
     # --- 워커 스레드가 호출하는 보고용 메서드 ---
 
@@ -184,11 +228,19 @@ class ProgressConsole:
             self.stop_event.wait(0.15)
 
     def _draw(self):
-        try:
-            columns = max(48, shutil.get_terminal_size((80, 25)).columns)
-        except Exception:
-            columns = 80
-        bar_width = max(10, min(40, columns - 30))
+        """좌상단부터 다시 그립니다. 이전 프레임 줄 수를 추적하지 않습니다."""
+        columns, _ = _console_size()
+        lines = [self._clip(line, max(8, columns - 1)) for line in self._compose()]
+        buffer = ['\x1b[H']                       # 커서를 항상 좌상단으로
+        buffer += ['\x1b[2K' + line + '\r\n' for line in lines]
+        buffer.append('\x1b[J')                   # 이전 프레임이 더 길었을 경우 잔여물 제거
+        sys.stdout.write(''.join(buffer))
+        sys.stdout.flush()
+
+    def _compose(self):
+        """현재 상태를 화면에 그릴 줄 목록으로 만듭니다(색 코드 포함)."""
+        columns, rows = _console_size()
+        columns = max(24, columns)
 
         with self.lock:
             states = {serial: dict(self.states[serial]) for serial in self.order}
@@ -198,7 +250,11 @@ class ProgressConsole:
         completed = sum(1 for s in states.values() if s['status'] == 'done')
         failed = sum(1 for s in states.values() if s['status'] == 'fail')
         all_settled = (completed + failed) == len(order) and order
-        rule = '═' * min(68, columns - 2)
+        rule = '═' * max(8, min(68, columns - 2))
+        # 기기가 많아 창 높이를 넘으면 아래쪽 기기가 안 보이므로 기기당 2줄로 접는다
+        compact = (5 + len(order) * 3) > rows
+        # 접었을 때는 막대 뒤에 상태 문구가 붙으므로 막대를 좁혀 자리를 남긴다
+        bar_width = max(8, min(18, columns - 46)) if compact else max(8, min(34, columns - 26))
         lines = []
 
         lines.append(' ' + self.WHITE + '갤럭시 초기화 V8' + self.RESET +
@@ -240,34 +296,32 @@ class ProgressConsole:
 
             if status == 'done':
                 spent = (state['finished_at'] or 0) - (state['started_at'] or state['finished_at'] or 0)
-                lines.append(self.GREEN + '     √ 초기화 완료' + self.RESET +
-                             self.DIM + '  (%s)' % self._mmss(spent) + self.RESET)
+                status_line = (self.GREEN + '√ 초기화 완료' + self.RESET +
+                               self.DIM + ' (%s)' % self._mmss(spent) + self.RESET)
             elif status == 'fail':
-                lines.append(self.RED + '     × ' + state['label'] + self.RESET)
+                status_line = self.RED + '× ' + state['label'] + self.RESET
             elif status == 'wait':
-                lines.append(self.DIM + '     · 대기 중' + self.RESET)
+                status_line = self.DIM + '· 대기 중' + self.RESET
             elif state['note']:
-                lines.append(self.YELLOW + '     ! ' + state['note'] + self.RESET)
+                status_line = self.YELLOW + '! ' + state['note'] + self.RESET
             else:
                 spin = self.SPINNER[int(time.time() * 6) % len(self.SPINNER)]
-                lines.append(self.CYAN + '     %s %s' % (spin, state['label']) + self.RESET)
+                status_line = self.CYAN + '%s %s' % (spin, state['label']) + self.RESET
+
+            if compact:
+                lines[-1] += '  ' + status_line  # 막대 줄 뒤에 붙여 한 줄 절약
+            else:
+                lines.append('     ' + status_line)
 
         lines.append(self.DIM + rule + self.RESET)
         if all_settled and failed:
-            lines.append(self.RED + ' 실패 %d대 — 해당 기기는 다시 초기화하세요.' % failed + self.RESET)
+            lines.append(self.RED + ' 실패 %d대 — 다시 초기화하세요.' % failed + self.RESET)
         elif all_settled:
             lines.append(self.GREEN + ' 모든 기기 초기화 완료.' + self.RESET)
         else:
-            lines.append(self.DIM + ' 기기를 뽑지 마세요. 완료된 기기부터 분리할 수 있습니다.' + self.RESET)
+            lines.append(self.DIM + ' 완료된 기기부터 분리하세요.' + self.RESET)
 
-        buffer = []
-        if self.lines_drawn:
-            buffer.append('\x1b[%dA' % self.lines_drawn)  # 이전에 그린 만큼 커서를 위로
-        for line in lines:
-            buffer.append('\x1b[2K' + self._clip(line, columns - 1) + '\n')
-        sys.stdout.write(''.join(buffer))
-        sys.stdout.flush()
-        self.lines_drawn = len(lines)
+        return lines
 
     def _clip(self, line, limit):
         """ANSI 색 코드는 폭 계산에서 제외하고 자릅니다."""
@@ -337,9 +391,8 @@ def get_device_model(serial):
     return result.stdout.strip() if hasattr(result, 'stdout') and result.stdout else ''
 
 
-def detect_series(serial):
-    """모델명(getprop)으로 디바이스 시리즈를 자동 감지합니다."""
-    model = get_device_model(serial)
+def series_from_model(model, serial=''):
+    """모델명 문자열에서 시리즈를 판정합니다(추가 adb 호출 없음)."""
     if model:
         # SM-S948N → S94 → S26
         for prefix, series in MODEL_TO_SERIES.items():
@@ -350,6 +403,11 @@ def detect_series(serial):
     else:
         logging.warning('[%s] 모델명 조회 실패 — 기본값 S24 사용', serial)
     return 'S24'
+
+
+def detect_series(serial):
+    """모델명(getprop)으로 디바이스 시리즈를 자동 감지합니다."""
+    return series_from_model(get_device_model(serial), serial)
 
 
 def clear_app_data(serial, package, desc):
@@ -1277,9 +1335,10 @@ def process_device(serial, locale=None):
     logging.info('[%s] 초기화 시작', serial)
     logging.info('========================================')
 
-    series = detect_series(serial)
-    wallpaper = f'{series}.png'
+    # 모델명은 한 번만 조회해 시리즈 판정과 화면 표시에 함께 쓴다
     model = get_device_model(serial)
+    series = series_from_model(model, serial)
+    wallpaper = f'{series}.png'
     if PROGRESS:
         PROGRESS.set_info(serial, model, series)
 
