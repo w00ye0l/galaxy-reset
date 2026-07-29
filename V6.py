@@ -8,7 +8,8 @@ import time
 import shutil
 import threading
 import unicodedata
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import collections
+from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 
 
 logging.basicConfig(
@@ -16,6 +17,40 @@ logging.basicConfig(
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[logging.StreamHandler(sys.stdout)]
 )
+
+# 워커 스레드가 어느 기기를 처리 중인지 로그 분류용 태깅
+_TLS = threading.local()
+
+
+class DeviceLogHandler(logging.Handler):
+    """기기별 최근 로그를 메모리에만 보관합니다(파일 기록 없음).
+
+    진행률 화면이 콘솔을 차지하는 동안에도 루트 로거에 핸들러가 최소 1개
+    남아 있게 하는 역할도 겸합니다 — 핸들러가 0개면 logging.lastResort가
+    WARNING 이상을 stderr로 흘려 진행률 화면을 오염시킵니다.
+    실행 종료 후 실패한 기기의 직전 로그만 tail()로 꺼내 보여줍니다.
+    """
+
+    def __init__(self, maxlen=40):
+        super().__init__()
+        self.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+        self._buffers = collections.defaultdict(lambda: collections.deque(maxlen=maxlen))
+        self._buffer_lock = threading.Lock()
+
+    def emit(self, record):
+        try:
+            serial = getattr(_TLS, 'serial', None)
+            if not serial:
+                match = re.match(r'\[([A-Za-z0-9]+)\]', record.getMessage())
+                serial = match.group(1) if match else '_global'
+            with self._buffer_lock:
+                self._buffers[serial].append(self.format(record))
+        except Exception:
+            pass  # 로그 수집 실패가 초기화를 방해하면 안 됨
+
+    def tail(self, serial, count=15):
+        with self._buffer_lock:
+            return list(self._buffers.get(serial, []))[-count:]
 
 
 def resource_path(relative_path):
@@ -152,7 +187,7 @@ class ProgressConsole:
             self.order = list(serials)
             self.states = {
                 serial: {'index': 0, 'label': '대기 중', 'status': 'wait',
-                         'model': '', 'series': '', 'note': '',
+                         'model': '', 'series': '', 'name': '', 'lang': '', 'note': '',
                          'started_at': None, 'finished_at': None}
                 for serial in serials
             }
@@ -192,8 +227,8 @@ class ProgressConsole:
 
     # --- 워커 스레드가 호출하는 보고용 메서드 ---
 
-    def set_info(self, serial, model, series):
-        self._update(serial, model=model, series=series)
+    def set_info(self, serial, model, series, name='', lang=''):
+        self._update(serial, model=model, series=series, name=name, lang=lang)
 
     def step(self, serial, index, label):
         self._update(serial, index=index, label=label, status='run')
@@ -224,7 +259,11 @@ class ProgressConsole:
 
     def _render_loop(self):
         while not self.stop_event.is_set():
-            self._draw()
+            try:
+                self._draw()
+            except Exception:
+                # 한 프레임 실패(콘솔 리사이즈, 인코딩 등)가 UI 전체를 멈추면 안 됨
+                pass
             self.stop_event.wait(0.15)
 
     def _draw(self):
@@ -283,9 +322,13 @@ class ProgressConsole:
             else:
                 head_color, bar_color = self.WHITE, self.CYAN
 
+            # 기기 이름(자산 라벨)이 있으면 맨 앞에 — 20대 중 어느 폰인지 바로 찾는 용도
+            name = (state['name'] + '  ') if state['name'] else ''
             model = (' ' + state['model']) if state['model'] else ''
             series = (' ' + state['series']) if state['series'] else ''
-            lines.append(head_color + ' [%d] %s%s%s' % (position, serial, model, series) + self.RESET)
+            lines.append(head_color + ' [%d] %s%s%s%s' % (position, name, serial, model, series) +
+                         self.RESET +
+                         (self.DIM + '  ' + state['lang'] + self.RESET if state['lang'] else ''))
 
             filled = int(round(fraction * bar_width))
             bar = (self.DIM + '[' + self.RESET + bar_color + self.fill_char * filled + self.RESET +
@@ -345,15 +388,68 @@ class ProgressConsole:
 PROGRESS = None  # main()에서 기기 수를 알 때 생성
 
 
-def run_command(cmd, check=False, timeout=60, retries=1):
-    """주어진 명령어를 실행하고 결과를 반환합니다. 실패 시 재시도합니다."""
+class DeviceLostError(RuntimeError):
+    """adb가 기기를 더 이상 보지 못함 — 해당 기기의 파이프라인 즉시 중단용."""
+
+    def __init__(self, serial, detail):
+        self.serial = serial
+        self.detail = detail
+        super().__init__('기기 연결 끊김 (%s)' % detail)
+
+
+# adb 클라이언트가 기기 이탈 시 stderr로 내는 메시지 패턴 (소문자 비교)
+DEVICE_GONE_PATTERNS = (
+    'not found', 'device offline', 'device unauthorized',
+    'error: closed', 'connection reset', 'protocol fault',
+)
+
+
+def _exec(cmd, timeout):
+    """subprocess 실행의 유일한 통로 — 시뮬레이션 테스트가 이 함수만 패치합니다."""
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                          encoding='utf-8', errors='replace')
+
+
+def _adb_serial(cmd):
+    """['adb', '-s', serial, ...] 형태에서 시리얼을 추출합니다. 없으면 None."""
+    if len(cmd) >= 3 and cmd[0] == 'adb' and cmd[1] == '-s':
+        return cmd[2]
+    return None
+
+
+def device_alive(serial, timeout=5):
+    """기기가 여전히 adb에 정상 연결되어 있는지 확인합니다(raise 없음)."""
+    try:
+        result = _exec(['adb', '-s', serial, 'get-state'], timeout)
+        return result.returncode == 0 and result.stdout.strip() == 'device'
+    except Exception:
+        return False
+
+
+def _stderr_says_device_gone(stderr):
+    lowered = (stderr or '').lower()
+    return any(pattern in lowered for pattern in DEVICE_GONE_PATTERNS)
+
+
+def run_command(cmd, check=False, timeout=90, retries=1):
+    """주어진 명령어를 실행하고 결과를 반환합니다. 실패 시 재시도합니다.
+
+    best-effort 철학 유지: 일반 실패(패키지 없음 등)는 결과를 그대로 돌려주지만,
+    stderr가 기기 이탈을 가리키고 get-state로도 이탈이 확인되면 DeviceLostError를
+    던져 남은 단계가 조용히 no-op로 흘러가는 것을 막습니다.
+    """
+    serial = _adb_serial(cmd)
     for attempt in range(1 + retries):
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=check, timeout=timeout, encoding='utf-8', errors='replace')
+            result = _exec(cmd, timeout)
             # 보안 폴더(user 150) 접근 에러는 무시 — shell 권한으로 접근 불가
             if result.stderr and 'SecurityException' in result.stderr and 'user 150' in result.stderr:
                 logging.debug('[보안폴더] 무시: %s', result.stderr.strip().split('\n')[0])
                 result = subprocess.CompletedProcess(cmd, returncode=0, stdout=result.stdout, stderr='')
+            if result.returncode != 0 and serial and _stderr_says_device_gone(result.stderr):
+                # 앱 출력의 우연한 'not found'와 구분하기 위해 실제 연결 상태로 확정
+                if not device_alive(serial):
+                    raise DeviceLostError(serial, (result.stderr or '').strip().split('\n')[0])
             if result.returncode == 0 or not check:
                 return result
         except subprocess.TimeoutExpired:
@@ -365,19 +461,69 @@ def run_command(cmd, check=False, timeout=60, retries=1):
         if attempt < retries:
             logging.info('RETRY: %s', ' '.join(cmd))
             time.sleep(2)
-    # 타임아웃 등으로 result가 없는 경우 빈 결과 반환
+    # 최종 타임아웃 — 기기가 이탈해서 응답이 없는 것인지 확인
+    if serial and not device_alive(serial):
+        raise DeviceLostError(serial, '타임아웃 + 연결 없음')
     return subprocess.CompletedProcess(cmd, returncode=-1, stdout='', stderr='TIMEOUT')
 
 
+def _reenable_packages(serial, packages):
+    """disable-user 했던 패키지를 재활성화합니다(finally 블록용, raise 없음).
+
+    기기 이탈 등으로 실패해도 원래 예외 전파를 막지 않도록 모든 예외를 삼키되,
+    비활성 상태로 남을 수 있음을 로그에 남깁니다.
+    """
+    for pkg in packages:
+        try:
+            run_command(['adb', '-s', serial, 'shell', 'pm', 'enable', pkg])
+        except Exception:
+            logging.warning('[%s] %s 재활성화 실패 — 기기에서 앱 활성 상태 확인 필요', serial, pkg)
+
+
+# 상태별 조치 안내 (scan_devices가 문제 기기 표에 사용)
+DEVICE_STATE_HINTS = {
+    'unauthorized': '기기 화면에서 USB 디버깅 허용(RSA)을 승인하세요',
+    'offline': 'USB 케이블을 다시 꽂아보세요 (허브 전원 부족 가능)',
+    'authorizing': '잠시 후 다시 스캔하세요 (인증 진행 중)',
+    'recovery': '기기를 정상 부팅한 뒤 다시 연결하세요',
+    'sideload': '기기를 정상 부팅한 뒤 다시 연결하세요',
+    'no permissions': 'USB 연결을 다시 시도하세요 (권한 문제)',
+}
+
+
+def scan_devices():
+    """연결된 모든 기기를 상태와 함께 스캔합니다.
+
+    반환: (ready, problems)
+      ready    — 초기화 가능한 시리얼 목록 (상태 'device')
+      problems — [(serial, state), ...] 초기화 불가능하지만 물리적으로 연결된 기기
+    이전 구현은 'device' 외 상태를 조용히 버려서, 허브에서 일시적으로
+    offline/unauthorized인 기기가 티 나지 않게 누락되는 원인이었습니다.
+    """
+    result = run_command(['adb', 'devices'], timeout=15)
+    ready, problems = [], []
+    if not hasattr(result, 'stdout') or not result.stdout:
+        return ready, problems
+    for line in result.stdout.strip().splitlines():
+        line = line.strip()
+        # 헤더/데몬 배너는 인덱스가 아니라 내용으로 거른다
+        if not line or line.startswith('List of devices') or line.startswith('*'):
+            continue
+        parts = line.split('\t')
+        if len(parts) < 2:
+            continue
+        serial, state = parts[0].strip(), parts[1].strip()
+        if state == 'device':
+            ready.append(serial)
+        else:
+            problems.append((serial, state))
+    return ready, problems
+
+
 def get_connected_devices():
-    """연결된 ADB 디바이스 목록을 가져옵니다."""
-    output = subprocess.check_output(['adb', 'devices']).decode('utf-8')
-    devices = []
-    for line in output.strip().splitlines()[1:]:
-        parts = line.strip().split('\t')
-        if len(parts) == 2 and parts[1] == 'device':
-            devices.append(parts[0])
-    return devices
+    """연결된 ADB 디바이스 목록을 가져옵니다(하위 호환용)."""
+    ready, _ = scan_devices()
+    return ready
 
 
 MODEL_TO_SERIES = {
@@ -389,6 +535,13 @@ def get_device_model(serial):
     """모델명(예: SM-S948N)을 반환합니다. 조회 실패 시 빈 문자열."""
     result = run_command(['adb', '-s', serial, 'shell', 'getprop', 'ro.product.model'])
     return result.stdout.strip() if hasattr(result, 'stdout') and result.stdout else ''
+
+
+def get_device_name(serial):
+    """기기에 설정된 이름(예: S24F57 — 자산 라벨)을 반환합니다. 없으면 빈 문자열."""
+    result = run_command(['adb', '-s', serial, 'shell', 'settings', 'get', 'global', 'device_name'])
+    name = result.stdout.strip() if hasattr(result, 'stdout') and result.stdout else ''
+    return '' if name == 'null' else name
 
 
 def series_from_model(model, serial=''):
@@ -420,12 +573,13 @@ def clear_app_data(serial, package, desc):
 # 1. 언어 설정
 # ============================================================
 
+# name: 선택 메뉴용(원어 병기), ko_name: 배정 표 등 한글 표시용
 LANGUAGE_OPTIONS = {
-    '1': {'locale': 'ja-JP', 'name': '日本語 (일본어)'},
-    '2': {'locale': 'en-US', 'name': 'English (영어)'},
-    '3': {'locale': 'ko-KR', 'name': '한국어'},
-    '4': {'locale': 'zh-CN', 'name': '中文简体 (중국어 간체)'},
-    '5': {'locale': 'zh-TW', 'name': '中文繁體 (중국어 번체)'},
+    '1': {'locale': 'ja-JP', 'name': '日本語 (일본어)', 'ko_name': '일본어'},
+    '2': {'locale': 'en-US', 'name': 'English (영어)', 'ko_name': '영어'},
+    '3': {'locale': 'ko-KR', 'name': '한국어', 'ko_name': '한국어'},
+    '4': {'locale': 'zh-CN', 'name': '中文简体 (중국어 간체)', 'ko_name': '중국어 간체'},
+    '5': {'locale': 'zh-TW', 'name': '中文繁體 (중국어 번체)', 'ko_name': '중국어 번체'},
 }
 
 
@@ -450,6 +604,58 @@ def select_language():
         print('  잘못된 입력입니다. 다시 선택해주세요.')
 
 
+def _locale_display_name(locale):
+    """배정 표에 쓰는 한글 언어 이름."""
+    for option in LANGUAGE_OPTIONS.values():
+        if option['locale'] == locale:
+            return option['ko_name']
+    return '언어 변경 안함'
+
+
+def assign_languages(devices):
+    """기본 언어를 고른 뒤, 일부 기기만 다른 언어로 바꿀 수 있게 합니다.
+
+    반환: {serial: locale} — 혼합 배치(예: 일본어 반납 15대 + 중국어 반납 5대)를
+    한 번의 실행으로 처리하기 위한 기기별 배정표.
+    """
+    default = select_language()
+    if len(devices) == 1:
+        return {devices[0]: default}
+
+    infos = []
+    for serial in devices:
+        try:
+            name = get_device_name(serial)
+            model = get_device_model(serial)
+        except DeviceLostError:
+            # 스캔과 배정 사이에 뽑힌 기기 — 표에는 남기고 실행 단계에서 실패 처리
+            name, model = '', ''
+        infos.append((serial, name, model))
+
+    locales = {serial: default for serial in devices}
+    while True:
+        print('\n기기별 언어 배정:')
+        for index, (serial, name, model) in enumerate(infos, start=1):
+            print(' %2d. %-10s %-16s %-10s → %s'
+                  % (index, name or '-', serial, model or '-',
+                     _locale_display_name(locales[serial])))
+        entry = input('다른 언어로 바꿀 기기 번호 (쉼표, 예: 3,5) — 없으면 Enter: ').strip()
+        if not entry:
+            return locales
+        try:
+            numbers = [int(token) for token in re.split(r'[,\s]+', entry) if token]
+        except ValueError:
+            print('  잘못된 입력입니다. 번호만 입력해주세요.')
+            continue
+        targets = [infos[n - 1][0] for n in numbers if 1 <= n <= len(infos)]
+        if not targets:
+            print('  잘못된 입력입니다. 표의 번호 범위에서 입력해주세요.')
+            continue
+        chosen = select_language()
+        for serial in targets:
+            locales[serial] = chosen
+
+
 def push_dex_if_needed(serial, dex_name):
     """DEX 헬퍼 파일을 기기에 푸시합니다. push 후 리모트 존재 여부를 검증합니다."""
     local_path = resource_path(dex_name)
@@ -463,6 +669,12 @@ def push_dex_if_needed(serial, dex_name):
     if hasattr(check, 'returncode') and check.returncode != 0:
         logging.warning('[%s] DEX push 검증 실패, 재시도: %s', serial, dex_name)
         run_command(['adb', '-s', serial, 'push', local_path, remote_path])
+        # 재시도 결과를 실제로 검증해 반환 — 무조건 True를 돌려주면
+        # 호출부의 폴백 경로(pm clear 등)가 필요할 때 타지 않는다
+        check = run_command(['adb', '-s', serial, 'shell', 'ls', remote_path])
+        if hasattr(check, 'returncode') and check.returncode != 0:
+            logging.warning('[%s] DEX push 최종 실패: %s', serial, dex_name)
+            return False
     return True
 
 
@@ -663,7 +875,7 @@ def deep_clean_gallery_trash(serial):
 
     # Step 3: 미디어/갤러리 프로바이더 데이터 초기화
     pm_cmd = '; '.join(f'pm clear {pkg}' for pkg in clear_packages)
-    result = run_command(['adb', '-s', serial, 'shell', pm_cmd], timeout=90)
+    result = run_command(['adb', '-s', serial, 'shell', pm_cmd], timeout=120)
     stdout = result.stdout if hasattr(result, 'stdout') else ''
     for line in stdout.splitlines():
         if 'Exception' in line or 'Error' in line:
@@ -699,11 +911,14 @@ def delete_user_installed_apps(serial):
         'com.nhn.android.nmap',
         'com.alphainventor.filemanager',
     ]
-    output = subprocess.check_output([
+    result = run_command([
         'adb', '-s', serial, 'shell',
         'pm', 'list', 'packages', '--user', '0', '-3'
-    ]).decode('utf-8')
-    installed_apps = [line.replace('package:', '').strip() for line in output.splitlines() if line.strip()]
+    ], timeout=120)
+    if result.returncode != 0:
+        logging.warning('[%s] 사용자 앱 목록 조회 실패 — 앱 삭제 단계 건너뜀', serial)
+        return
+    installed_apps = [line.replace('package:', '').strip() for line in result.stdout.splitlines() if line.strip()]
 
     for app in installed_apps:
         if app not in exclude_apps:
@@ -917,14 +1132,12 @@ def delete_esim_profiles(serial):
             'adb', '-s', serial, 'shell',
             'am', 'start', '-a', 'android.telephony.euicc.action.MANAGE_EMBEDDED_SUBSCRIPTIONS'
         ])
-        print()
-        print('=' * 60)
-        print('  ⚠  e-SIM 프로필 자동 삭제에 실패했습니다!')
-        print('  기기 화면에서 수동으로 삭제해주세요.')
-        print()
-        print('  👉 SIM 관리자 > eSIM 선택 > 삭제')
-        print('=' * 60)
-        print()
+        # 진행률 화면(전용 버퍼) 위에 print()가 겹쳐 쓰이면 깨지고 곧 지워져
+        # 보이지 않는다 — 진행률 행의 노란 표시 + 종료 후 공지로 전달한다.
+        if PROGRESS:
+            PROGRESS.note(serial, 'e-SIM 수동 삭제 필요 — 기기에서 SIM 관리자 확인')
+        add_post_run_notice('[%s] e-SIM 수동 삭제 필요 — SIM 관리자 > eSIM 선택 > 삭제 '
+                            '(기기에 화면을 열어두었습니다)' % serial)
         logging.warning('[%s] ⚠ e-SIM 수동 삭제 필요 — SIM 관리자 화면을 열었습니다.', serial)
 
     logging.info('[%s] e-SIM 프로필 처리 완료', serial)
@@ -1072,8 +1285,11 @@ def push_default_wallpaper(serial, wallpaper_file, series=None):
 def wipe_internal_storage(serial):
     """내장 메모리 전체를 삭제합니다."""
     logging.info('[%s] 내장 메모리 전체 삭제 시작', serial)
-    run_command(['adb', '-s', serial, 'shell', 'rm', '-rf', '/storage/emulated/0/*'])
-    run_command(['adb', '-s', serial, 'shell', 'rm', '-rf', '/storage/emulated/0/.*'])
+    # 수십 GB 삭제일 수 있어 넉넉한 타임아웃. '.*'는 '..'까지 잡아 비정상 종료를
+    # 유발하므로 dotglob 안전 패턴('.[!.]*', '..?*')으로 숨김 파일만 지운다.
+    run_command(['adb', '-s', serial, 'shell', 'rm', '-rf', '/storage/emulated/0/*'], timeout=300)
+    run_command(['adb', '-s', serial, 'shell', 'rm', '-rf',
+                 '/storage/emulated/0/.[!.]*', '/storage/emulated/0/..?*'], timeout=300)
     logging.info('[%s] 내장 메모리 전체 삭제 완료', serial)
 
 
@@ -1119,7 +1335,11 @@ def reset_widgets_only(serial):
     """
     logging.info('[%s] 위젯 전용 제거 — launcher.db 보존', serial)
     result = run_command(['adb', '-s', serial, 'shell', 'dumpsys', 'appwidget'])
-    dump = result.stdout if hasattr(result, 'stdout') and result.stdout else ''
+    if result.returncode != 0 or not (hasattr(result, 'stdout') and result.stdout):
+        # 타임아웃/오류로 빈 결과가 오면 '위젯 없음'으로 오판하지 않는다
+        logging.warning('[%s] 위젯 탐지 실패(dumpsys 오류) — 위젯이 남아있을 수 있음', serial)
+        return
+    dump = result.stdout
 
     providers = set()
     in_widgets_section = False
@@ -1145,16 +1365,16 @@ def reset_widgets_only(serial):
 
     for pkg in providers:
         run_command(['adb', '-s', serial, 'shell', 'pm', 'disable-user', '--user', '0', pkg])
-
-    # launcher clear 없이 재시작 → db row 검증 + 빈 슬롯 저장
-    run_command(['adb', '-s', serial, 'shell', 'am', 'force-stop', 'com.sec.android.app.launcher'])
-    time.sleep(1)
-    run_command(['adb', '-s', serial, 'shell', 'am', 'start', '-n',
-                 'com.sec.android.app.launcher/.activities.LauncherActivity'])
-    time.sleep(4)
-
-    for pkg in providers:
-        run_command(['adb', '-s', serial, 'shell', 'pm', 'enable', pkg])
+    try:
+        # launcher clear 없이 재시작 → db row 검증 + 빈 슬롯 저장
+        run_command(['adb', '-s', serial, 'shell', 'am', 'force-stop', 'com.sec.android.app.launcher'])
+        time.sleep(1)
+        run_command(['adb', '-s', serial, 'shell', 'am', 'start', '-n',
+                     'com.sec.android.app.launcher/.activities.LauncherActivity'])
+        time.sleep(4)
+    finally:
+        # 중간에 무엇이 실패하든 provider가 비활성 상태로 남지 않게 한다
+        _reenable_packages(serial, providers)
 
     logging.info('[%s] 위젯 제거 완료 — provider 재활성화됨', serial)
 
@@ -1175,17 +1395,19 @@ def block_galaxy_store_auto_restore(serial):
     run_command(['adb', '-s', serial, 'shell', 'pm', 'clear', 'com.sec.android.app.samsungapps'])
     run_command(['adb', '-s', serial, 'shell', 'pm', 'clear', 'com.samsung.android.scloud'])
     # 일시 disable (자동 복원 trigger 차단)
-    for pkg in ['com.sec.android.app.samsungapps', 'com.samsung.android.scloud']:
+    store_pkgs = ['com.sec.android.app.samsungapps', 'com.samsung.android.scloud']
+    for pkg in store_pkgs:
         run_command(['adb', '-s', serial, 'shell', 'pm', 'disable-user', '--user', '0', pkg])
-    # launcher 재시작 - disabled 상태에서 db row 검증 trigger
-    run_command(['adb', '-s', serial, 'shell', 'am', 'force-stop', 'com.sec.android.app.launcher'])
-    time.sleep(1)
-    run_command(['adb', '-s', serial, 'shell', 'am', 'start', '-n',
-                 'com.sec.android.app.launcher/.activities.LauncherActivity'])
-    time.sleep(5)
-    # Galaxy Store/Cloud 재활성화 (기능 복원, launcher.db는 이미 정리됨)
-    for pkg in ['com.sec.android.app.samsungapps', 'com.samsung.android.scloud']:
-        run_command(['adb', '-s', serial, 'shell', 'pm', 'enable', pkg])
+    try:
+        # launcher 재시작 - disabled 상태에서 db row 검증 trigger
+        run_command(['adb', '-s', serial, 'shell', 'am', 'force-stop', 'com.sec.android.app.launcher'])
+        time.sleep(1)
+        run_command(['adb', '-s', serial, 'shell', 'am', 'start', '-n',
+                     'com.sec.android.app.launcher/.activities.LauncherActivity'])
+        time.sleep(5)
+    finally:
+        # Galaxy Store/Cloud가 비활성 상태로 출고되는 일이 없도록 무조건 재활성화
+        _reenable_packages(serial, store_pkgs)
     logging.info('[%s] Galaxy Store 자동 복원 차단 완료', serial)
 
 
@@ -1211,7 +1433,11 @@ def reset_launcher_with_clean_home(serial):
 
     # 런처 호스트에 바인딩된 위젯의 provider 패키지 추출
     result = run_command(['adb', '-s', serial, 'shell', 'dumpsys', 'appwidget'])
-    dump = result.stdout if hasattr(result, 'stdout') and result.stdout else ''
+    if result.returncode != 0 or not (hasattr(result, 'stdout') and result.stdout):
+        # 타임아웃/오류로 빈 결과가 오면 '위젯 없음'으로 오판하지 않는다
+        logging.warning('[%s] 위젯 탐지 실패(dumpsys 오류) — 위젯이 남아있을 수 있음', serial)
+        return
+    dump = result.stdout
 
     providers = set()
     in_widgets_section = False
@@ -1239,26 +1465,26 @@ def reset_launcher_with_clean_home(serial):
     for pkg in providers:
         run_command(['adb', '-s', serial, 'shell', 'pm', 'disable-user', '--user', '0', pkg])
 
-    # 위젯 + placeholder 제거: launcher.db 보존하면서 launcher만 재시작.
-    # force-stop + start 시점에 launcher가 db row의 패키지 존재성 재검증 →
-    # 누락된 위젯과 app drawer placeholder를 자동 정리.
-    # (pm clear는 launcher.db를 새로 만들어 default layout 다시 적용 → placeholder 재발생)
-    #
-    # 모델별로 launcher의 자동 sweep 타이밍이 다름. 일부 모델(S24 등)은
-    # background sweep job 완료까지 8초 이상 필요. KEYCODE_HOME으로 활성화도 trigger.
-    logging.info('[%s] 런처 재시작 — 위젯 + placeholder 자동 정리', serial)
-    run_command(['adb', '-s', serial, 'shell', 'am', 'force-stop', 'com.sec.android.app.launcher'])
-    time.sleep(1)
-    run_command(['adb', '-s', serial, 'shell', 'am', 'start', '-n',
-                 'com.sec.android.app.launcher/.activities.LauncherActivity'])
-    time.sleep(4)
-    # launcher가 화면에 노출되어야 background sweep이 trigger되는 모델 대응
-    run_command(['adb', '-s', serial, 'shell', 'input', 'keyevent', 'KEYCODE_HOME'])
-    time.sleep(8)  # background sweep job 완료 대기 (모델별로 4-10초 필요)
-
-    # Provider 재활성화 (앱 기능 복원)
-    for pkg in providers:
-        run_command(['adb', '-s', serial, 'shell', 'pm', 'enable', pkg])
+    try:
+        # 위젯 + placeholder 제거: launcher.db 보존하면서 launcher만 재시작.
+        # force-stop + start 시점에 launcher가 db row의 패키지 존재성 재검증 →
+        # 누락된 위젯과 app drawer placeholder를 자동 정리.
+        # (pm clear는 launcher.db를 새로 만들어 default layout 다시 적용 → placeholder 재발생)
+        #
+        # 모델별로 launcher의 자동 sweep 타이밍이 다름. 일부 모델(S24 등)은
+        # background sweep job 완료까지 8초 이상 필요. KEYCODE_HOME으로 활성화도 trigger.
+        logging.info('[%s] 런처 재시작 — 위젯 + placeholder 자동 정리', serial)
+        run_command(['adb', '-s', serial, 'shell', 'am', 'force-stop', 'com.sec.android.app.launcher'])
+        time.sleep(1)
+        run_command(['adb', '-s', serial, 'shell', 'am', 'start', '-n',
+                     'com.sec.android.app.launcher/.activities.LauncherActivity'])
+        time.sleep(4)
+        # launcher가 화면에 노출되어야 background sweep이 trigger되는 모델 대응
+        run_command(['adb', '-s', serial, 'shell', 'input', 'keyevent', 'KEYCODE_HOME'])
+        time.sleep(8)  # background sweep job 완료 대기 (모델별로 4-10초 필요)
+    finally:
+        # Provider 재활성화 (앱 기능 복원) — 중간 실패 시에도 반드시 실행
+        _reenable_packages(serial, providers)
 
     logging.info('[%s] 런처 초기화 완료 — 위젯 제거됨, provider 재활성화됨', serial)
 
@@ -1269,9 +1495,13 @@ def ensure_essential_apps_installed(serial):
         {'package': 'com.nhn.android.nmap', 'name': 'Nmap', 'apk_path': resource_path('nmap.apk')},
         {'package': 'com.alphainventor.filemanager', 'name': 'File Manager', 'apk_path': resource_path('filemanager.apk')},
     ]
-    output = subprocess.check_output([
+    result = run_command([
         'adb', '-s', serial, 'shell', 'pm', 'list', 'packages'
-    ]).decode('utf-8')
+    ], timeout=120)
+    if result.returncode != 0:
+        logging.warning('[%s] 패키지 목록 조회 실패 — 필수 앱 설치 단계 건너뜀', serial)
+        return
+    output = result.stdout
 
     for app in apps:
         if f"package:{app['package']}" in output:
@@ -1280,8 +1510,13 @@ def ensure_essential_apps_installed(serial):
             apk = app['apk_path']
             if os.path.exists(apk):
                 logging.info('[%s] %s 설치 중...', serial, app['name'])
-                run_command(['adb', '-s', serial, 'install', '-r', apk])
-                logging.info('[%s] %s 설치 완료', serial, app['name'])
+                # 80MB APK — 다중 기기 동시 전송 시 60초로는 부족
+                install = run_command(['adb', '-s', serial, 'install', '-r', apk], timeout=300)
+                if 'Success' in (install.stdout or ''):
+                    logging.info('[%s] %s 설치 완료', serial, app['name'])
+                else:
+                    logging.warning('[%s] %s 설치 실패: %s', serial, app['name'],
+                                    (install.stderr or install.stdout or '알 수 없음').strip()[:120])
             else:
                 logging.warning('[%s] APK 파일 없음: %s', serial, apk)
 
@@ -1331,31 +1566,38 @@ PIPELINE_STEP_COUNT = len(build_pipeline('', None, '', ''))
 
 def process_device(serial, locale=None):
     """단일 기기에 대한 전체 초기화 프로세스를 실행합니다."""
+    _TLS.serial = serial  # 이 워커 스레드의 로그를 기기별 버퍼로 분류하기 위한 태깅
     logging.info('========================================')
     logging.info('[%s] 초기화 시작', serial)
     logging.info('========================================')
 
-    # 모델명은 한 번만 조회해 시리즈 판정과 화면 표시에 함께 쓴다
-    model = get_device_model(serial)
-    series = series_from_model(model, serial)
-    wallpaper = f'{series}.png'
-    if PROGRESS:
-        PROGRESS.set_info(serial, model, series)
+    current_label = '모델 확인'
+    try:
+        # 모델명은 한 번만 조회해 시리즈 판정과 화면 표시에 함께 쓴다
+        model = get_device_model(serial)
+        series = series_from_model(model, serial)
+        wallpaper = f'{series}.png'
+        if PROGRESS:
+            PROGRESS.set_info(serial, model, series, get_device_name(serial), locale or '')
 
-    steps = build_pipeline(serial, locale, wallpaper, series)
-    for number, (label, action) in enumerate(steps, start=1):
-        if PROGRESS:
-            PROGRESS.step(serial, number - 1, label)
-        logging.info('[%s] (%d/%d) %s', serial, number, len(steps), label)
-        try:
-            action()
-        except Exception as e:
-            # 기존 동작 유지 — 예외는 main()이 기기별로 잡아 기록하고 해당 기기만 중단
+        steps = build_pipeline(serial, locale, wallpaper, series)
+        for number, (label, action) in enumerate(steps, start=1):
+            current_label = label
             if PROGRESS:
-                PROGRESS.fail(serial, '%s 중 실패: %s' % (label, e))
-            raise
+                PROGRESS.step(serial, number - 1, label)
+            logging.info('[%s] (%d/%d) %s', serial, number, len(steps), label)
+            action()
+            if PROGRESS:
+                PROGRESS.step(serial, number, label)
+    except Exception as e:
+        # 예외는 main()이 기기별로 잡아 기록하고 해당 기기만 중단 (기존 동작 유지).
+        # 단계명을 붙여 다시 던져 실패 사유에 이탈 시점이 남게 한다.
+        logging.error('[%s] %s 중 실패: %s', serial, current_label, e)
         if PROGRESS:
-            PROGRESS.step(serial, number, label)
+            PROGRESS.fail(serial, '%s 중 실패: %s' % (current_label, e))
+        raise RuntimeError('%s 중 실패: %s' % (current_label, e)) from e
+    finally:
+        _TLS.serial = None
 
     if PROGRESS:
         PROGRESS.done(serial)
@@ -1364,9 +1606,110 @@ def process_device(serial, locale=None):
     logging.info('========================================')
 
 
-def main():
+# 동시 처리 대수 상한 — 모든 명령이 adb 서버 하나를 거치므로 무제한 병렬은
+# 명령 지연·타임아웃을 키운다. 8대씩이면 20대는 3차례로 안정 처리.
+MAX_WORKERS = 8
+
+# 실행 종료 후 콘솔에 출력할 공지 (예: e-SIM 수동 삭제 필요)
+POST_RUN_NOTICES = []
+_NOTICE_LOCK = threading.Lock()
+
+
+def add_post_run_notice(message):
+    with _NOTICE_LOCK:
+        POST_RUN_NOTICES.append(message)
+
+
+def wait_for_ready_devices():
+    """기기를 스캔하고, 문제 상태 기기가 있으면 표로 보여준 뒤 재스캔 기회를 줍니다.
+
+    반환: 초기화 가능한 시리얼 목록 (빈 목록이면 호출부에서 재시도).
+    """
     while True:
-        devices = get_connected_devices()
+        ready, problems = scan_devices()
+        if problems:
+            print()
+            print('⚠ 연결됐지만 초기화할 수 없는 기기 %d대:' % len(problems))
+            print('-' * 62)
+            for serial, state in problems:
+                hint = DEVICE_STATE_HINTS.get(state, '상태 확인 필요: %s' % state)
+                print('  %-18s %-13s %s' % (serial, state, hint))
+            print('-' * 62)
+            choice = input('[r] 다시 스캔  [Enter] 정상 %d대만 진행: ' % len(ready)).strip().lower()
+            if choice == 'r':
+                continue
+        return ready
+
+
+def run_fleet(devices, locales):
+    """기기 목록을 병렬 초기화하고 {serial: 실패사유}를 반환합니다.
+
+    locales: 전 기기 공통 locale 문자열(또는 None), 혹은 {serial: locale} 배정표.
+    """
+    def locale_for(serial):
+        return locales.get(serial) if isinstance(locales, dict) else locales
+
+    global PROGRESS
+    PROGRESS = ProgressConsole(PIPELINE_STEP_COUNT)
+    if not PROGRESS.start(devices):
+        PROGRESS = None  # 콘솔이 아니면 기존 로그 방식으로 진행
+
+    failures = {}
+    executor = ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(devices)))
+    try:
+        futures = {executor.submit(process_device, serial, locale_for(serial)): serial
+                   for serial in devices}
+        # as_completed 무한 대기 중에는 플랫폼에 따라 Ctrl+C(SIGINT) 처리가
+        # 대기가 끝날 때까지 지연된다 — 0.5초 폴링으로 즉시 반응하게 한다.
+        pending = set(futures)
+        while pending:
+            done, pending = futures_wait(pending, timeout=0.5)
+            for future in done:
+                serial = futures[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    failures[serial] = str(e)
+                    logging.error('[%s] 초기화 중 예외 발생: %s', serial, e)
+        executor.shutdown(wait=True)
+    except KeyboardInterrupt:
+        # 진행 중 단계는 마저 돌지만 대기 중이던 기기는 시작하지 않고 즉시 빠져나온다
+        executor.shutdown(wait=False, cancel_futures=True)
+        for future, serial in futures.items():
+            if serial not in failures and not future.done():
+                failures[serial] = '사용자 중단'
+        raise
+    finally:
+        if PROGRESS:
+            PROGRESS.stop()
+            PROGRESS = None
+    return failures
+
+
+def report_run(devices, failures, log_buffer):
+    """실행 결과 요약 + 실패 기기의 직전 로그를 출력합니다."""
+    logging.info('모든 기기 초기화 작업이 완료되었습니다.')
+    with _NOTICE_LOCK:
+        notices, POST_RUN_NOTICES[:] = list(POST_RUN_NOTICES), []
+    for notice in notices:
+        print('⚠ %s' % notice)
+    if not failures:
+        return
+    logging.error('실패한 기기 %d대: %s — 다시 초기화하세요.',
+                  len(failures), ', '.join(failures))
+    for serial, reason in failures.items():
+        print()
+        print('──── [%s] 실패: %s ────' % (serial, reason))
+        for line in log_buffer.tail(serial):
+            print('  ' + line)
+
+
+def main():
+    log_buffer = DeviceLogHandler()
+    logging.getLogger().addHandler(log_buffer)
+
+    while True:
+        devices = wait_for_ready_devices()
         if not devices:
             logging.error('연결된 기기가 없습니다. ADB 연결을 확인해주세요.')
         else:
@@ -1375,42 +1718,22 @@ def main():
                 logging.info(' - %s', device)
 
             # [V6] 언어 선택 메뉴
-            locale = select_language()
+            locales = assign_languages(devices)
 
-            global PROGRESS
-            PROGRESS = ProgressConsole(PIPELINE_STEP_COUNT)
-            if not PROGRESS.start(devices):
-                PROGRESS = None  # 콘솔이 아니면 기존 로그 방식으로 진행
+            failures = run_fleet(devices, locales)
+            report_run(devices, failures, log_buffer)
 
-            failures = []
-            max_workers = min(5, len(devices))
-            try:
-                with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    futures = {executor.submit(process_device, serial, locale): serial for serial in devices}
-                    for future in as_completed(futures):
-                        serial = futures[future]
-                        try:
-                            future.result()
-                        except Exception as e:
-                            failures.append(serial)
-                            logging.error('[%s] 초기화 중 예외 발생: %s', serial, e)
-            finally:
-                if PROGRESS:
-                    PROGRESS.stop()
-                    PROGRESS = None
-
-            logging.info('모든 기기 초기화 작업이 완료되었습니다.')
-            if failures:
-                logging.error('실패한 기기 %d대: %s — 다시 초기화하세요.',
-                              len(failures), ', '.join(failures))
-
-            # 기기 종료 여부 확인
+            # 기기 종료 여부 확인 — 실패한 기기는 켜진 채 남겨 물리적으로 구분되게 한다
             shutdown = input('기기를 종료하시겠습니까? (y/n): ').strip().lower()
             if shutdown == 'y':
-                for serial in devices:
+                survivors = [serial for serial in devices if serial not in failures]
+                for serial in survivors:
                     logging.info('[%s] 기기 종료 중...', serial)
                     run_command(['adb', '-s', serial, 'shell', 'reboot', '-p'])
-                logging.info('모든 기기 종료 명령 전송 완료')
+                logging.info('기기 %d대 종료 명령 전송 완료', len(survivors))
+                if failures:
+                    print('⚠ 전원이 꺼지지 않은 기기 (실패 — 재작업 필요): %s'
+                          % ', '.join(failures))
 
         try:
             logging.info('추가로 작업하실 기기를 연결 완료 후 엔터를 눌러주세요. (종료하려면 Ctrl+C)')
