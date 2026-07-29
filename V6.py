@@ -619,8 +619,6 @@ def assign_languages(devices):
     한 번의 실행으로 처리하기 위한 기기별 배정표.
     """
     default = select_language()
-    if len(devices) == 1:
-        return {devices[0]: default}
 
     infos = []
     for serial in devices:
@@ -639,6 +637,9 @@ def assign_languages(devices):
             print(' %2d. %-10s %-16s %-10s → %s'
                   % (index, name or '-', serial, model or '-',
                      _locale_display_name(locales[serial])))
+        if len(devices) == 1:
+            # 1대는 방금 고른 언어 외 선택지가 없으므로 표만 확인시키고 진행
+            return locales
         entry = input('다른 언어로 바꿀 기기 번호 (쉼표, 예: 3,5) — 없으면 Enter: ').strip()
         if not entry:
             return locales
