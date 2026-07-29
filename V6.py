@@ -187,7 +187,7 @@ class ProgressConsole:
             self.order = list(serials)
             self.states = {
                 serial: {'index': 0, 'label': '대기 중', 'status': 'wait',
-                         'model': '', 'series': '', 'name': '', 'note': '',
+                         'model': '', 'series': '', 'name': '', 'lang': '', 'note': '',
                          'started_at': None, 'finished_at': None}
                 for serial in serials
             }
@@ -227,8 +227,8 @@ class ProgressConsole:
 
     # --- 워커 스레드가 호출하는 보고용 메서드 ---
 
-    def set_info(self, serial, model, series, name=''):
-        self._update(serial, model=model, series=series, name=name)
+    def set_info(self, serial, model, series, name='', lang=''):
+        self._update(serial, model=model, series=series, name=name, lang=lang)
 
     def step(self, serial, index, label):
         self._update(serial, index=index, label=label, status='run')
@@ -326,7 +326,9 @@ class ProgressConsole:
             name = (state['name'] + '  ') if state['name'] else ''
             model = (' ' + state['model']) if state['model'] else ''
             series = (' ' + state['series']) if state['series'] else ''
-            lines.append(head_color + ' [%d] %s%s%s%s' % (position, name, serial, model, series) + self.RESET)
+            lines.append(head_color + ' [%d] %s%s%s%s' % (position, name, serial, model, series) +
+                         self.RESET +
+                         (self.DIM + '  ' + state['lang'] + self.RESET if state['lang'] else ''))
 
             filled = int(round(fraction * bar_width))
             bar = (self.DIM + '[' + self.RESET + bar_color + self.fill_char * filled + self.RESET +
@@ -599,6 +601,57 @@ def select_language():
             print(f'  → {selected["name"]} 선택됨\n')
             return selected['locale']
         print('  잘못된 입력입니다. 다시 선택해주세요.')
+
+
+def _locale_display_name(locale):
+    for option in LANGUAGE_OPTIONS.values():
+        if option['locale'] == locale:
+            return option['name']
+    return '언어 변경 안함'
+
+
+def assign_languages(devices):
+    """기본 언어를 고른 뒤, 일부 기기만 다른 언어로 바꿀 수 있게 합니다.
+
+    반환: {serial: locale} — 혼합 배치(예: 일본어 반납 15대 + 중국어 반납 5대)를
+    한 번의 실행으로 처리하기 위한 기기별 배정표.
+    """
+    default = select_language()
+    if len(devices) == 1:
+        return {devices[0]: default}
+
+    infos = []
+    for serial in devices:
+        try:
+            name = get_device_name(serial)
+            model = get_device_model(serial)
+        except DeviceLostError:
+            # 스캔과 배정 사이에 뽑힌 기기 — 표에는 남기고 실행 단계에서 실패 처리
+            name, model = '', ''
+        infos.append((serial, name, model))
+
+    locales = {serial: default for serial in devices}
+    while True:
+        print('\n기기별 언어 배정:')
+        for index, (serial, name, model) in enumerate(infos, start=1):
+            print(' %2d. %-10s %-16s %-10s → %s'
+                  % (index, name or '-', serial, model or '-',
+                     _locale_display_name(locales[serial])))
+        entry = input('다른 언어로 바꿀 기기 번호 (쉼표, 예: 3,5) — 없으면 Enter: ').strip()
+        if not entry:
+            return locales
+        try:
+            numbers = [int(token) for token in re.split(r'[,\s]+', entry) if token]
+        except ValueError:
+            print('  잘못된 입력입니다. 번호만 입력해주세요.')
+            continue
+        targets = [infos[n - 1][0] for n in numbers if 1 <= n <= len(infos)]
+        if not targets:
+            print('  잘못된 입력입니다. 표의 번호 범위에서 입력해주세요.')
+            continue
+        chosen = select_language()
+        for serial in targets:
+            locales[serial] = chosen
 
 
 def push_dex_if_needed(serial, dex_name):
@@ -1523,7 +1576,7 @@ def process_device(serial, locale=None):
         series = series_from_model(model, serial)
         wallpaper = f'{series}.png'
         if PROGRESS:
-            PROGRESS.set_info(serial, model, series, get_device_name(serial))
+            PROGRESS.set_info(serial, model, series, get_device_name(serial), locale or '')
 
         steps = build_pipeline(serial, locale, wallpaper, series)
         for number, (label, action) in enumerate(steps, start=1):
@@ -1586,8 +1639,14 @@ def wait_for_ready_devices():
         return ready
 
 
-def run_fleet(devices, locale):
-    """기기 목록을 병렬 초기화하고 {serial: 실패사유}를 반환합니다."""
+def run_fleet(devices, locales):
+    """기기 목록을 병렬 초기화하고 {serial: 실패사유}를 반환합니다.
+
+    locales: 전 기기 공통 locale 문자열(또는 None), 혹은 {serial: locale} 배정표.
+    """
+    def locale_for(serial):
+        return locales.get(serial) if isinstance(locales, dict) else locales
+
     global PROGRESS
     PROGRESS = ProgressConsole(PIPELINE_STEP_COUNT)
     if not PROGRESS.start(devices):
@@ -1596,7 +1655,8 @@ def run_fleet(devices, locale):
     failures = {}
     executor = ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(devices)))
     try:
-        futures = {executor.submit(process_device, serial, locale): serial for serial in devices}
+        futures = {executor.submit(process_device, serial, locale_for(serial)): serial
+                   for serial in devices}
         # as_completed 무한 대기 중에는 플랫폼에 따라 Ctrl+C(SIGINT) 처리가
         # 대기가 끝날 때까지 지연된다 — 0.5초 폴링으로 즉시 반응하게 한다.
         pending = set(futures)
@@ -1656,9 +1716,9 @@ def main():
                 logging.info(' - %s', device)
 
             # [V6] 언어 선택 메뉴
-            locale = select_language()
+            locales = assign_languages(devices)
 
-            failures = run_fleet(devices, locale)
+            failures = run_fleet(devices, locales)
             report_run(devices, failures, log_buffer)
 
             # 기기 종료 여부 확인 — 실패한 기기는 켜진 채 남겨 물리적으로 구분되게 한다
