@@ -573,12 +573,13 @@ def clear_app_data(serial, package, desc):
 # 1. 언어 설정
 # ============================================================
 
+# name: 선택 메뉴용(원어 병기), ko_name: 배정 표 등 한글 표시용
 LANGUAGE_OPTIONS = {
-    '1': {'locale': 'ja-JP', 'name': '日本語 (일본어)'},
-    '2': {'locale': 'en-US', 'name': 'English (영어)'},
-    '3': {'locale': 'ko-KR', 'name': '한국어'},
-    '4': {'locale': 'zh-CN', 'name': '中文简体 (중국어 간체)'},
-    '5': {'locale': 'zh-TW', 'name': '中文繁體 (중국어 번체)'},
+    '1': {'locale': 'ja-JP', 'name': '日本語 (일본어)', 'ko_name': '일본어'},
+    '2': {'locale': 'en-US', 'name': 'English (영어)', 'ko_name': '영어'},
+    '3': {'locale': 'ko-KR', 'name': '한국어', 'ko_name': '한국어'},
+    '4': {'locale': 'zh-CN', 'name': '中文简体 (중국어 간체)', 'ko_name': '중국어 간체'},
+    '5': {'locale': 'zh-TW', 'name': '中文繁體 (중국어 번체)', 'ko_name': '중국어 번체'},
 }
 
 
@@ -604,9 +605,10 @@ def select_language():
 
 
 def _locale_display_name(locale):
+    """배정 표에 쓰는 한글 언어 이름."""
     for option in LANGUAGE_OPTIONS.values():
         if option['locale'] == locale:
-            return option['name']
+            return option['ko_name']
     return '언어 변경 안함'
 
 
