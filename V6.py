@@ -187,7 +187,7 @@ class ProgressConsole:
             self.order = list(serials)
             self.states = {
                 serial: {'index': 0, 'label': '대기 중', 'status': 'wait',
-                         'model': '', 'series': '', 'note': '',
+                         'model': '', 'series': '', 'name': '', 'note': '',
                          'started_at': None, 'finished_at': None}
                 for serial in serials
             }
@@ -227,8 +227,8 @@ class ProgressConsole:
 
     # --- 워커 스레드가 호출하는 보고용 메서드 ---
 
-    def set_info(self, serial, model, series):
-        self._update(serial, model=model, series=series)
+    def set_info(self, serial, model, series, name=''):
+        self._update(serial, model=model, series=series, name=name)
 
     def step(self, serial, index, label):
         self._update(serial, index=index, label=label, status='run')
@@ -322,9 +322,11 @@ class ProgressConsole:
             else:
                 head_color, bar_color = self.WHITE, self.CYAN
 
+            # 기기 이름(자산 라벨)이 있으면 맨 앞에 — 20대 중 어느 폰인지 바로 찾는 용도
+            name = (state['name'] + '  ') if state['name'] else ''
             model = (' ' + state['model']) if state['model'] else ''
             series = (' ' + state['series']) if state['series'] else ''
-            lines.append(head_color + ' [%d] %s%s%s' % (position, serial, model, series) + self.RESET)
+            lines.append(head_color + ' [%d] %s%s%s%s' % (position, name, serial, model, series) + self.RESET)
 
             filled = int(round(fraction * bar_width))
             bar = (self.DIM + '[' + self.RESET + bar_color + self.fill_char * filled + self.RESET +
@@ -531,6 +533,13 @@ def get_device_model(serial):
     """모델명(예: SM-S948N)을 반환합니다. 조회 실패 시 빈 문자열."""
     result = run_command(['adb', '-s', serial, 'shell', 'getprop', 'ro.product.model'])
     return result.stdout.strip() if hasattr(result, 'stdout') and result.stdout else ''
+
+
+def get_device_name(serial):
+    """기기에 설정된 이름(예: S24F57 — 자산 라벨)을 반환합니다. 없으면 빈 문자열."""
+    result = run_command(['adb', '-s', serial, 'shell', 'settings', 'get', 'global', 'device_name'])
+    name = result.stdout.strip() if hasattr(result, 'stdout') and result.stdout else ''
+    return '' if name == 'null' else name
 
 
 def series_from_model(model, serial=''):
@@ -1514,7 +1523,7 @@ def process_device(serial, locale=None):
         series = series_from_model(model, serial)
         wallpaper = f'{series}.png'
         if PROGRESS:
-            PROGRESS.set_info(serial, model, series)
+            PROGRESS.set_info(serial, model, series, get_device_name(serial))
 
         steps = build_pipeline(serial, locale, wallpaper, series)
         for number, (label, action) in enumerate(steps, start=1):
