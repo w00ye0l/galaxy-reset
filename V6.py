@@ -583,15 +583,42 @@ LANGUAGE_OPTIONS = {
 }
 
 
+# 대화형 화면(메뉴·표)의 색상 사용 여부 — main()에서 콘솔 확인 후 켠다
+ANSI_OK = False
+
+_C_DIM, _C_WHITE, _C_CYAN, _C_GREEN, _C_YELLOW, _C_RED = '90', '97', '96', '92', '93', '91'
+
+
+def _c(text, code):
+    """ANSI 색 입히기 (콘솔이 지원할 때만)."""
+    return '\x1b[%sm%s\x1b[0m' % (code, text) if ANSI_OK else text
+
+
+def _menu_cell(key, name, pad_to=0):
+    """'1. 日本語 (일본어)' 형태의 셀. 전각 폭 기준으로 패딩해 열을 맞춘다."""
+    plain = '%s. %s' % (key, name)
+    cell = _c(key + '.', _C_CYAN) + ' ' + name
+    if pad_to:
+        cell += ' ' * max(0, pad_to - _display_width(plain))
+    return cell
+
+
 def select_language():
     """사용자에게 언어 선택 메뉴를 표시합니다."""
-    print('\n========================================')
-    print('  언어 설정을 선택해주세요')
-    print('========================================')
-    for key, lang in LANGUAGE_OPTIONS.items():
-        print(f'  {key}. {lang["name"]}')
-    print('  0. 언어 변경 안함 (건너뛰기)')
-    print('========================================')
+    items = [(key, option['name']) for key, option in LANGUAGE_OPTIONS.items()]
+    items.append(('0', '언어 변경 안함 (건너뛰기)'))
+    rule = '─' * 56
+    print()
+    print(_c(rule, _C_DIM))
+    print('  ' + _c('언어 설정을 선택해주세요', _C_WHITE))
+    print(_c(rule, _C_DIM))
+    for row_start in range(0, len(items), 2):
+        pair = items[row_start:row_start + 2]
+        line = '  ' + _menu_cell(*pair[0], pad_to=28)
+        if len(pair) == 2:
+            line += _menu_cell(*pair[1])
+        print(line)
+    print(_c(rule, _C_DIM))
 
     while True:
         choice = input('번호 입력: ').strip()
@@ -599,9 +626,9 @@ def select_language():
             return None
         if choice in LANGUAGE_OPTIONS:
             selected = LANGUAGE_OPTIONS[choice]
-            print(f'  → {selected["name"]} 선택됨\n')
+            print('  ' + _c('→ %s 선택됨' % selected['name'], _C_GREEN) + '\n')
             return selected['locale']
-        print('  잘못된 입력입니다. 다시 선택해주세요.')
+        print('  ' + _c('잘못된 입력입니다. 다시 선택해주세요.', _C_YELLOW))
 
 
 def _locale_display_name(locale):
@@ -632,11 +659,11 @@ def assign_languages(devices):
 
     locales = {serial: default for serial in devices}
     while True:
-        print('\n기기별 언어 배정:')
+        print('\n' + _c('기기별 언어 배정:', _C_WHITE))
         for index, (serial, name, model) in enumerate(infos, start=1):
-            print(' %2d. %-10s %-16s %-10s → %s'
-                  % (index, name or '-', serial, model or '-',
-                     _locale_display_name(locales[serial])))
+            print(_c(' %2d.' % index, _C_CYAN) +
+                  ' %-10s %-16s %-10s ' % (name or '-', serial, model or '-') +
+                  _c('→ ', _C_DIM) + _c(_locale_display_name(locales[serial]), _C_GREEN))
         if len(devices) == 1:
             # 1대는 방금 고른 언어 외 선택지가 없으므로 표만 확인시키고 진행
             return locales
@@ -1630,13 +1657,14 @@ def wait_for_ready_devices():
         ready, problems = scan_devices()
         if problems:
             print()
-            print('⚠ 연결됐지만 초기화할 수 없는 기기 %d대:' % len(problems))
-            print('-' * 62)
+            print(_c('⚠ 연결됐지만 초기화할 수 없는 기기 %d대:' % len(problems), _C_YELLOW))
+            print(_c('─' * 62, _C_DIM))
             for serial, state in problems:
                 hint = DEVICE_STATE_HINTS.get(state, '상태 확인 필요: %s' % state)
-                print('  %-18s %-13s %s' % (serial, state, hint))
-            print('-' * 62)
-            choice = input('[r] 다시 스캔  [Enter] 정상 %d대만 진행: ' % len(ready)).strip().lower()
+                print('  %-18s ' % serial + _c('%-13s' % state, _C_YELLOW) + ' ' + hint)
+            print(_c('─' * 62, _C_DIM))
+            choice = input(_c('[r]', _C_CYAN) + ' 다시 스캔  ' + _c('[Enter]', _C_CYAN) +
+                           ' 정상 %d대만 진행: ' % len(ready)).strip().lower()
             if choice == 'r':
                 continue
         return ready
@@ -1706,6 +1734,10 @@ def report_run(devices, failures, log_buffer):
 
 
 def main():
+    # 메뉴·표의 색상 표시 (진행률 화면과 동일한 VT 경로, 미지원 콘솔이면 무색)
+    global ANSI_OK
+    ANSI_OK = sys.stdout.isatty() and _enable_ansi()
+
     log_buffer = DeviceLogHandler()
     logging.getLogger().addHandler(log_buffer)
 
