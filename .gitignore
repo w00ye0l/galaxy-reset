@@ -26,3 +26,8 @@ Thumbs.db
 *.tmp
 *.log
 device_info.txt
+# Android
+.gradle/
+local.properties
+*.jks
+*.keystore

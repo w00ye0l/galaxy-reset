@@ -1,0 +1,43 @@
+plugins { id 'com.android.application' }
+android {
+    namespace 'com.forholiday.galaxyreset'
+    compileSdk 36
+    defaultConfig {
+        applicationId 'com.forholiday.galaxyreset'
+        minSdk 30
+        targetSdk 36
+        versionCode 7
+        versionName '1.1.3'
+    }
+    buildFeatures { aidl true; buildConfig true }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    sourceSets.main.assets.srcDir layout.buildDirectory.dir('generated/resetAssets')
+}
+def resetAssets = ['locale_changer.dex', 'account_remover.dex', 'esim_manager.dex',
+                   'content_cleaner.dex', 'wallpaper_setter.dex', 'recent_tasks_cleaner.dex',
+                   'S23.png', 'S24.png', 'S25.png', 'S26.png', 'nmap.apk', 'filemanager.apk']
+tasks.register('prepareResetAssets', Copy) {
+    from rootProject.file('..')
+    include resetAssets
+    into layout.buildDirectory.dir('generated/resetAssets')
+    doFirst {
+        resetAssets.each { name ->
+            def asset = rootProject.file('../' + name)
+            if (!asset.isFile()) throw new GradleException('Missing asset: ' + name)
+            if (name.endsWith('.apk')) {
+                asset.withInputStream { input ->
+                    if (input.read() != 0x50 || input.read() != 0x4b) throw new GradleException('Invalid APK / Git LFS pointer: ' + name + '. Run git lfs pull.')
+                }
+            }
+        }
+    }
+}
+tasks.named('preBuild').configure { dependsOn 'prepareResetAssets' }
+dependencies {
+    implementation 'dev.rikka.shizuku:api:13.1.5'
+    implementation 'dev.rikka.shizuku:provider:13.1.5'
+    testImplementation 'junit:junit:4.13.2'
+}
