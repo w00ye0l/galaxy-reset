@@ -1,0 +1,33 @@
+name: Build Android APK
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'android/**'
+      - '*.dex'
+      - 'S2*.png'
+      - '*.apk'
+      - '.github/workflows/build-apk.yml'
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          lfs: true
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+        with:
+          # v3 defaults to the removed legacy "tools" package; request only supported SDK packages.
+          packages: 'platform-tools platforms;android-36 build-tools;36.0.0'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Build and verify
+        working-directory: android
+        run: ./gradlew testDebugUnitTest lintDebug assembleDebug
+      - uses: actions/upload-artifact@v5
+        with:
+          name: galaxy-reset-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk

@@ -9,6 +9,10 @@ import shutil
 import threading
 import unicodedata
 import collections
+import argparse
+import hashlib
+import shlex
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 
 
@@ -938,6 +942,9 @@ def delete_user_installed_apps(serial):
         'com.sec.android.app.popupcalculator',
         'com.nhn.android.nmap',
         'com.alphainventor.filemanager',
+        'com.forholiday.galaxyreset',
+        'moe.shizuku.privileged.api',
+        'com.sec.android.app.sbrowser',
     ]
     result = run_command([
         'adb', '-s', serial, 'shell',
@@ -1517,36 +1524,147 @@ def reset_launcher_with_clean_home(serial):
     logging.info('[%s] 런처 초기화 완료 — 위젯 제거됨, provider 재활성화됨', serial)
 
 
+PHONE_APP_PACKAGE = 'com.forholiday.galaxyreset'
+SHIZUKU_PACKAGE = 'moe.shizuku.privileged.api'
+PHONE_APK_FILES = {PHONE_APP_PACKAGE: 'galaxy-reset.apk', SHIZUKU_PACKAGE: 'shizuku.apk'}
+
+
+def load_phone_bundle(verify_hash=False):
+    """EXE와 함께 동봉한 서명 APK를 검증합니다. 설치 때 다른 키로 재빌드하지 않습니다."""
+    manifest_path = resource_path('phone-app/bundle.json')
+    try:
+        with open(manifest_path, encoding='utf-8') as source:
+            manifest = json.load(source)
+        apps = {app['package']: dict(app) for app in manifest['apps']}
+        if set(apps) != set(PHONE_APK_FILES):
+            raise ValueError('필수 APK 목록 불일치')
+        for package, filename in PHONE_APK_FILES.items():
+            app = apps[package]
+            if app['file'] != filename or not isinstance(app['versionCode'], int):
+                raise ValueError('APK 메타데이터 오류')
+            apk = resource_path('phone-app/' + filename)
+            with zipfile.ZipFile(apk) as archive:
+                if not {'AndroidManifest.xml', 'classes.dex'} <= set(archive.namelist()):
+                    raise ValueError('유효하지 않은 APK: ' + filename)
+            if verify_hash:
+                digest = hashlib.sha256()
+                with open(apk, 'rb') as binary:
+                    for block in iter(lambda: binary.read(1024 * 1024), b''):
+                        digest.update(block)
+                if digest.hexdigest() != app['sha256']:
+                    raise ValueError('APK 해시 불일치: ' + filename)
+            app['apk_path'] = apk
+        return apps
+    except (OSError, ValueError, KeyError, TypeError, zipfile.BadZipFile) as error:
+        raise RuntimeError('폰 앱 동봉 파일 검증 실패: %s — tools/prepare_phone_bundle.py를 실행하고 EXE를 다시 빌드하세요.' % error) from error
+
+
+def _pc_required(serial, arguments, timeout=90):
+    result = run_command(['adb', '-s', serial] + arguments, check=True, timeout=timeout)
+    output = (result.stdout or '') + '\n' + (result.stderr or '')
+    if result.returncode != 0 or any(token in output for token in ('SecurityException', 'Error:', 'Failure [')):
+        # 설치/설정 실패를 '초기화 완료'로 넘기지 않는다. 연결 이탈은 run_command가 구분한다.
+        raise RuntimeError('폰 앱 준비 실패 (%s): %s' % (' '.join(arguments[:3]), output.strip()[:180]))
+    return result
+
+
+def _package_version(serial, package):
+    result = _pc_required(serial, ['shell', 'dumpsys', 'package', package])
+    match = re.search(r'\bversionCode=(\d+)\b', result.stdout or '')
+    if not match:
+        raise RuntimeError('설치 버전 조회 실패: ' + package)
+    return int(match.group(1))
+
+
+def start_shizuku_from_pc(serial):
+    """13.6+ 공식 starter 실행. 무선 페어링 키를 복제하거나 승인 DB를 수정하지 않습니다."""
+    running = run_command(['adb', '-s', serial, 'shell', 'pidof', 'shizuku_server'])
+    if running.returncode == 0 and re.fullmatch(r'[0-9\s]+', (running.stdout or '').strip()):
+        logging.info('[%s] Shizuku 이미 실행 중', serial)
+        return
+    package_dump = _pc_required(serial, ['shell', 'dumpsys', 'package', SHIZUKU_PACKAGE]).stdout or ''
+    path_match = re.search(r'^\s*codePath=(/data/app/[A-Za-z0-9_./+=~-]+)\s*$', package_dump, re.MULTILINE)
+    abi_match = re.search(r'^\s*primaryCpuAbi=(\S+)\s*$', package_dump, re.MULTILINE)
+    arch = {'arm64-v8a': 'arm64', 'armeabi-v7a': 'arm', 'x86_64': 'x86_64', 'x86': 'x86'}
+    if not path_match or not abi_match or abi_match.group(1) not in arch:
+        raise RuntimeError('Shizuku 실행 파일 경로/아키텍처 조회 실패')
+    directory = path_match.group(1)
+    starter = directory + '/lib/' + arch[abi_match.group(1)] + '/libshizuku.so'
+    _pc_required(serial, ['shell', 'test', '-x', starter])
+    command = shlex.quote(starter) + ' --apk=' + shlex.quote(directory + '/base.apk')
+    _pc_required(serial, ['shell', command], timeout=45)
+    for _ in range(10):
+        running = run_command(['adb', '-s', serial, 'shell', 'pidof', 'shizuku_server'], timeout=10)
+        if running.returncode == 0 and re.fullmatch(r'[0-9\s]+', (running.stdout or '').strip()):
+            logging.info('[%s] Shizuku USB 기동 확인', serial)
+            return
+        time.sleep(1)
+    raise RuntimeError('Shizuku 서버 시작 확인 실패')
+
+
+def prepare_wireless_reset(serial):
+    """첫 USB 작업에서 설정 가능한 범위까지 준비하고 최초 승인 절차는 직원에게 안내합니다."""
+    sdk_text = _pc_required(serial, ['shell', 'getprop', 'ro.build.version.sdk']).stdout.strip()
+    if not sdk_text.isdigit() or int(sdk_text) < 30:
+        raise RuntimeError('폰 단독 무선 초기화는 Android 11 이상이 필요합니다.')
+    user = _pc_required(serial, ['shell', 'am', 'get-current-user']).stdout.strip()
+    if user != '0':
+        raise RuntimeError('폰 앱 준비는 소유자(사용자 0) 화면에서 진행하세요.')
+    sdk = int(sdk_text)
+    for package in (PHONE_APP_PACKAGE, SHIZUKU_PACKAGE):
+        _pc_required(serial, ['shell', 'pm', 'enable', '--user', '0', package])
+        _pc_required(serial, ['shell', 'pm', 'grant', '--user', '0', package,
+                              'android.permission.WRITE_SECURE_SETTINGS'])
+        if sdk >= 33:
+            _pc_required(serial, ['shell', 'pm', 'grant', '--user', '0', package,
+                                  'android.permission.POST_NOTIFICATIONS'])
+        battery = run_command(['adb', '-s', serial, 'shell', 'cmd', 'deviceidle', 'whitelist', '+' + package])
+        if battery.returncode != 0:
+            add_post_run_notice('[%s] %s 배터리 제한 제외 실패 — 기기 설정에서 확인하세요.' % (serial, package))
+    for name in ('development_settings_enabled', 'adb_enabled', 'adb_wifi_enabled'):
+        _pc_required(serial, ['shell', 'settings', 'put', 'global', name, '1'])
+    wireless = _pc_required(serial, ['shell', 'settings', 'get', 'global', 'adb_wifi_enabled']).stdout.strip()
+    if wireless != '1':
+        raise RuntimeError('무선 디버깅 활성화 확인 실패 — Wi-Fi 연결과 기기의 허용 팝업을 확인하세요.')
+    start_shizuku_from_pc(serial)
+    _pc_required(serial, ['shell', 'am', 'start', '--user', '0', '-n', PHONE_APP_PACKAGE + '/.MainActivity'])
+    note = ('[%s] 폰 앱·Shizuku 설치 및 USB 기동 준비 완료. 처음인 기기는 전원을 끄기 전에 '
+            'Shizuku 무선 페어링(현재 Wi-Fi 신뢰 포함)과 초기화 앱 권한 허용을 1회 완료하세요. '
+            '기존 페어링·권한은 보존하며, USB 기동만으로 무선 페어링 완료를 뜻하지 않습니다.' % serial)
+    add_post_run_notice(note)
+    if PROGRESS:
+        PROGRESS.note(serial, '최초 1회: Shizuku 페어링·앱 권한 확인 (기존 승인은 유지)')
+    logging.info('[%s] 무선 초기화 준비 설정 완료', serial)
+
+
 def ensure_essential_apps_installed(serial):
-    """필수 앱이 설치되어 있는지 확인하고 없으면 설치합니다."""
+    """기존 필수 앱 + 폰 초기화 앱 + Shizuku를 설치하고 다음 폰 단독 실행을 준비합니다."""
+    bundled = load_phone_bundle()
     apps = [
         {'package': 'com.nhn.android.nmap', 'name': 'Nmap', 'apk_path': resource_path('nmap.apk')},
         {'package': 'com.alphainventor.filemanager', 'name': 'File Manager', 'apk_path': resource_path('filemanager.apk')},
+        dict(bundled[PHONE_APP_PACKAGE], name='갤럭시 초기화'),
+        dict(bundled[SHIZUKU_PACKAGE], name='Shizuku'),
     ]
-    result = run_command([
-        'adb', '-s', serial, 'shell', 'pm', 'list', 'packages'
-    ], timeout=120)
-    if result.returncode != 0:
-        logging.warning('[%s] 패키지 목록 조회 실패 — 필수 앱 설치 단계 건너뜀', serial)
-        return
-    output = result.stdout
-
+    listed = _pc_required(serial, ['shell', 'pm', 'list', 'packages', '--user', '0'], timeout=120)
+    installed = {line[8:].strip() for line in listed.stdout.splitlines() if line.startswith('package:')}
     for app in apps:
-        if f"package:{app['package']}" in output:
-            logging.info('[%s] %s 이미 설치됨', serial, app['name'])
-        else:
-            apk = app['apk_path']
-            if os.path.exists(apk):
-                logging.info('[%s] %s 설치 중...', serial, app['name'])
-                # 80MB APK — 다중 기기 동시 전송 시 60초로는 부족
-                install = run_command(['adb', '-s', serial, 'install', '-r', apk], timeout=300)
-                if 'Success' in (install.stdout or ''):
-                    logging.info('[%s] %s 설치 완료', serial, app['name'])
-                else:
-                    logging.warning('[%s] %s 설치 실패: %s', serial, app['name'],
-                                    (install.stderr or install.stdout or '알 수 없음').strip()[:120])
-            else:
-                logging.warning('[%s] APK 파일 없음: %s', serial, apk)
+        package = app['package']
+        if package in installed:
+            if 'versionCode' not in app or _package_version(serial, package) >= app['versionCode']:
+                logging.info('[%s] %s 설치됨 (같거나 최신 버전 유지)', serial, app['name'])
+                continue
+        apk = app['apk_path']
+        if not os.path.isfile(apk):
+            raise RuntimeError('필수 APK 없음: ' + apk)
+        logging.info('[%s] %s 설치/업데이트 중...', serial, app['name'])
+        result = _pc_required(serial, ['install', '-r', '--user', '0', apk], timeout=300)
+        if 'Success' not in (result.stdout or ''):
+            raise RuntimeError('필수 앱 설치 확인 실패: ' + app['name'])
+        verify = _pc_required(serial, ['shell', 'pm', 'path', '--user', '0', package])
+        if not (verify.stdout or '').strip().startswith('package:'):
+            raise RuntimeError('필수 앱 설치 후 조회 실패: ' + app['name'])
+    prepare_wireless_reset(serial)
 
 
 # ============================================================
@@ -1583,7 +1701,7 @@ def build_pipeline(serial, locale, wallpaper, series):
         ('런처 초기화', lambda: reset_launcher_with_clean_home(serial)),
         ('Galaxy Store 복원 차단', lambda: block_galaxy_store_auto_restore(serial)),
         ('배경화면 적용', lambda: push_default_wallpaper(serial, wallpaper, series)),
-        ('필수 앱 설치', lambda: ensure_essential_apps_installed(serial)),
+        ('필수 앱 설치·무선 초기화 준비', lambda: ensure_essential_apps_installed(serial)),
         ('최근 앱 목록 제거', lambda: clear_recent_tasks(serial)),
     ]
 
@@ -1715,16 +1833,16 @@ def run_fleet(devices, locales):
     return failures
 
 
-def report_run(devices, failures, log_buffer):
+def report_run(devices, failures, log_buffer, activity='초기화'):
     """실행 결과 요약 + 실패 기기의 직전 로그를 출력합니다."""
-    logging.info('모든 기기 초기화 작업이 완료되었습니다.')
+    logging.info('모든 기기 %s 작업이 종료되었습니다.', activity)
     with _NOTICE_LOCK:
         notices, POST_RUN_NOTICES[:] = list(POST_RUN_NOTICES), []
     for notice in notices:
         print('⚠ %s' % notice)
     if not failures:
         return
-    logging.error('실패한 기기 %d대: %s — 다시 초기화하세요.',
+    logging.error('실패한 기기 %d대: %s — 해당 작업을 다시 시도하세요.',
                   len(failures), ', '.join(failures))
     for serial, reason in failures.items():
         print()
@@ -1734,6 +1852,7 @@ def report_run(devices, failures, log_buffer):
 
 
 def main():
+    load_phone_bundle(verify_hash=True)
     # 메뉴·표의 색상 표시 (진행률 화면과 동일한 VT 경로, 미지원 콘솔이면 무색)
     global ANSI_OK
     ANSI_OK = sys.stdout.isatty() and _enable_ansi()
@@ -1776,5 +1895,30 @@ def main():
             break
 
 
+def prepare_phone_only_main():
+    parser = argparse.ArgumentParser(description='데이터 삭제 없이 필수 앱 설치와 무선 초기화 준비만 실행')
+    parser.add_argument('--prepare-phone-only', action='store_true')
+    parser.add_argument('--serial', action='append', help='대상 USB 시리얼, 여러 번 지정 가능')
+    args = parser.parse_args()
+    load_phone_bundle(verify_hash=True)
+    devices = args.serial or get_connected_devices()
+    if not devices:
+        raise RuntimeError('준비할 USB 기기가 없습니다.')
+    failures = {}
+    buffer = DeviceLogHandler()
+    logging.getLogger().addHandler(buffer)
+    for serial in devices:
+        try:
+            ensure_essential_apps_installed(serial)
+        except Exception as error:
+            failures[serial] = str(error)
+    report_run(devices, failures, buffer, activity='폰 앱 준비 (데이터 삭제 없음)')
+    if failures:
+        raise SystemExit(1)
+
+
 if __name__ == '__main__':
-    main()
+    if '--prepare-phone-only' in sys.argv:
+        prepare_phone_only_main()
+    else:
+        main()

@@ -1,0 +1,2 @@
+Material Symbols Rounded icons by Google. Licensed under Apache License 2.0.
+Original SVG paths converted to Android VectorDrawable resources; no path modifications.

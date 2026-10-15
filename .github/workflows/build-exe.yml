@@ -22,6 +22,12 @@ jobs:
       - name: Install PyInstaller
         run: pip install pyinstaller
 
+      - name: Verify bundled phone APKs
+        run: python tools/prepare_phone_bundle.py --check
+
+      - name: Test phone provisioning
+        run: python -m unittest -v test_phone_setup
+
       - name: Build EXE
         run: pyinstaller V6.spec
 

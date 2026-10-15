@@ -1,0 +1,19 @@
+{
+  "apps": [
+    {
+      "package": "com.forholiday.galaxyreset",
+      "file": "galaxy-reset.apk",
+      "versionCode": 12,
+      "versionName": "1.1.8",
+      "sha256": "91d04186434a9a76c574b930f3523a3be83e2b22a53dc1919cd54975d9583df7"
+    },
+    {
+      "package": "moe.shizuku.privileged.api",
+      "file": "shizuku.apk",
+      "versionCode": 1086,
+      "versionName": "13.6.0",
+      "source": "https://github.com/RikkaApps/Shizuku/releases/download/v13.6.0/shizuku-v13.6.0.r1086.2650830c-release.apk",
+      "sha256": "6e273ab0e991c4e79bc8b1bbb9b9dd739ccac1a8712a541a214078886b7b790f"
+    }
+  ]
+}
