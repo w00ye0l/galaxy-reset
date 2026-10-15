@@ -6,13 +6,20 @@ import java.util.*;
 
 final class RunState {
     final SharedPreferences prefs;
-    RunState(Context context) { prefs = context.getSharedPreferences("run", Context.MODE_PRIVATE); }
+    RunState(Context context) { this(context.getSharedPreferences("run", Context.MODE_PRIVATE)); }
+    RunState(SharedPreferences preferences) { prefs = preferences; }
     String phase() { return prefs.getString("phase", "idle"); }
     int index() { return prefs.getInt("index", 0); }
     boolean homeOnNextLaunch() { return prefs.getBoolean("home_after_shutdown", false); }
     void homeOnNextLaunch(boolean value) {
         if (!prefs.edit().putBoolean("home_after_shutdown", value).commit())
             throw new IllegalStateException("화면 상태를 저장하지 못했습니다.");
+    }
+    void clearHistoryForShutdown() {
+        // Recovery information must be resolved before dropping this app's run history.
+        if (!pending().isEmpty()) throw new IllegalStateException("앱 복구가 남아있습니다. 재연결 후 복구부터 완료하세요.");
+        if (!prefs.edit().clear().putBoolean("home_after_shutdown", true).commit())
+            throw new IllegalStateException("초기화 기록을 지우지 못했습니다. 저장 공간을 확인하세요.");
     }
     String locale() { return prefs.getString("locale", "ja-JP"); }
     String status(int step) { return prefs.getString("status" + step, "대기"); }

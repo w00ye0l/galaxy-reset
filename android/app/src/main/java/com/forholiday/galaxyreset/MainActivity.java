@@ -23,13 +23,15 @@ public class MainActivity extends Activity {
     private final Handler handler=new Handler(Looper.getMainLooper());
     private RunState state;
     private LinearLayout frame, body, footer, rows;
-    private ScrollView records;
+    private ScrollView contentScroll, records;
     private TextView percent, progressLabel, countLabel;
     private ProgressBar progressBar;
     private int preview=-1, override=-1;
     private String selected="ja-JP", signature="";
     private Bitmap wallpaper;
     private Dialog activeDialog;
+    private long backPressedAt;
+    private boolean shuttingDown;
     private final Shizuku.OnBinderReceivedListener received=()->{ShellConnection.INSTANCE.connect(false); refresh();};
     private final Shizuku.OnBinderDeadListener dead=()->{ShellConnection.INSTANCE.lost(); refresh();};
     private final Shizuku.OnRequestPermissionResultListener permission=(request,result)->{ShellConnection.INSTANCE.connect(false); refresh();};
@@ -37,6 +39,7 @@ public class MainActivity extends Activity {
 
     @Override public void onCreate(Bundle saved) {
         super.onCreate(saved); state=new RunState(this); state.detectInterruption();
+        if(Build.VERSION.SDK_INT>=33)getOnBackInvokedDispatcher().registerOnBackInvokedCallback(android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT,this::handleBack);
         selected=saved==null?state.locale():saved.getString("selected",state.locale());
         if(saved!=null){override=saved.getInt("override",-1);}
         if(state.homeOnNextLaunch()&&!running()){preview=-1;override=1;}
@@ -90,16 +93,11 @@ public class MainActivity extends Activity {
         int current=screen();frame=column();frame.setBackgroundColor(BG);frame.setTag(current==3?"progress:"+preview:"screen:"+current);setContentView(frame);
         frame.setOnApplyWindowInsetsListener((view,insets)->{Insets bars=insets.getInsets(WindowInsets.Type.systemBars());view.setPadding(bars.left,bars.top,bars.right,bars.bottom);return insets;});frame.requestApplyInsets();
         WindowInsetsController controls=frame.getWindowInsetsController();if(controls!=null)controls.setSystemBarsAppearance(WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS|WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS,WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS|WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS);
-        header();
-        ScrollView scroll=new ScrollView(this);scroll.setFillViewport(true);body=column();body.setPadding(dp(20),dp(8),dp(20),dp(20));scroll.addView(body);frame.addView(scroll,new LinearLayout.LayoutParams(-1,0,1));
+        contentScroll=new ScrollView(this);contentScroll.setFillViewport(true);body=column();body.setPadding(dp(20),dp(8),dp(20),dp(20));contentScroll.addView(body);frame.addView(contentScroll,new LinearLayout.LayoutParams(-1,0,1));
         footer=column();footer.setPadding(dp(20),dp(12),dp(20),dp(16));footer.setBackgroundColor(WHITE);frame.addView(footer);
         switch(current){case 0->connectionScreen();case 1,2->startScreen();case 3->progressScreen();case 4->doneScreen();case 5->failureScreen();}
         if(current==2)handler.post(()->confirmRun(0,false,true));
     }
-    void header(){LinearLayout header=row();header.setPadding(dp(20),dp(14),dp(16),dp(14));
-        ImageView logo=icon(UiIcon.REFRESH,WHITE,22);logo.setPadding(dp(5),dp(5),dp(5),dp(5));logo.setBackground(shape(TEAL,9,0));logo.setLayoutParams(new LinearLayout.LayoutParams(dp(32),dp(32)));header.addView(logo);
-        TextView title=label("갤럭시 초기화",18,INK,true);LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(0,-2,1);p.setMargins(dp(10),0,0,0);header.addView(title,p);
-        frame.addView(header);}
     void connectionScreen(){
         space(body,18);text(body,"권한 연결 확인",28,INK,true);space(body,10);text(body,"Shizuku가 실행 중이면 자동으로 연결합니다.",14,MUTED,false);space(body,24);
         LinearLayout steps=column();card(steps,WHITE);body.addView(steps);
@@ -136,8 +134,8 @@ public class MainActivity extends Activity {
         progressBar=new ProgressBar(this,null,android.R.attr.progressBarStyleHorizontal);progressBar.setMax(19);progressBar.setProgressTintList(ColorStateList.valueOf(TEAL));progressBar.setProgressBackgroundTintList(ColorStateList.valueOf(BORDER));top.addView(progressBar,new LinearLayout.LayoutParams(-1,dp(8)));space(top,12);progressLabel=text(top,"",15,TEAL,true);body.addView(top);space(body,12);
         LinearLayout tip=row();tip.setPadding(dp(12),dp(12),dp(12),dp(12));tip.setBackground(shape(0xfffff1dc,12,0));tip.addView(icon(UiIcon.ALERT,AMBER,20));TextView message=label("화면이 깜빡이거나 홈 화면으로 나가도 정상이에요. 끝나면 돌아옵니다. 충전기를 연결해 두세요.",12,AMBER,false);LinearLayout.LayoutParams m=new LinearLayout.LayoutParams(0,-2,1);m.setMargins(dp(8),0,0,0);tip.addView(message,m);body.addView(tip);space(body,16);
         LinearLayout title=row();title.addView(label("진행 기록",14,INK,true),new LinearLayout.LayoutParams(0,-2,1));title.addView(label("눌러서 상세 확인",11,MUTED,false));body.addView(title);space(body,8);
-        records=new ScrollView(this);records.setBackground(shape(WHITE,18,0));records.setClipToOutline(true);records.setFillViewport(true);rows=column();rows.setPadding(dp(14),dp(10),dp(14),dp(10));records.addView(rows);int height=Math.max(230,Math.min(430,(int)(getResources().getDisplayMetrics().heightPixels/getResources().getDisplayMetrics().density)-380-(demo()?120:0)));body.addView(records,new LinearLayout.LayoutParams(-1,dp(height)));
-        records.setOnTouchListener((v,event)->{v.getParent().requestDisallowInterceptTouchEvent(event.getAction()!=MotionEvent.ACTION_UP&&event.getAction()!=MotionEvent.ACTION_CANCEL);return false;});
+        // One scroll owner: clickable step rows must not compete with a nested ScrollView.
+        records=contentScroll;rows=column();rows.setBackground(shape(WHITE,18,0));rows.setPadding(dp(14),dp(10),dp(14),dp(10));body.addView(rows);
         if(demo())action(footer,"완료 화면 보기",UiIcon.ARROW,TEAL,WHITE,()->{preview=4;render();});
         else if(!running())action(footer,"결과 화면으로",UiIcon.ARROW,TEAL,WHITE,()->{override=-1;render();});
         else {text(footer,deviceName()+" · "+ko(state.locale()),12,MUTED,false);footer.setBackgroundColor(BG);}
@@ -147,7 +145,7 @@ public class MainActivity extends Activity {
     void updateProgress(){if(rows==null||percent==null)return;int count=demo()?6:state.completed();percent.setText((count*100/19)+"%");countLabel.setText(count+" / 19");progressBar.setProgress(count);progressLabel.setText(demo()?"로그·캐시 정리 중…":running()?ResetPipeline.LABELS[state.index()]+" 중…":"전체 단계 기록");
         int scrollY=records.getScrollY();rows.removeAllViews();for(int i=0;i<19;i++){final int step=i;String status=displayedStatus(i);boolean done=status.equals("완료"),active=status.equals("진행 중"),problem=status.equals("실패")||status.equals("수동 확인");LinearLayout item=row();item.setPadding(dp(4),dp(10),dp(4),dp(10));item.setMinimumHeight(dp(48));item.setBackground(ripple(active?PALE:WHITE,10,0));item.addView(icon(done?UiIcon.CHECK:problem?UiIcon.ALERT:active?UiIcon.REFRESH:UiIcon.INFO,done||active?TEAL:problem?AMBER:BORDER,20));LinearLayout copy=column();LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(0,-2,1);p.setMargins(dp(10),0,dp(6),0);item.addView(copy,p);text(copy,ResetPipeline.LABELS[i],13,active?TEAL:status.equals("대기")?MUTED:INK,true);
             if(problem){space(copy,3);text(copy,status,11,AMBER,false);}item.addView(label(String.format(Locale.ROOT,"%02d",i+1),11,MUTED,false));item.setContentDescription((i+1)+"단계 "+ResetPipeline.LABELS[i]+", "+status+", 상세 확인");item.setOnClickListener(v->showStep(step));rows.addView(item);}
-        records.post(()->{if(running()&&!demo())records.smoothScrollTo(0,rows.getChildAt(state.index()).getTop());else records.scrollTo(0,scrollY);});
+        records.post(()->{if(running()&&!demo())records.smoothScrollTo(0,rows.getTop()+rows.getChildAt(state.index()).getTop());else records.scrollTo(0,scrollY);});
     }
     void hero(String title,String subtitle,int kind,int fill){space(body,22);ImageView symbol=icon(kind,WHITE,42);symbol.setPadding(dp(15),dp(15),dp(15),dp(15));symbol.setBackground(shape(fill,40,0));LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(dp(76),dp(76));p.gravity=Gravity.CENTER_HORIZONTAL;body.addView(symbol,p);space(body,18);TextView name=text(body,title,26,INK,true);name.setGravity(Gravity.CENTER);space(body,10);TextView details=text(body,subtitle,12,MUTED,false);details.setGravity(Gravity.CENTER);space(body,24);}
     void doneScreen(){hero("초기화 완료",deviceName()+" · "+(demo()?19:state.completed())+" / 19단계",UiIcon.CHECK,TEAL);LinearLayout results=column();card(results,WHITE);String summary=state.prefs.getString("summary","");
@@ -179,13 +177,49 @@ public class MainActivity extends Activity {
     void dismissDialog(){if(activeDialog!=null){activeDialog.dismiss();activeDialog=null;}}
     void confirmRun(int from,boolean single,boolean fresh){if(!demo()&&(running()||!ShellConnection.INSTANCE.ready()))return;LinearLayout content=column();card(content,WHITE);ImageView alert=icon(UiIcon.ALERT,RED,28);content.addView(alert);space(content,16);text(content,"이 폰의 사용자 데이터가 지워져요",21,INK,true);space(content,10);text(content,"지운 데이터는 되돌릴 수 없어요.",13,MUTED,false);space(content,16);LinearLayout list=column();card(list,BG);text(list,"· 사진·동영상·다운로드 파일\n· 설치한 앱과 비삼성 계정\n· e-SIM 프로필\n· 인터넷·Google 앱 사용 기록",13,INK,false);content.addView(list);space(content,12);text(content,single?"선택 단계: "+ResetPipeline.LABELS[from]:fresh?"삼성 계정·초기화 앱·Shizuku·필수 앱은 보존합니다.":(from+1)+"단계부터 다시 실행합니다.",12,MUTED,false);space(content,20);LinearLayout actions=row();Button cancel=button("취소",UiIcon.CLOSE,WHITE,INK,()->{dismissDialog();if(preview==2){preview=1;render();}});Button erase=button("모두 지우기",UiIcon.DELETE,RED,WHITE,()->{dismissDialog();if(demo()){preview=3;render();return;}if(running()||!ShellConnection.INSTANCE.ready())return;state.homeOnNextLaunch(false);override=-1;Intent intent=new Intent(this,ResetService.class).putExtra("from",from).putExtra("single",single).putExtra("fresh",fresh).putExtra("locale",selected);startForegroundService(intent);});actions.addView(cancel,new LinearLayout.LayoutParams(0,dp(50),1));LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(0,dp(50),1);p.setMargins(dp(10),0,0,0);actions.addView(erase,p);content.addView(actions);showDialog(content);}
     void previewNotice(String title){new AlertDialog.Builder(this).setTitle(title+" · 미리보기").setMessage("디자인 미리보기에서는 실제 명령을 실행하지 않습니다.").setPositiveButton("확인",null).show();}
-    void confirmShutdown(){new AlertDialog.Builder(this).setTitle("전원을 끌까요?").setMessage((state.issues()?"확인할 항목이 남아있습니다.\n\n":"")+"전원을 끄면 Shizuku도 종료됩니다.").setNegativeButton("취소",null).setPositiveButton("전원 끄기",(d,w)->new Thread(()->{try{ShellConnection.INSTANCE.checkUid();state.homeOnNextLaunch(true);if(ShellConnection.INSTANCE.run("reboot -p",15).code()!=0)throw new IllegalStateException();}catch(Exception e){handler.post(()->Toast.makeText(this,"전원 끄기 실패 · 기기 전원 버튼을 사용하세요.",Toast.LENGTH_LONG).show());}},"shutdown").start()).show();}
+    void confirmShutdown(){
+        if(shuttingDown||running())return;
+        new AlertDialog.Builder(this).setTitle("전원을 끌까요?")
+            .setMessage((state.issues()?"확인할 항목이 남아있습니다.\n\n":"")+"초기화 앱의 진행·결과 기록, 완료 알림과 최근 앱 항목을 지운 뒤 전원을 끕니다. Shizuku 연결 권한은 유지됩니다.")
+            .setNegativeButton("취소",null).setPositiveButton("전원 끄기",(d,w)->shutdown()).show();
+    }
+    void shutdown(){
+        if(shuttingDown||running())return;shuttingDown=true;
+        new Thread(()->{
+            try{
+                ShellConnection.INSTANCE.checkUid();
+                handler.post(()->{
+                    try{
+                        if(running())throw new IllegalStateException("초기화 실행 중입니다.");
+                        state.clearHistoryForShutdown();
+                        getSystemService(NotificationManager.class).cancelAll();
+                        closeApp();
+                        new Thread(()->{
+                            try{if(ShellConnection.INSTANCE.run("reboot -p",15).code()!=0)throw new IllegalStateException();}
+                            catch(Exception e){shutdownFailed("전원 끄기 실패 · 기기 전원 버튼을 사용하세요.");}
+                        },"shutdown-command").start();
+                    }catch(Exception e){shutdownFailed(e.getMessage());}
+                });
+            }catch(Exception e){shutdownFailed("Shizuku 연결을 확인한 뒤 다시 시도하세요.");}
+        },"shutdown-prepare").start();
+    }
+    void shutdownFailed(String message){handler.post(()->{shuttingDown=false;Toast.makeText(getApplicationContext(),message,Toast.LENGTH_LONG).show();});}
+    void handleBack(){
+        long now=SystemClock.elapsedRealtime();
+        if(backPressedAt!=0&&now-backPressedAt<=2000){closeApp();return;}
+        backPressedAt=now;
+        Toast.makeText(this,running()?"한 번 더 누르면 앱이 닫힙니다. 초기화는 계속 진행됩니다.":"한 번 더 누르면 앱이 종료됩니다.",Toast.LENGTH_SHORT).show();
+    }
+    // Android 13+ uses OnBackInvokedDispatcher above; this override is only the Android 11/12 fallback.
+    @android.annotation.SuppressLint("GestureBackNavigation")
+    @Override public void onBackPressed(){if(Build.VERSION.SDK_INT<33)handleBack();}
+    void closeApp(){dismissDialog();for(ActivityManager.AppTask task:getSystemService(ActivityManager.class).getAppTasks())task.finishAndRemoveTask();finishAndRemoveTask();}
     void debugGuide(){new AlertDialog.Builder(this).setTitle("무선 디버깅 연결").setMessage("Wi-Fi 연결 → 개발자 옵션의 무선 디버깅 켜기 → Shizuku에서 페어링·시작 → 이 앱의 권한 허용 순서로 진행하세요.\n\n재부팅 후에는 Shizuku를 다시 시작해야 합니다.").setPositiveButton("개발자 옵션 열기",(d,w)->open(new Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS))).setNegativeButton("닫기",null).show();}
     void goHome(){state.homeOnNextLaunch(true);override=1;}
     void connectShizuku(){if(Shizuku.pingBinder())ShellConnection.INSTANCE.connect(true);else openShizuku();}
     void openShizuku(){Intent launch=getPackageManager().getLaunchIntentForPackage(ResetPipeline.SHIZUKU);open(launch!=null?launch:new Intent(Intent.ACTION_VIEW,Uri.parse("https://shizuku.rikka.app/download/")));}
     void open(Intent intent){try{startActivity(intent);}catch(Exception e){Toast.makeText(this,"설정에서 직접 열어주세요.",Toast.LENGTH_LONG).show();}}
     @Override protected void onResume(){super.onResume();handler.post(tick);ShellConnection.INSTANCE.connect(false);}
-    @Override protected void onPause(){handler.removeCallbacks(tick);super.onPause();}
+    @Override protected void onPause(){backPressedAt=0;handler.removeCallbacks(tick);super.onPause();}
     @Override protected void onDestroy(){dismissDialog();Shizuku.removeBinderReceivedListener(received);Shizuku.removeBinderDeadListener(dead);Shizuku.removeRequestPermissionResultListener(permission);handler.removeCallbacks(tick);super.onDestroy();}
 }
