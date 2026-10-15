@@ -188,33 +188,17 @@ public class MainActivity extends Activity {
         text(content,"사진·동영상·파일·설치한 앱·비삼성 계정·e-SIM 등이 삭제될 수 있으며, 이 앱으로 되돌릴 수 없습니다.",14,RED,true);space(content,12);
         text(content,"대상 기기: "+deviceName()+" · "+Build.MODEL,13,INK,true);space(content,6);
         text(content,single?"실행 단계: "+ResetPipeline.LABELS[from]:fresh?"전체 19단계 · 삼성 계정·초기화 앱·Shizuku·필수 앱 보존":(from+1)+"단계부터 다시 실행",12,MUTED,false);space(content,14);
-        CheckBox staff=new CheckBox(this);staff.setText("직원이며, 반납된 기기와 삭제 대상을 확인했습니다.");staff.setTextSize(14);staff.setTextColor(INK);staff.setButtonTintList(ColorStateList.valueOf(RED));content.addView(staff);space(content,10);
-        text(content,"계속하려면 아래에 ‘초기화’를 직접 입력하세요.",13,INK,true);space(content,6);
-        EditText phrase=new EditText(this);phrase.setHint("초기화");phrase.setSingleLine(true);phrase.setTextSize(16);
-        phrase.setInputType(android.text.InputType.TYPE_CLASS_TEXT|android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
-        phrase.setImeOptions(android.view.inputmethod.EditorInfo.IME_ACTION_DONE|android.view.inputmethod.EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING);
-        phrase.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS);phrase.setSaveEnabled(false);
-        content.addView(phrase,new LinearLayout.LayoutParams(-1,dp(52)));space(content,16);
         LinearLayout actions=row();
         Button cancel=button("취소",UiIcon.CLOSE,WHITE,INK,()->{dismissDialog();if(preview==2){preview=1;render();}});
         Button erase=button(single?"이 단계 실행":"삭제 실행",UiIcon.DELETE,RED,WHITE,()->{
-            if(!ResetConfirmation.allowed(staff.isChecked(),phrase.getText().toString()))return;
             if(!demo()&&(running()||!ShellConnection.INSTANCE.ready())){Toast.makeText(this,"Shizuku 연결 상태를 확인하세요.",Toast.LENGTH_SHORT).show();return;}
             dismissDialog();
             if(demo()){preview=3;render();return;}
             state.homeOnNextLaunch(false);override=-1;
             Intent intent=new Intent(this,ResetService.class).putExtra("from",from).putExtra("single",single).putExtra("fresh",fresh).putExtra("locale",selected);startForegroundService(intent);
         });
-        Runnable update=()->{boolean allowed=ResetConfirmation.allowed(staff.isChecked(),phrase.getText().toString());erase.setEnabled(allowed);erase.setAlpha(allowed?1f:0.35f);};
-        staff.setOnCheckedChangeListener((view,checked)->update.run());
-        phrase.addTextChangedListener(new android.text.TextWatcher(){
-            public void beforeTextChanged(CharSequence value,int start,int count,int after){}
-            public void onTextChanged(CharSequence value,int start,int before,int count){update.run();}
-            public void afterTextChanged(android.text.Editable value){}
-        });update.run();
         actions.addView(cancel,new LinearLayout.LayoutParams(0,dp(50),1));LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(0,dp(50),1);p.setMargins(dp(10),0,0,0);actions.addView(erase,p);content.addView(actions);
         content.setFocusableInTouchMode(true);content.requestFocus();showDialog(content);
-        if(activeDialog.getWindow()!=null)activeDialog.getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE|WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN);
     }
     void previewNotice(String title){new AlertDialog.Builder(this).setTitle(title+" · 미리보기").setMessage("디자인 미리보기에서는 실제 명령을 실행하지 않습니다.").setPositiveButton("확인",null).show();}
     void confirmShutdown(){
