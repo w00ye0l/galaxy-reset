@@ -65,6 +65,46 @@ final class ResetPipeline {
         Result r = required("pm list packages --user 0 " + quote(pkg));
         return Arrays.asList(r.output.split("\\R")).contains("package:" + pkg);
     }
+    long packageVersion(String pkg) throws Exception {
+        Matcher version=Pattern.compile("\\bversionCode=(\\d+)\\b").matcher(required("dumpsys package "+quote(pkg)).output);
+        if(!version.find())throw new IOException("설치 버전 조회 실패: "+pkg);
+        return Long.parseLong(version.group(1));
+    }
+    void nmapInstallSuccess(Result result) throws IOException {
+        if(result.code!=0||result.truncated||!result.output.contains("Success")||result.output.contains("Failure"))
+            throw new IOException("네이버 지도 분할 APK 설치 실패: "+result.output.substring(0,Math.min(180,result.output.length())));
+    }
+    void prepareNmap() throws Exception {
+        String pkg="com.nhn.android.nmap";
+        if(!installed(pkg)||packageVersion(pkg)<BuildConfig.NMAP_VERSION_CODE){
+            String session=null;boolean committed=false;
+            try{
+                for(String asset:BuildConfig.NMAP_APKS)bridge.copy(asset,TMP+asset);
+                Result created=required("pm install-create -r --user 0");
+                Matcher id=Pattern.compile("Success: created install session \\[(\\d+)\\]").matcher(created.output);
+                if(!id.find())throw new IOException("네이버 지도 설치 세션 생성 실패");
+                session=id.group(1);
+                for(String asset:BuildConfig.NMAP_APKS)
+                    nmapInstallSuccess(raw("pm install-write "+session+" "+quote(asset)+" "+quote(TMP+asset),300));
+                nmapInstallSuccess(raw("pm install-commit "+session,300));committed=true;
+            }finally{
+                if(session!=null&&!committed)try{raw("pm install-abandon "+session,30);}catch(Exception ignored){}
+                for(String asset:BuildConfig.NMAP_APKS)try{raw("rm -f "+quote(TMP+asset),30);}catch(Exception ignored){}
+            }
+        }
+        if(!installed(pkg)||packageVersion(pkg)<BuildConfig.NMAP_VERSION_CODE)throw new IOException("네이버 지도 설치 버전 확인 실패");
+        checked("pm enable --user 0 "+pkg,30);checked("am force-stop --user 0 "+pkg,30);
+        try{
+            String[] resolved=required("cmd package resolve-activity --brief --user 0 -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p "+pkg).output.trim().split("\\R");
+            String component=resolved[resolved.length-1];
+            if(!component.matches("com\\.nhn\\.android\\.nmap/[A-Za-z0-9_.$]+"))throw new IOException("네이버 지도 실행 화면 조회 실패");
+            Result start=required("am start -W --user 0 -n "+quote(component));
+            if(!start.output.contains("Status: ok"))throw new IOException("네이버 지도 실행 실패");
+            pause(2000);
+            if(!required("pidof "+pkg).output.trim().matches("[0-9\\s]+"))throw new IOException("네이버 지도 실행 직후 종료됨");
+            notes.add("네이버 지도 버전·시작 확인 완료 · 첫 안내/권한 및 지도 로딩은 별도 확인");
+        }finally{try{raw("am force-stop --user 0 "+pkg,30);}catch(Exception ignored){}}
+    }
     void commands(String... commands) throws Exception { for (String c : commands) checked(c, 120); }
     void clear(String... packages) throws Exception {
         for (String pkg : packages) if (installed(pkg)) checked("pm clear --user 0 " + quote(pkg), 120);
@@ -261,10 +301,11 @@ final class ResetPipeline {
             }
             case 16 -> wallpaper(model);
             case 17 -> {
-                for (String pkg : List.of("com.nhn.android.nmap", "com.alphainventor.filemanager", SELF)) {
+                prepareNmap();
+                for (String pkg : List.of("com.alphainventor.filemanager", SELF)) {
                     if (installed(pkg)) continue;
                     if (pkg.equals(SELF)) { warnings.add("초기화 앱 설치 상태 확인 필요"); continue; }
-                    String asset = pkg.equals("com.nhn.android.nmap") ? "nmap.apk" : "filemanager.apk";
+                    String asset = "filemanager.apk";
                     bridge.copy(asset, TMP + asset);
                     success(checked("pm install -r --user 0 " + quote(TMP + asset), 300), "Success", "필수 앱 설치 실패: " + pkg);
                     if (!installed(pkg)) warnings.add("필수 앱 없음: " + pkg);

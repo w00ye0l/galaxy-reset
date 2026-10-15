@@ -33,6 +33,7 @@ class FakeFleet:
         self.counts = defaultdict(int)
         self.lock = threading.Lock()
         self.installed = defaultdict(lambda: {'com.example.userapp'})
+        self.just_timed_out = defaultdict(bool)
         self.step_at_drop = {}  # 이탈 시점에 돌고 있던 단계 라벨 기록용
 
     def exec(self, cmd, timeout):
@@ -57,8 +58,11 @@ class FakeFleet:
 
         if 'get-state' in cmd:
             return _cp(cmd, 0, 'device\n')
-        if random.random() < 0.02:  # 산발 타임아웃 (기기는 살아있음)
+        # Isolated transient errors recover on retry; repeated failures are covered by provisioning unit tests.
+        if random.random() < 0.02 and not self.just_timed_out[serial]:
+            self.just_timed_out[serial] = True
             raise subprocess.TimeoutExpired(cmd, timeout)
+        self.just_timed_out[serial] = False
         if 'ro.build.version.sdk' in cmd:
             return _cp(cmd, 0, '37\n')
         if 'get-current-user' in cmd:
@@ -73,12 +77,22 @@ class FakeFleet:
             return _cp(cmd, 0, '1234\n')
         if 'settings' in cmd and 'get' in cmd and 'adb_wifi_enabled' in cmd:
             return _cp(cmd, 0, '1\n')
+        if cmd[3] == 'install-multiple':
+            self.installed[serial].add(V6.NMAP_PACKAGE)
+            return _cp(cmd, 0, 'Success\n')
         if cmd[3] == 'install':
             pkg = {'nmap.apk': 'com.nhn.android.nmap', 'filemanager.apk': 'com.alphainventor.filemanager',
                    'galaxy-reset.apk': 'com.forholiday.galaxyreset', 'shizuku.apk': 'moe.shizuku.privileged.api'}.get(cmd[-1].replace('\\', '/').rsplit('/', 1)[-1])
             if pkg:
                 self.installed[serial].add(pkg)
             return _cp(cmd, 0, 'Success\n')
+        if 'resolve-activity' in cmd:
+            return _cp(cmd, 0, 'com.nhn.android.nmap/com.naver.map.LaunchActivity\n')
+        if 'am' in cmd and 'start' in cmd and any('com.nhn.android.nmap/' in item for item in cmd):
+            return _cp(cmd, 0, 'Status: ok\n')
+        if 'dumpsys' in cmd and 'package' in cmd:
+            version = V6.load_nmap_bundle()['versionCode'] if cmd[-1] == V6.NMAP_PACKAGE else V6.load_phone_bundle()[cmd[-1]]['versionCode']
+            return _cp(cmd, 0, 'versionCode=%s minSdk=30\n' % version)
         if 'dumpsys' in cmd:
             return _cp(cmd, 0, 'Widgets:\nHosts:\n')
         return _cp(cmd, 0, 'SUCCESS\n')

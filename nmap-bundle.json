@@ -1,0 +1,24 @@
+{
+  "package": "com.nhn.android.nmap",
+  "versionCode": 61000004,
+  "versionName": "6.10.0.16",
+  "signingCertificateSha256": "0b8b8523bb4aeffa346e4bdd4fbf7d193450569aa14aaad4adfd94a3f7b227bb",
+  "source": "https://apkpure.net/naver-map-navigation/com.nhn.android.nmap/download (publisher signature verified against existing Naver APK)",
+  "apks": [
+    {
+      "file": "nmap.apk",
+      "sha256": "0266841b5e3646f963deb9164eb7dbb69fcbc7708dc4713439118bc058967fda",
+      "size": 219341863
+    },
+    {
+      "file": "nmap-config.arm64_v8a.apk",
+      "sha256": "1996714bd6af59915fd4e8567fb36d4661f747294f49df9bef8c2fe0534ef237",
+      "size": 78928766
+    },
+    {
+      "file": "nmap-config.xxhdpi.apk",
+      "sha256": "016ab085e84bf56dc345fd221b66bea2a1702196388997e5d47d6a7973cb77d0",
+      "size": 12138244
+    }
+  ]
+}

@@ -34,6 +34,14 @@ def validate_apk(path):
 
 
 def check():
+    nmap = json.loads((ROOT / 'nmap-bundle.json').read_text(encoding='utf-8'))
+    for item in nmap['apks']:
+        path = ROOT / item['file']
+        with zipfile.ZipFile(path) as archive:
+            if 'AndroidManifest.xml' not in archive.namelist():
+                raise ValueError('Invalid Naver Map APK: ' + str(path))
+        if sha256(path) != item['sha256']:
+            raise ValueError('Naver Map checksum mismatch: ' + str(path))
     manifest = json.loads((DEST / 'bundle.json').read_text(encoding='utf-8'))
     for app in manifest['apps']:
         path = DEST / app['file']
@@ -45,6 +53,10 @@ def check():
     reset = next(a for a in manifest['apps'] if a['package'] == 'com.forholiday.galaxyreset')
     if reset['versionCode'] != version:
         raise ValueError('Rebuild Android and rerun tools/prepare_phone_bundle.py before building the EXE')
+    with zipfile.ZipFile(DEST / reset['file']) as archive:
+        embedded_nmap = json.loads(archive.read('assets/nmap-bundle.json'))
+        if embedded_nmap != nmap:
+            raise ValueError('Android APK contains an old Naver Map bundle; rebuild Android and refresh phone-app first')
     print('Phone APK bundle verified: Galaxy Reset %s, Shizuku 13.6.0' % reset['versionName'])
 
 
