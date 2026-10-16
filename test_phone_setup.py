@@ -15,7 +15,7 @@ class FakeDevice:
     def __init__(self):
         self.installed = {'com.nhn.android.nmap', 'com.alphainventor.filemanager',
                           V6.PHONE_APP_PACKAGE, V6.SHIZUKU_PACKAGE}
-        self.versions = {V6.PHONE_APP_PACKAGE: 7, V6.SHIZUKU_PACKAGE: 1086}
+        self.versions = {V6.PHONE_APP_PACKAGE: 7, V6.SHIZUKU_PACKAGE: 1086, V6.NMAP_PACKAGE: V6.load_nmap_bundle()['versionCode']}
         self.calls = []
         self.sdk = '37'
         self.user = '0'
@@ -23,6 +23,7 @@ class FakeDevice:
         self.running = True
         self.install_failure = False
         self.grant_failure = False
+        self.nmap_alive = True
 
     def run(self, command, **kwargs):
         self.calls.append(list(command))
@@ -33,13 +34,15 @@ class FakeDevice:
         elif a[:3] == ['shell', 'dumpsys', 'package']:
             out = ('codePath=/data/app/~~ABC=/moe.shizuku.privileged.api-XYZ==\n'
                    'primaryCpuAbi=arm64-v8a\nversionCode=%d minSdk=24\n' % self.versions[a[-1]])
-        elif a[:1] == ['install']:
+        elif a[:1] in (['install'], ['install-multiple']):
             if self.install_failure:
                 code, out = 1, 'Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE]'
             else:
-                pkg = {'galaxy-reset.apk': V6.PHONE_APP_PACKAGE, 'shizuku.apk': V6.SHIZUKU_PACKAGE,
+                pkg = V6.NMAP_PACKAGE if a[0] == 'install-multiple' else {'galaxy-reset.apk': V6.PHONE_APP_PACKAGE, 'shizuku.apk': V6.SHIZUKU_PACKAGE,
                        'nmap.apk': 'com.nhn.android.nmap', 'filemanager.apk': 'com.alphainventor.filemanager'}[Path(a[-1]).name]
                 self.installed.add(pkg)
+                if pkg == V6.NMAP_PACKAGE: self.versions[pkg] = V6.load_nmap_bundle()['versionCode']
+                elif pkg in (V6.PHONE_APP_PACKAGE, V6.SHIZUKU_PACKAGE): self.versions[pkg] = V6.load_phone_bundle()[pkg]['versionCode']
                 out = 'Success\n'
         elif a[:3] == ['shell', 'pm', 'path']:
             out = 'package:/data/app/%s/base.apk\n' % a[-1] if a[-1] in self.installed else ''
@@ -49,6 +52,12 @@ class FakeDevice:
             out = self.user + '\n'
         elif a[:4] == ['shell', 'settings', 'get', 'global']:
             out = self.wireless + '\n'
+        elif a[:4] == ['shell', 'cmd', 'package', 'resolve-activity']:
+            out = 'com.nhn.android.nmap/com.naver.map.LaunchActivity\n'
+        elif a[:3] == ['shell', 'am', 'start'] and a[-1].startswith('com.nhn.android.nmap/'):
+            out = 'Status: ok\n'
+        elif a[:3] == ['shell', 'pidof', V6.NMAP_PACKAGE]:
+            code, out = (0, '5555\n') if self.nmap_alive else (1, '')
         elif a[:3] == ['shell', 'pidof', 'shizuku_server']:
             code, out = (0, '2345\n') if self.running else (1, '')
         elif len(a) == 2 and 'libshizuku.so' in a[1]:
@@ -65,6 +74,7 @@ class PhoneSetupTest(unittest.TestCase):
         self.fake.versions[V6.PHONE_APP_PACKAGE] = self.bundle[V6.PHONE_APP_PACKAGE]['versionCode']
         self.mock = patch.object(V6, 'run_command', side_effect=self.fake.run)
         self.mock.start()
+        sleep = patch.object(V6.time, 'sleep'); sleep.start(); self.addCleanup(sleep.stop)
         self.addCleanup(self.mock.stop)
         V6.POST_RUN_NOTICES.clear()
 
@@ -88,6 +98,27 @@ class PhoneSetupTest(unittest.TestCase):
         self.fake.versions[V6.PHONE_APP_PACKAGE] += 100
         V6.ensure_essential_apps_installed('TEST')
         self.assertFalse(any(c[3] == 'install' for c in self.fake.calls))
+
+    def test_old_nmap_updates_complete_split_set(self):
+        self.fake.versions[V6.NMAP_PACKAGE] = 5120400
+        V6.ensure_essential_apps_installed('TEST')
+        commands = [c for c in self.fake.calls if c[3] == 'install-multiple']
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(commands[0][7:], V6.load_nmap_bundle()['apk_paths'])
+        self.assertIn('-r', commands[0])
+
+    def test_newer_nmap_is_preserved_and_still_launch_checked(self):
+        self.fake.versions[V6.NMAP_PACKAGE] += 1
+        V6.ensure_essential_apps_installed('TEST')
+        self.assertFalse(any(c[3] == 'install-multiple' for c in self.fake.calls))
+        self.assertTrue(any(c[-1] == V6.NMAP_PACKAGE and 'pidof' in c for c in self.fake.calls))
+
+    def test_nmap_immediate_exit_fails_preparation(self):
+        self.fake.nmap_alive = False
+        with self.assertRaises(RuntimeError):
+            V6.ensure_essential_apps_installed('TEST')
+        self.assertFalse(V6.POST_RUN_NOTICES)
+        self.assertTrue(any('force-stop' in c and c[-1] == V6.NMAP_PACKAGE for c in self.fake.calls))
 
     def test_signature_failure_stops_setup_and_never_uninstalls(self):
         self.fake.versions[V6.PHONE_APP_PACKAGE] -= 1

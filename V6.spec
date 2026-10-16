@@ -1,6 +1,9 @@
 # -*- mode: python ; coding: utf-8 -*-
 # PyInstaller spec file for V6.py
 # 사용법: pyinstaller V6.spec
+import json
+with open('nmap-bundle.json', encoding='utf-8') as source:
+    nmap_files = [(item['file'], '.') for item in json.load(source)['apks']]
 
 a = Analysis(
     ['V6.py'],
@@ -12,7 +15,7 @@ a = Analysis(
         ('S24.png', '.'),
         ('S25.png', '.'),
         ('S26.png', '.'),
-        ('nmap.apk', '.'),
+        ('nmap-bundle.json', '.'),
         ('filemanager.apk', '.'),
         ('phone-app/galaxy-reset.apk', 'phone-app'),
         ('phone-app/shizuku.apk', 'phone-app'),
@@ -24,7 +27,7 @@ a = Analysis(
         ('recent_tasks_cleaner.dex', '.'),
         ('content_cleaner.dex', '.'),
         ('esim_manager.dex', '.'),
-    ],
+    ] + nmap_files,
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

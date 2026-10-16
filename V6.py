@@ -1527,6 +1527,37 @@ def reset_launcher_with_clean_home(serial):
 PHONE_APP_PACKAGE = 'com.forholiday.galaxyreset'
 SHIZUKU_PACKAGE = 'moe.shizuku.privileged.api'
 PHONE_APK_FILES = {PHONE_APP_PACKAGE: 'galaxy-reset.apk', SHIZUKU_PACKAGE: 'shizuku.apk'}
+NMAP_PACKAGE = 'com.nhn.android.nmap'
+
+
+def load_nmap_bundle(verify_hash=False):
+    try:
+        with open(resource_path('nmap-bundle.json'), encoding='utf-8') as source:
+            bundle = json.load(source)
+        if bundle['package'] != NMAP_PACKAGE or not isinstance(bundle['versionCode'], int):
+            raise ValueError('네이버 지도 메타데이터 오류')
+        names = [item['file'] for item in bundle['apks']]
+        if not names or names[0] != 'nmap.apk' or len(names) != len(set(names)):
+            raise ValueError('네이버 지도 기본 APK/분할 목록 오류')
+        paths = []
+        for item in bundle['apks']:
+            if not re.fullmatch(r'nmap(?:-[A-Za-z0-9_.]+)?\.apk', item['file']):
+                raise ValueError('잘못된 네이버 지도 APK 이름')
+            path = resource_path(item['file'])
+            with zipfile.ZipFile(path) as archive:
+                if 'AndroidManifest.xml' not in archive.namelist():
+                    raise ValueError('유효하지 않은 네이버 지도 APK')
+            if verify_hash:
+                digest = hashlib.sha256()
+                with open(path, 'rb') as binary:
+                    for block in iter(lambda: binary.read(1024 * 1024), b''):
+                        digest.update(block)
+                if digest.hexdigest() != item['sha256']:
+                    raise ValueError('네이버 지도 APK 해시 불일치: ' + item['file'])
+            paths.append(path)
+        return dict(bundle, apk_path=paths[0], apk_paths=paths)
+    except (OSError, ValueError, KeyError, TypeError, zipfile.BadZipFile) as error:
+        raise RuntimeError('네이버 지도 동봉 파일 검증 실패: %s' % error) from error
 
 
 def load_phone_bundle(verify_hash=False):
@@ -1641,7 +1672,7 @@ def ensure_essential_apps_installed(serial):
     """기존 필수 앱 + 폰 초기화 앱 + Shizuku를 설치하고 다음 폰 단독 실행을 준비합니다."""
     bundled = load_phone_bundle()
     apps = [
-        {'package': 'com.nhn.android.nmap', 'name': 'Nmap', 'apk_path': resource_path('nmap.apk')},
+        dict(load_nmap_bundle(), name='네이버 지도'),
         {'package': 'com.alphainventor.filemanager', 'name': 'File Manager', 'apk_path': resource_path('filemanager.apk')},
         dict(bundled[PHONE_APP_PACKAGE], name='갤럭시 초기화'),
         dict(bundled[SHIZUKU_PACKAGE], name='Shizuku'),
@@ -1658,13 +1689,41 @@ def ensure_essential_apps_installed(serial):
         if not os.path.isfile(apk):
             raise RuntimeError('필수 APK 없음: ' + apk)
         logging.info('[%s] %s 설치/업데이트 중...', serial, app['name'])
-        result = _pc_required(serial, ['install', '-r', '--user', '0', apk], timeout=300)
+        paths = app.get('apk_paths', [apk])
+        command = 'install-multiple' if len(paths) > 1 else 'install'
+        result = _pc_required(serial, [command, '-r', '--user', '0'] + paths, timeout=600)
         if 'Success' not in (result.stdout or ''):
             raise RuntimeError('필수 앱 설치 확인 실패: ' + app['name'])
         verify = _pc_required(serial, ['shell', 'pm', 'path', '--user', '0', package])
         if not (verify.stdout or '').strip().startswith('package:'):
             raise RuntimeError('필수 앱 설치 후 조회 실패: ' + app['name'])
+        if 'versionCode' in app and _package_version(serial, package) < app['versionCode']:
+            raise RuntimeError('필수 앱 버전 확인 실패: ' + app['name'])
+    verify_nmap_launch(serial)
     prepare_wireless_reset(serial)
+
+
+def verify_nmap_launch(serial):
+    _pc_required(serial, ['shell', 'pm', 'enable', '--user', '0', NMAP_PACKAGE])
+    _pc_required(serial, ['shell', 'am', 'force-stop', '--user', '0', NMAP_PACKAGE])
+    try:
+        resolved = _pc_required(serial, ['shell', 'cmd', 'package', 'resolve-activity', '--brief', '--user', '0',
+                                        '-a', 'android.intent.action.MAIN', '-c', 'android.intent.category.LAUNCHER',
+                                        '-p', NMAP_PACKAGE]).stdout.strip().splitlines()
+        component = resolved[-1] if resolved else ''
+        if not re.fullmatch(r'com\.nhn\.android\.nmap/[A-Za-z0-9_.$]+', component):
+            raise RuntimeError('네이버 지도 실행 화면 조회 실패')
+        result = _pc_required(serial, ['shell', 'am', 'start', '-W', '--user', '0',
+                                      '-n', component], timeout=45)
+        if 'Status: ok' not in result.stdout:
+            raise RuntimeError('네이버 지도 실행 실패: 시작 결과를 확인하세요.')
+        time.sleep(2)
+        running = _pc_required(serial, ['shell', 'pidof', NMAP_PACKAGE], timeout=10)
+        if not re.fullmatch(r'[0-9\s]+', running.stdout.strip()):
+            raise RuntimeError('네이버 지도 실행 후 프로세스가 종료되었습니다.')
+        logging.info('[%s] 네이버 지도 버전·시작 확인 완료 (첫 안내/권한 및 지도 로딩은 별도 확인)', serial)
+    finally:
+        run_command(['adb', '-s', serial, 'shell', 'am', 'force-stop', '--user', '0', NMAP_PACKAGE])
 
 
 # ============================================================
@@ -1853,6 +1912,7 @@ def report_run(devices, failures, log_buffer, activity='초기화'):
 
 def main():
     load_phone_bundle(verify_hash=True)
+    load_nmap_bundle(verify_hash=True)
     # 메뉴·표의 색상 표시 (진행률 화면과 동일한 VT 경로, 미지원 콘솔이면 무색)
     global ANSI_OK
     ANSI_OK = sys.stdout.isatty() and _enable_ansi()
@@ -1901,6 +1961,7 @@ def prepare_phone_only_main():
     parser.add_argument('--serial', action='append', help='대상 USB 시리얼, 여러 번 지정 가능')
     args = parser.parse_args()
     load_phone_bundle(verify_hash=True)
+    load_nmap_bundle(verify_hash=True)
     devices = args.serial or get_connected_devices()
     if not devices:
         raise RuntimeError('준비할 USB 기기가 없습니다.')

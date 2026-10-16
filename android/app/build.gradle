@@ -1,4 +1,5 @@
 plugins { id 'com.android.application' }
+def nmapBundle = new groovy.json.JsonSlurper().parse(rootProject.file('../nmap-bundle.json'))
 android {
     namespace 'com.forholiday.galaxyreset'
     compileSdk 36
@@ -6,8 +7,10 @@ android {
         applicationId 'com.forholiday.galaxyreset'
         minSdk 30
         targetSdk 36
-        versionCode 12
-        versionName '1.1.8'
+        versionCode 15
+        versionName '1.1.11'
+        buildConfigField 'long', 'NMAP_VERSION_CODE', nmapBundle.versionCode.toString() + 'L'
+        buildConfigField 'String[]', 'NMAP_APKS', 'new String[]{' + nmapBundle.apks.collect { '"' + it.file + '"' }.join(',') + '}'
     }
     buildFeatures { aidl true; buildConfig true }
     compileOptions {
@@ -18,7 +21,7 @@ android {
 }
 def resetAssets = ['locale_changer.dex', 'account_remover.dex', 'esim_manager.dex',
                    'content_cleaner.dex', 'wallpaper_setter.dex', 'recent_tasks_cleaner.dex',
-                   'S23.png', 'S24.png', 'S25.png', 'S26.png', 'nmap.apk', 'filemanager.apk']
+                   'S23.png', 'S24.png', 'S25.png', 'S26.png', 'filemanager.apk', 'nmap-bundle.json'] + nmapBundle.apks.collect { it.file }
 tasks.register('prepareResetAssets', Copy) {
     from rootProject.file('..')
     include resetAssets
