@@ -1,0 +1,51 @@
+name: Publish App Update
+
+on:
+  push:
+    tags:
+      - 'app-v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'App tag (leave blank to use app-v plus the bundled APK version)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-app-update
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          lfs: true
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Prepare signed APK and update metadata
+        id: prepare
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+        run: python tools/prepare_app_release.py --tag "$RELEASE_TAG" --output release-app --github-output "$GITHUB_OUTPUT"
+      - name: Verify release tag points to this commit
+        env:
+          RELEASE_TAG: ${{ steps.prepare.outputs.tag }}
+        run: |
+          if git rev-parse --verify "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$GITHUB_SHA"
+          fi
+      - name: Publish exact signed APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.prepare.outputs.tag }}
+          RELEASE_TITLE: ${{ steps.prepare.outputs.title }}
+        run: |
+          gh release create "$RELEASE_TAG" release-app/galaxy-reset.apk release-app/galaxy-reset-update.json --draft --target "$GITHUB_SHA" --title "$RELEASE_TITLE" --notes-file release-app/release-notes.txt
+          gh release edit "$RELEASE_TAG" --draft=false --latest

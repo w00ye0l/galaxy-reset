@@ -7,6 +7,8 @@
     <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS" tools:ignore="ProtectedPermissions" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <queries><package android:name="moe.shizuku.privileged.api" /></queries>
     <application android:label="갤럭시 초기화" android:allowBackup="false" android:fullBackupContent="false" android:dataExtractionRules="@xml/data_extraction_rules" android:enableOnBackInvokedCallback="true"
         android:icon="@mipmap/ic_launcher" android:roundIcon="@mipmap/ic_launcher" android:supportsRtl="true"
@@ -27,5 +29,6 @@
             <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Operator initiated rental phone data cleanup using Shizuku shell, including launcher and locale reset" />
         </service>
+        <receiver android:name=".UpdateInstallReceiver" android:exported="false" />
     </application>
 </manifest>

@@ -31,3 +31,4 @@ device_info.txt
 local.properties
 *.jks
 *.keystore
+release-app/
