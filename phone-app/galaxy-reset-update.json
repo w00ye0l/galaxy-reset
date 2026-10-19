@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
   "packageName": "com.forholiday.galaxyreset",
-  "versionCode": 15,
-  "versionName": "1.1.11",
+  "versionCode": 16,
+  "versionName": "1.1.12",
   "apkName": "galaxy-reset.apk",
-  "sha256": "79b46648369aa7a11d4fcd4d82dbd7945306becf228e884bf6cb03a4bbf9eb42",
-  "size": 153564836
+  "sha256": "a329d6d9ee960a516b487b61d5b8122d02ccd37a5f77b70ce63542333629877e",
+  "size": 153433800
 }
