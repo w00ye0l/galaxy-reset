@@ -7,8 +7,8 @@ android {
         applicationId 'com.forholiday.galaxyreset'
         minSdk 30
         targetSdk 36
-        versionCode 16
-        versionName '1.1.12'
+        versionCode 17
+        versionName '1.1.13'
         buildConfigField 'long', 'NMAP_VERSION_CODE', nmapBundle.versionCode.toString() + 'L'
         buildConfigField 'String[]', 'NMAP_APKS', 'new String[]{' + nmapBundle.apks.collect { '"' + it.file + '"' }.join(',') + '}'
     }
@@ -40,6 +40,9 @@ tasks.register('prepareResetAssets', Copy) {
 }
 tasks.named('preBuild').configure { dependsOn 'prepareResetAssets' }
 dependencies {
+    implementation 'com.github.MuntashirAkon:libadb-android:3.1.1'
+    implementation 'org.conscrypt:conscrypt-android:2.5.3'
+    implementation 'org.bouncycastle:bcpkix-jdk15to18:1.81'
     implementation 'dev.rikka.shizuku:api:13.1.5'
     implementation 'dev.rikka.shizuku:provider:13.1.5'
     testImplementation 'junit:junit:4.13.2'

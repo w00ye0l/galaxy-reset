@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import shlex
 import zipfile
+import phone_autostart
 from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 
 
@@ -1659,17 +1660,18 @@ def prepare_wireless_reset(serial):
                                        'adb_allowed_connection_time']).stdout.strip()
     if auth_timeout != '0':
         raise RuntimeError('ADB 인증 자동 만료 해제 확인 실패 — 개발자 옵션의 ADB 인증 시간 제한 설정을 확인하세요.')
+    start_shizuku_from_pc(serial)
+    phone_autostart.prepare(serial, _exec)
     wireless = _pc_required(serial, ['shell', 'settings', 'get', 'global', 'adb_wifi_enabled']).stdout.strip()
     if wireless != '1':
         raise RuntimeError('무선 디버깅 활성화 확인 실패 — Wi-Fi 연결과 기기의 허용 팝업을 확인하세요.')
-    start_shizuku_from_pc(serial)
     _pc_required(serial, ['shell', 'am', 'start', '--user', '0', '-n', PHONE_APP_PACKAGE + '/.MainActivity'])
-    note = ('[%s] 폰 앱·Shizuku 설치 및 USB 기동 준비 완료. ADB 인증 자동 만료 해제 확인 완료. 처음인 기기는 전원을 끄기 전에 '
-            'Shizuku 무선 페어링(현재 Wi-Fi 신뢰 포함)과 초기화 앱 권한 허용을 1회 완료하세요. '
-            '기존 페어링·권한은 보존하며, USB 기동만으로 무선 페어링 완료를 뜻하지 않습니다.' % serial)
+    note = ('[%s] 폰 앱·Shizuku 설치 및 앱 전용 자동 시작 인증 등록 완료. ADB 인증 자동 만료 해제 확인 완료. '
+            '초기화 앱의 Shizuku 권한 연결도 확인했습니다. 이후 Wi-Fi 연결 상태에서 초기화 앱을 열면 자동 시작을 시도합니다. '
+            '기존 Shizuku 페어링·권한은 보존하며, 앱 전용 인증을 별도로 등록했습니다.' % serial)
     add_post_run_notice(note)
     if PROGRESS:
-        PROGRESS.note(serial, '최초 1회: Shizuku 페어링·앱 권한 확인 (기존 승인은 유지)')
+        PROGRESS.note(serial, '자동 시작 인증 등록·Shizuku 앱 권한 연결 확인 완료')
     logging.info('[%s] 무선 초기화 준비 설정 완료', serial)
 
 

@@ -1,0 +1,20 @@
+Galaxy Reset wireless startup dependencies
+
+LibADB Android 3.1.1: Copyright Muntashir Al-Islam and contributors.
+Used under Apache-2.0. https://github.com/MuntashirAkon/libadb-android/tree/3.1.1
+
+SPAKE2 Java / Android 2.2.1: LGPL-3.0.
+https://github.com/MuntashirAkon/spake2-java/tree/2.2.1
+Includes components derived from BoringSSL; upstream source contains their notices.
+
+Conscrypt Android 2.5.3: Apache-2.0 and third-party notices in Conscrypt-LICENSE.txt.
+https://github.com/google/conscrypt/tree/2.5.3
+
+Bouncy Castle bcprov, bcutil, bcpkix 1.81: Bouncy Castle licence (MIT).
+https://github.com/bcgit/bc-java/tree/r1rv81
+
+Licence texts accompany this notice. The unmodified library dependencies, versions,
+application sources and Gradle build instructions are available for rebuilding and
+relinking the application at https://github.com/w00ye0l/galaxy-reset/tree/feat/reset-steps-and-progress-console
+and the upstream source links above. Reverse engineering for debugging modifications
+to the LGPL component is permitted. No dependency is modified by this application.

@@ -30,5 +30,7 @@
                 android:value="Operator initiated rental phone data cleanup using Shizuku shell, including launcher and locale reset" />
         </service>
         <receiver android:name=".UpdateInstallReceiver" android:exported="false" />
+        <service android:name=".AdbPairingService" android:exported="false" android:foregroundServiceType="shortService" />
+        <receiver android:name=".AdbBootstrapReceiver" android:exported="true" android:permission="android.permission.DUMP" />
     </application>
 </manifest>

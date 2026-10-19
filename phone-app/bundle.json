@@ -3,9 +3,9 @@
     {
       "package": "com.forholiday.galaxyreset",
       "file": "galaxy-reset.apk",
-      "versionCode": 16,
-      "versionName": "1.1.12",
-      "sha256": "a329d6d9ee960a516b487b61d5b8122d02ccd37a5f77b70ce63542333629877e"
+      "versionCode": 17,
+      "versionName": "1.1.13",
+      "sha256": "5a0cf1b6e2092b050cf4df6f9d0342bb0616cb87f983773522ab130398115d56"
     },
     {
       "package": "moe.shizuku.privileged.api",

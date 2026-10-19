@@ -79,6 +79,7 @@ class PhoneSetupTest(unittest.TestCase):
         self.fake.versions[V6.PHONE_APP_PACKAGE] = self.bundle[V6.PHONE_APP_PACKAGE]['versionCode']
         self.mock = patch.object(V6, 'run_command', side_effect=self.fake.run)
         self.mock.start()
+        pairing = patch.object(V6.phone_autostart, 'prepare'); pairing.start(); self.addCleanup(pairing.stop)
         sleep = patch.object(V6.time, 'sleep'); sleep.start(); self.addCleanup(sleep.stop)
         self.addCleanup(self.mock.stop)
         V6.POST_RUN_NOTICES.clear()
@@ -186,7 +187,8 @@ class PhoneSetupTest(unittest.TestCase):
 
     def test_initial_pairing_and_permission_notice_remains_truthful(self):
         V6.prepare_wireless_reset('TEST')
-        self.assertIn('USB 기동만으로 무선 페어링 완료를 뜻하지 않습니다', V6.POST_RUN_NOTICES[-1])
+        self.assertIn('앱 전용 인증을 별도로 등록했습니다', V6.POST_RUN_NOTICES[-1])
+        V6.phone_autostart.prepare.assert_called_once_with('TEST', V6._exec)
         self.assertFalse(any('pair' in c for c in self.fake.calls))
         for pkg in (V6.PHONE_APP_PACKAGE, V6.SHIZUKU_PACKAGE):
             self.assertTrue(any(pkg in c and 'android.permission.WRITE_SECURE_SETTINGS' in c for c in self.fake.calls))
