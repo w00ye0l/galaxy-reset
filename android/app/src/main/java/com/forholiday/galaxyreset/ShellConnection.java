@@ -11,41 +11,61 @@ final class ShellConnection implements ResetPipeline.Bridge {
     volatile IShellService remote;
     volatile String message = "Shizuku를 무선 디버깅으로 시작해주세요.";
     private boolean binding;
+    private long retryAt;
+    private int attempt;
+    enum State { STOPPED, PERMISSION, CONNECTING, RETRY, READY }
     private final Shizuku.UserServiceArgs args = new Shizuku.UserServiceArgs(
         new ComponentName(BuildConfig.APPLICATION_ID, ShellService.class.getName()))
         .daemon(false).processNameSuffix("reset_shell").debuggable(BuildConfig.DEBUG).version(BuildConfig.VERSION_CODE);
     private final ServiceConnection connection = new ServiceConnection() {
         @Override public void onServiceConnected(ComponentName name, IBinder binder) {
             remote = IShellService.Stub.asInterface(binder);
-            try { binder.linkToDeath(() -> new Handler(Looper.getMainLooper()).post(ShellConnection.this::lost), 0); }
+            try { binder.linkToDeath(() -> new Handler(Looper.getMainLooper()).post(() -> {
+                if (remote != null && remote.asBinder() == binder) lost();
+            }), 0); }
             catch (RemoteException e) { lost(); return; }
-            binding = false; message = "연결됨 · 실행 전 shell 권한을 확인합니다.";
+            binding = false; retryAt = 0; message = "연결됨 · 초기화를 실행할 수 있습니다.";
         }
         @Override public void onServiceDisconnected(ComponentName name) { lost(); }
     };
-    void lost() { remote = null; binding = false; message = "연결 끊김 · Shizuku를 다시 시작해주세요."; }
+    void lost() { remote = null; binding = false; retryAt = 0; attempt++; message = Shizuku.pingBinder()
+        ? "앱의 권한 연결이 끊겼습니다. 다시 연결을 눌러주세요."
+        : "Shizuku가 꺼져 있습니다. Shizuku에서 무선 디버깅 ‘시작’을 눌러주세요."; }
+    State state() {
+        if (!Shizuku.pingBinder()) return State.STOPPED;
+        try { if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) return State.PERMISSION; }
+        catch (Exception ignored) { return State.STOPPED; }
+        if (ready()) return State.READY;
+        return binding ? State.CONNECTING : State.RETRY;
+    }
     void connect(boolean requestPermission) {
         try {
             if (!Shizuku.pingBinder()) { lost(); return; }
             if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
+                remote = null; binding = false; retryAt = 0; attempt++;
                 message = "Shizuku에서 초기화 앱 권한을 허용해주세요.";
                 if (requestPermission && !Shizuku.shouldShowRequestPermissionRationale()) Shizuku.requestPermission(10);
                 return;
             }
-            if (remote == null && !binding) {
+            if (remote == null && !binding && (requestPermission || SystemClock.elapsedRealtime() >= retryAt)) {
                 binding = true; message = "shell 서비스 연결 중…";
+                final int currentAttempt = ++attempt;
                 Shizuku.bindUserService(args, connection);
                 new Handler(Looper.getMainLooper()).postDelayed(() -> {
-                    if (remote == null && binding) {
-                        binding = false; message = "연결 시간 초과 · Shizuku 상태 확인 후 다시 연결하세요.";
+                    if (remote == null && binding && attempt == currentAttempt) {
+                        binding = false; retryAt = SystemClock.elapsedRealtime() + 5000;
+                        message = "연결 시간이 초과됐습니다. 다시 연결을 누르거나 Shizuku 상태를 확인해주세요.";
                     }
                 }, 15000);
             }
-        } catch (Exception e) { binding = false; message = "연결 실패: " + e.getMessage(); }
+        } catch (Exception e) { binding = false; retryAt = SystemClock.elapsedRealtime() + 5000; message = "연결 실패: " + e.getMessage(); }
     }
     boolean ready() {
         IShellService service = remote;
-        if (service != null && !service.asBinder().pingBinder()) { lost(); return false; }
+        if (service != null && (!Shizuku.pingBinder() || !service.asBinder().pingBinder())) { lost(); return false; }
+        if (service != null) try {
+            if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) { remote = null; binding = false; return false; }
+        } catch (Exception ignored) { lost(); return false; }
         return service != null;
     }
     private IShellService require() throws ResetPipeline.ConnectionLost {

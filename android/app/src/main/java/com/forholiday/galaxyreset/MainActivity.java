@@ -40,7 +40,7 @@ public class MainActivity extends Activity {
     private final Shizuku.OnBinderReceivedListener received=()->{ShellConnection.INSTANCE.connect(false); refresh();};
     private final Shizuku.OnBinderDeadListener dead=()->{ShellConnection.INSTANCE.lost(); refresh();};
     private final Shizuku.OnRequestPermissionResultListener permission=(request,result)->{ShellConnection.INSTANCE.connect(false); refresh();};
-    private final Runnable tick=new Runnable(){public void run(){refresh();handler.postDelayed(this,1000);}};
+    private final Runnable tick=new Runnable(){public void run(){if(!demo()){maybeStartWireless();ShellConnection.INSTANCE.connect(false);}refresh();handler.postDelayed(this,1000);}};
 
     @Override public void onCreate(Bundle saved) {
         super.onCreate(saved); state=new RunState(this); state.detectInterruption();
@@ -88,6 +88,8 @@ public class MainActivity extends Activity {
     void refresh(){
         if(state==null)return;state.detectInterruption();
         StringBuilder key=new StringBuilder(screen()+"|"+preview+"|"+ShellConnection.INSTANCE.ready()+"|"+selected+"|"+state.phase()+"|"+ShellConnection.INSTANCE.message);
+        key.append('|').append(ShellConnection.INSTANCE.state()).append('|').append(wifiConnected()).append('|').append(wirelessDebugging());
+        key.append('|').append(WirelessStarter.INSTANCE.status).append('|').append(WirelessStarter.INSTANCE.busy.get()).append('|').append(WirelessStarter.INSTANCE.configured(this));
         for(int i=0;i<19;i++)key.append('|').append(state.status(i)).append(state.detail(i));
         key.append(state.prefs.getString("summary",""));
         if(!key.toString().equals(signature)){signature=key.toString();
@@ -109,25 +111,35 @@ public class MainActivity extends Activity {
     void connectionScreen(){
         space(body,18);text(body,"권한 연결 확인",28,INK,true);space(body,10);text(body,"Shizuku가 실행 중이면 자동으로 연결합니다.",14,MUTED,false);space(body,24);
         LinearLayout steps=column();card(steps,WHITE);body.addView(steps);
-        boolean wifi=false;try{ConnectivityManager cm=getSystemService(ConnectivityManager.class);NetworkCapabilities caps=cm.getNetworkCapabilities(cm.getActiveNetwork());wifi=caps!=null&&caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI);}catch(Exception ignored){}
+        boolean wifi=wifiConnected();
         boolean ready=ShellConnection.INSTANCE.ready();
         connectionRow(steps,"Wi-Fi 연결","현장 Wi-Fi에 연결해주세요",UiIcon.WIFI,demo()||wifi,()->open(new Intent(Settings.ACTION_WIFI_SETTINGS)));divider(steps);
-        connectionRow(steps,"무선 디버깅","개발자 옵션에서 켜고 페어링해주세요",UiIcon.PHONE,demo()||Settings.Global.getInt(getContentResolver(),"adb_wifi_enabled",0)==1,this::debugGuide);divider(steps);
+        connectionRow(steps,"무선 디버깅","개발자 옵션에서 켜고 페어링해주세요",UiIcon.PHONE,demo()||wirelessDebugging(),this::debugGuide);divider(steps);
         connectionRow(steps,"Shizuku 시작","무선 디버깅으로 Shizuku를 시작해주세요",UiIcon.REFRESH,demo()||Shizuku.pingBinder(),this::openShizuku);divider(steps);
         connectionRow(steps,"초기화 권한","초기화 앱의 Shizuku 권한을 허용해주세요",UiIcon.SHIELD,demo()||ready,this::connectShizuku);
-        space(body,18);text(body,demo()?"연결 상태를 보여주는 예시 화면입니다.":ShellConnection.INSTANCE.message,13,MUTED,false);
-        space(body,12);text(body,"최초 페어링과 재부팅 후 시작은 Shizuku에서 진행합니다. 각 항목을 눌러 설정을 열 수 있어요.",13,MUTED,false);
+        space(body,18);text(body,demo()?"연결 상태를 보여주는 예시 화면입니다.":connectionDetail(),13,MUTED,false);
+        space(body,12);text(body,"자동 시작을 한 번 설정하면 앱을 열 때 Shizuku 시작을 시도합니다. Wi-Fi와 무선 디버깅 허용이 필요합니다.",13,MUTED,false);
+        wirelessSetup(body);
         appUpdates(body);
         Button next=action(footer,"계속",UiIcon.ARROW,TEAL,WHITE,()->{if(demo()){preview=1;render();}else{override=1;render();}});next.setEnabled(demo()||ready);
-        space(footer,8);action(footer,"연결하기",UiIcon.REFRESH,WHITE,INK,()->{if(!demo())connectShizuku();else{preview=1;render();}});
+        space(footer,8);Button connect=action(footer,connectionAction(),UiIcon.REFRESH,WHITE,INK,()->{if(!demo())connectShizuku();else{preview=1;render();}});connect.setEnabled(demo()||(!WirelessStarter.INSTANCE.busy.get()&&ShellConnection.INSTANCE.state()!=ShellConnection.State.CONNECTING));
     }
     void connectionRow(LinearLayout parent,String title,String subtitle,int kind,boolean good,Runnable callback){LinearLayout line=row();line.addView(icon(kind,TEAL,24));LinearLayout copy=column();LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(0,-2,1);p.setMargins(dp(12),0,dp(8),0);line.addView(copy,p);text(copy,title,15,INK,true);space(copy,4);text(copy,subtitle,12,MUTED,false);line.addView(icon(good?UiIcon.CHECK:UiIcon.ARROW,good?TEAL:MUTED,20));line.setMinimumHeight(dp(52));line.setOnClickListener(v->{if(!demo())callback.run();});parent.addView(line);}
     void startScreen(){
-        LinearLayout device=row();card(device,WHITE);LinearLayout info=column();device.addView(info,new LinearLayout.LayoutParams(0,-2,1));
-        text(info,"이 기기",12,MUTED,true);space(info,6);text(info,deviceName(),28,INK,true);space(info,4);text(info,Build.MODEL+" · "+ResetPipeline.series(Build.MODEL)+" 시리즈",12,MUTED,false);space(info,10);
-        LinearLayout chips=row();chip(chips,"Wi-Fi",UiIcon.WIFI);chip(chips,"무선 디버깅",UiIcon.CHECK);info.addView(chips);space(info,5);LinearLayout auth=row();chip(auth,ShellConnection.INSTANCE.ready()||demo()?"권한 연결됨":"연결 확인 필요",UiIcon.SHIELD);info.addView(auth);
-        LinearLayout image=column();image.setGravity(Gravity.CENTER);image.addView(wallpaperImage(58,112));space(image,5);text(image,"적용할 배경",10,MUTED,false);device.addView(image);body.addView(device);
-        appUpdates(body);space(body,12);LinearLayout heading=row();heading.addView(label("손님 언어",18,INK,true),new LinearLayout.LayoutParams(0,-2,1));heading.addView(label("하나를 고르세요",12,MUTED,false));body.addView(heading);space(body,10);
+        LinearLayout device=row();card(device,WHITE);device.setPadding(dp(14),dp(12),dp(14),dp(12));LinearLayout info=column();device.addView(info,new LinearLayout.LayoutParams(0,-2,1));
+        TextView name=text(info,deviceName(),24,INK,true);name.setSingleLine(true);name.setEllipsize(android.text.TextUtils.TruncateAt.END);space(info,4);
+        TextView model=text(info,Build.MODEL+" · "+ResetPipeline.series(Build.MODEL)+" 시리즈",11,MUTED,false);model.setSingleLine(true);model.setEllipsize(android.text.TextUtils.TruncateAt.END);space(info,8);
+        LinearLayout chips=row();if(getResources().getConfiguration().fontScale>1.15f)chips.setOrientation(LinearLayout.VERTICAL);
+        chip(chips,demo()||wifiConnected()?"Wi-Fi 연결됨":"Wi-Fi 끊김",UiIcon.WIFI);chip(chips,connectionTitle(),UiIcon.SHIELD);info.addView(chips);
+        LinearLayout image=column();image.setGravity(Gravity.CENTER);image.addView(wallpaperImage(40,76));space(image,4);text(image,"적용 배경",10,MUTED,false);
+        LinearLayout.LayoutParams imageParams=new LinearLayout.LayoutParams(-2,-2);imageParams.setMargins(dp(12),0,0,0);device.addView(image,imageParams);body.addView(device);
+        if(!demo()&&!ShellConnection.INSTANCE.ready()){
+            space(body,12);LinearLayout connection=column();card(connection,WHITE);body.addView(connection);
+            text(connection,connectionTitle(),16,INK,true);space(connection,6);text(connection,connectionDetail(),13,MUTED,false);space(connection,12);
+            Button connect=action(connection,connectionAction(),UiIcon.REFRESH,TEAL,WHITE,this::connectShizuku);connect.setEnabled(!WirelessStarter.INSTANCE.busy.get()&&ShellConnection.INSTANCE.state()!=ShellConnection.State.CONNECTING);
+            space(connection,4);TextView guide=text(connection,"Wi-Fi · 무선 디버깅 설정 확인",12,TEAL,true);guide.setMinHeight(dp(48));guide.setGravity(Gravity.CENTER_VERTICAL);guide.setOnClickListener(v->{override=0;render();});
+        }
+        wirelessSetup(body);appUpdates(body);space(body,12);LinearLayout heading=row();heading.addView(label("손님 언어",18,INK,true),new LinearLayout.LayoutParams(0,-2,1));heading.addView(label("하나를 고르세요",12,MUTED,false));body.addView(heading);space(body,10);
         for(int i=0;i<5;i++){final String tag=ResetPipeline.LOCALES[i];boolean chosen=tag.equals(selected);LinearLayout option=row();option.setPadding(dp(12),dp(4),dp(14),dp(4));option.setBackground(ripple(chosen?PALE:WHITE,12,chosen?TEAL:BORDER));
             RadioButton radio=new RadioButton(this);radio.setChecked(chosen);radio.setButtonTintList(ColorStateList.valueOf(chosen?TEAL:MUTED));radio.setClickable(false);radio.setFocusable(false);radio.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);option.addView(radio,new LinearLayout.LayoutParams(dp(32),dp(40)));
             option.addView(label(NAMES[i],14,INK,true),new LinearLayout.LayoutParams(0,-2,1));option.addView(label(tag,11,MUTED,false));option.setContentDescription(NAMES[i]+(chosen?", 선택됨":""));option.setOnClickListener(v->{selected=tag;render();});body.addView(option,new LinearLayout.LayoutParams(-1,dp(49)));space(body,7);
@@ -137,7 +149,6 @@ public class MainActivity extends Activity {
         text(footer,"직원 전용 · 고객님은 실행하지 마세요",12,RED,true);space(footer,6);
         TextView hint=text(footer,"19단계 진행 · 끝날 때까지 화면을 만지지 마세요",11,MUTED,false);hint.setCompoundDrawables(UiIcon.create(this,UiIcon.INFO,MUTED,dp(14)),null,null,null);hint.setCompoundDrawablePadding(dp(6));space(footer,10);
         startButton=action(footer,"초기화 시작",UiIcon.REFRESH,TEAL,WHITE,()->confirmRun(0,false,true));startButton.setEnabled(demo()||ShellConnection.INSTANCE.ready());
-        if(!demo()&&!ShellConnection.INSTANCE.ready()){space(footer,8);action(footer,"Shizuku 연결하기",UiIcon.SHIELD,WHITE,INK,this::connectShizuku);}
     }
     void chip(LinearLayout parent,String title,int kind){TextView chip=label(title,10,TEAL,true);chip.setPadding(dp(7),dp(5),dp(7),dp(5));chip.setCompoundDrawables(UiIcon.create(this,kind,TEAL,dp(12)),null,null,null);chip.setCompoundDrawablePadding(dp(4));chip.setBackground(shape(PALE,20,0));LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(-2,-2);p.setMargins(0,0,dp(5),0);parent.addView(chip,p);}
     void progressScreen(){
@@ -187,6 +198,7 @@ public class MainActivity extends Activity {
     void showDialog(LinearLayout content){dismissDialog();activeDialog=new Dialog(this);ScrollView scroll=new ScrollView(this);scroll.addView(content);activeDialog.setContentView(scroll);Window window=activeDialog.getWindow();if(window!=null){window.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));window.setLayout(getResources().getDisplayMetrics().widthPixels-dp(40),-2);}activeDialog.show();if(window!=null)window.setLayout(getResources().getDisplayMetrics().widthPixels-dp(40),-2);}
     void dismissDialog(){if(activeDialog!=null){activeDialog.dismiss();activeDialog=null;}}
     void confirmRun(int from,boolean single,boolean fresh){
+        if(WirelessStarter.INSTANCE.busy.get()){Toast.makeText(this,"연결 설정이 끝난 뒤 초기화하세요.",Toast.LENGTH_SHORT).show();return;}
         if(AppUpdater.INSTANCE.active()){Toast.makeText(this,"앱 업데이트가 끝난 뒤 초기화하세요.",Toast.LENGTH_SHORT).show();return;}
         if(!demo()&&(running()||!ShellConnection.INSTANCE.ready()))return;
         LinearLayout content=column();card(content,WHITE);
@@ -212,6 +224,7 @@ public class MainActivity extends Activity {
     }
     void previewNotice(String title){new AlertDialog.Builder(this).setTitle(title+" · 미리보기").setMessage("디자인 미리보기에서는 실제 명령을 실행하지 않습니다.").setPositiveButton("확인",null).show();}
     void confirmShutdown(){
+        if(WirelessStarter.INSTANCE.busy.get()){Toast.makeText(this,"연결 설정이 끝난 뒤 전원을 꺼주세요.",Toast.LENGTH_SHORT).show();return;}
         if(AppUpdater.INSTANCE.active()){Toast.makeText(this,"앱 업데이트가 끝난 뒤 전원을 꺼주세요.",Toast.LENGTH_SHORT).show();return;}
         if(shuttingDown||running())return;
         new AlertDialog.Builder(this).setTitle("전원을 끌까요?")
@@ -249,10 +262,64 @@ public class MainActivity extends Activity {
     @android.annotation.SuppressLint("GestureBackNavigation")
     @Override public void onBackPressed(){if(Build.VERSION.SDK_INT<33)handleBack();}
     void closeApp(){dismissDialog();for(ActivityManager.AppTask task:getSystemService(ActivityManager.class).getAppTasks())task.finishAndRemoveTask();finishAndRemoveTask();}
-    void debugGuide(){new AlertDialog.Builder(this).setTitle("무선 디버깅 연결").setMessage("Wi-Fi 연결 → 개발자 옵션의 무선 디버깅 켜기 → Shizuku에서 페어링·시작 → 이 앱의 권한 허용 순서로 진행하세요.\n\n재부팅 후에는 Shizuku를 다시 시작해야 합니다.").setPositiveButton("개발자 옵션 열기",(d,w)->open(new Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS))).setNegativeButton("닫기",null).show();}
+    void debugGuide(){new AlertDialog.Builder(this).setTitle("무선 디버깅 연결").setMessage("Wi-Fi와 무선 디버깅을 켜고, 자동 시작 설정에서 최초 1회 페어링해주세요. 인증이 유지되면 재부팅 후 앱 실행 시 Shizuku 시작을 시도합니다.\n\n설정이 어려우면 Shizuku에서 직접 페어링·시작할 수도 있습니다.").setPositiveButton("개발자 옵션 열기",(d,w)->open(new Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS))).setNegativeButton("닫기",null).show();}
     void goHome(){state.homeOnNextLaunch(true);override=1;}
-    void connectShizuku(){if(Shizuku.pingBinder())ShellConnection.INSTANCE.connect(true);else openShizuku();}
+    boolean wifiConnected(){try{ConnectivityManager cm=getSystemService(ConnectivityManager.class);NetworkCapabilities caps=cm.getNetworkCapabilities(cm.getActiveNetwork());return caps!=null&&caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI);}catch(Exception ignored){return false;}}
+    boolean wirelessDebugging(){return Settings.Global.getInt(getContentResolver(),"adb_wifi_enabled",0)==1;}
+    String connectionTitle(){if(demo())return "권한 연결됨";if(!Shizuku.pingBinder()&&WirelessStarter.INSTANCE.busy.get())return "Shizuku 자동 시작 중…";return switch(ShellConnection.INSTANCE.state()){
+        case READY->"권한 연결됨";case STOPPED->"Shizuku 시작 필요";case PERMISSION->"초기화 앱 권한 필요";case CONNECTING->"연결 중…";case RETRY->"다시 연결 필요";
+    };}
+    String connectionAction(){return switch(ShellConnection.INSTANCE.state()){
+        case READY->"연결 상태 확인";case STOPPED->WirelessStarter.INSTANCE.busy.get()?"자동 연결 중…":WirelessStarter.INSTANCE.configured(this)?"Shizuku 자동 연결":"자동 시작 설정";case PERMISSION->"권한 허용하기";case CONNECTING->"연결 중…";case RETRY->"다시 연결";
+    };}
+    String connectionDetail(){return switch(ShellConnection.INSTANCE.state()){
+        case STOPPED->WirelessStarter.INSTANCE.status.isEmpty()?"최초 1회 자동 시작을 설정하면 앱 실행 시 Shizuku를 시작합니다. Wi-Fi·무선 디버깅 허용과 인증 유지가 필요합니다.":WirelessStarter.INSTANCE.status;
+        case PERMISSION->"버튼을 눌러 초기화 앱의 Shizuku 권한을 허용해주세요. 이미 거부했다면 Shizuku의 ‘인증된 앱’에서 허용해주세요.";
+        case CONNECTING->"Shizuku와 연결하고 있습니다. 연결되면 초기화 시작 버튼이 활성화됩니다.";
+        case RETRY->ShellConnection.INSTANCE.message;
+        case READY->"연결됐습니다. 초기화를 실행할 수 있습니다.";
+    };}
+    void connectShizuku(){
+        if(demo())return;
+        if(!Shizuku.pingBinder()){
+            if(WirelessStarter.INSTANCE.configured(this)){WirelessStarter.INSTANCE.start(this,true);refresh();}
+            else showWirelessSetup();return;
+        }
+        if(Shizuku.checkSelfPermission()!=PackageManager.PERMISSION_GRANTED&&Shizuku.shouldShowRequestPermissionRationale()){
+            Toast.makeText(this,"Shizuku의 ‘인증된 앱’에서 갤럭시 초기화 권한을 허용해주세요.",Toast.LENGTH_LONG).show();openShizuku();return;
+        }
+        ShellConnection.INSTANCE.connect(true);refresh();
+        if(ShellConnection.INSTANCE.ready())Toast.makeText(this,"연결됐습니다.",Toast.LENGTH_SHORT).show();
+    }
     void openShizuku(){Intent launch=getPackageManager().getLaunchIntentForPackage(ResetPipeline.SHIZUKU);open(launch!=null?launch:new Intent(Intent.ACTION_VIEW,Uri.parse("https://shizuku.rikka.app/download/")));}
+    void maybeStartWireless(){if(!demo()&&!running()&&!shuttingDown&&!AppUpdater.INSTANCE.active())WirelessStarter.INSTANCE.start(this,false);}
+    void wirelessSetup(LinearLayout parent){
+        if(demo())return;
+        space(parent,10);LinearLayout setup=row();setup.setPadding(dp(14),0,dp(14),0);setup.setBackground(ripple(WHITE,12,0));
+        boolean paired=WirelessStarter.INSTANCE.configured(this),busy=WirelessStarter.INSTANCE.busy.get();
+        setup.addView(icon(busy?UiIcon.REFRESH:UiIcon.SHIELD,paired?TEAL:MUTED,18));
+        String title=busy?"자동 연결 중…":paired?"자동 시작 설정됨":"자동 시작 설정 필요";
+        TextView status=label(title,12,paired?INK:MUTED,false);status.setSingleLine(true);status.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        LinearLayout.LayoutParams labelParams=new LinearLayout.LayoutParams(0,-2,1);labelParams.setMargins(dp(8),0,dp(8),0);setup.addView(status,labelParams);
+        TextView change=label("설정",12,TEAL,true);change.setGravity(Gravity.CENTER);setup.addView(change,new LinearLayout.LayoutParams(dp(40),-1));
+        setup.setContentDescription(title+", 자동 시작 설정 열기");setup.setFocusable(true);setup.setOnClickListener(v->showWirelessSetup());
+        setup.setEnabled(!busy&&!running()&&!AppUpdater.INSTANCE.active());setup.setAlpha(setup.isEnabled()?1f:0.5f);
+        parent.addView(setup,new LinearLayout.LayoutParams(-1,dp(48)));
+    }
+    void showWirelessSetup(){
+        if(running()||shuttingDown||AppUpdater.INSTANCE.active()||WirelessStarter.INSTANCE.busy.get())return;
+        new AlertDialog.Builder(this).setTitle("Shizuku 자동 시작 설정")
+                .setMessage("초기화 앱용 인증을 최초 한 번 등록합니다. 기존 Shizuku 페어링과 별도입니다.\n\n1. 다음 화면에서 무선 디버깅을 켭니다.\n2. ‘페어링 코드로 기기 페어링’을 누릅니다.\n3. 화면을 그대로 둔 채 알림을 내려 ‘초기화 앱’ 알림에 6자리 코드를 입력합니다.\n4. 설정 완료 후 초기화 앱으로 돌아옵니다.\n\n인증이 삭제되면 다시 등록해야 합니다. 설정 과정에서 초기화를 실행하지 않습니다.")
+                .setNegativeButton("취소",null).setNeutralButton("Shizuku 열기",(d,w)->openShizuku())
+                .setPositiveButton("페어링 시작",(d,w)->{
+                    if(!getSystemService(NotificationManager.class).areNotificationsEnabled()){
+                        Toast.makeText(this,"코드 입력을 위해 초기화 앱 알림을 켜고 다시 설정해주세요.",Toast.LENGTH_LONG).show();
+                        open(new Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE,getPackageName()));return;
+                    }
+                    startForegroundService(new Intent(this,AdbPairingService.class).setAction(AdbPairingService.START));
+                    open(new Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS));
+                }).show();
+    }
     void open(Intent intent){try{startActivity(intent);}catch(Exception e){Toast.makeText(this,"설정에서 직접 열어주세요.",Toast.LENGTH_LONG).show();}}
     void appUpdates(LinearLayout parent){
         space(parent,16);LinearLayout version=row();version.addView(label("앱 버전 "+BuildConfig.VERSION_NAME,12,MUTED,false),new LinearLayout.LayoutParams(0,-2,1));
@@ -262,13 +329,13 @@ public class MainActivity extends Activity {
     void renderUpdateStatus(){
         boolean active=AppUpdater.INSTANCE.active();
         if(updateStatus!=null){updateStatus.setText(AppUpdater.INSTANCE.status);updateStatus.setVisibility(AppUpdater.INSTANCE.status.isEmpty()?View.GONE:View.VISIBLE);}
-        if(updateCheck!=null){updateCheck.setEnabled(!active&&!running());updateCheck.setAlpha(active?0.4f:1f);}
-        if(startButton!=null)startButton.setEnabled((demo()||ShellConnection.INSTANCE.ready())&&!active);
+        if(updateCheck!=null){updateCheck.setEnabled(!active&&!running()&&!WirelessStarter.INSTANCE.busy.get());updateCheck.setAlpha(active?0.4f:1f);}
+        if(startButton!=null)startButton.setEnabled((demo()||ShellConnection.INSTANCE.ready())&&!active&&!WirelessStarter.INSTANCE.busy.get());
     }
     boolean updateVisible(){return resumed&&!isFinishing()&&!isDestroyed();}
     void updateError(String message){if(updateVisible()){renderUpdateStatus();new AlertDialog.Builder(this).setTitle("앱 업데이트").setMessage(message).setPositiveButton("확인",null).show();}}
     void checkAppUpdate(){
-        if(running()||shuttingDown||AppUpdater.INSTANCE.active())return;
+        if(running()||shuttingDown||AppUpdater.INSTANCE.active()||WirelessStarter.INSTANCE.busy.get())return;
         AppUpdater.INSTANCE.check(new AppUpdater.Callback<AppUpdater.Release>(){
             public void success(AppUpdater.Release release){
                 if(!updateVisible())return;renderUpdateStatus();

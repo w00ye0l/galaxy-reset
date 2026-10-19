@@ -35,6 +35,7 @@ class FakeFleet:
         self.installed = defaultdict(lambda: {'com.example.userapp'})
         self.just_timed_out = defaultdict(bool)
         self.step_at_drop = {}  # 이탈 시점에 돌고 있던 단계 라벨 기록용
+        self.pair_screen = defaultdict(lambda: 'developer')
 
     def exec(self, cmd, timeout):
         time.sleep(random.uniform(0.002, 0.01))
@@ -77,6 +78,22 @@ class FakeFleet:
             return _cp(cmd, 0, '1234\n')
         if 'settings' in cmd and 'get' in cmd and 'adb_wifi_enabled' in cmd:
             return _cp(cmd, 0, '1\n')
+        if 'settings' in cmd and 'get' in cmd and 'adb_allowed_connection_time' in cmd:
+            return _cp(cmd, 0, '0\n')
+        if 'android.settings.APPLICATION_DEVELOPMENT_SETTINGS' in cmd:
+            self.pair_screen[serial] = 'developer'
+        if cmd[-1] == 'com.forholiday.galaxyreset/.MainActivity':
+            self.pair_screen[serial] = 'ready'
+        if 'input' in cmd and 'tap' in cmd:
+            self.pair_screen[serial] = {'developer': 'wireless', 'wireless': 'code'}.get(self.pair_screen[serial], 'code')
+        if cmd[3:5] == ['exec-out', 'cat'] and cmd[-1] == V6.phone_autostart.UI_FILE:
+            labels = {'developer': ['무선 디버깅'], 'wireless': ['페어링 코드로 기기 페어링'],
+                      'code': ['123456', '127.0.0.1:34567'], 'ready': ['권한 연결됨']}[self.pair_screen[serial]]
+            package = V6.PHONE_APP_PACKAGE if self.pair_screen[serial] == 'ready' else 'com.android.settings'
+            xml = '<?xml version="1.0"?><hierarchy>' + ''.join('<node package="%s" text="%s" resource-id="%s" bounds="[10,10][100,100]" />' % (package, t, 'com.android.settings:id/pairing_code' if t == '123456' else 'com.android.settings:id/ip_addr' if ':' in t else '') for t in labels) + '</hierarchy>'
+            return _cp(cmd, 0, xml)
+        if 'com.forholiday.galaxyreset.PAIR_FROM_USB' in cmd:
+            return _cp(cmd, 0, 'Broadcast completed: result=0, data="PAIRED"\n')
         if cmd[3] == 'install-multiple':
             self.installed[serial].add(V6.NMAP_PACKAGE)
             return _cp(cmd, 0, 'Success\n')

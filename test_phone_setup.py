@@ -20,6 +20,8 @@ class FakeDevice:
         self.sdk = '37'
         self.user = '0'
         self.wireless = '1'
+        self.auth_timeout = '604800000'
+        self.reject_timeout_change = False
         self.running = True
         self.install_failure = False
         self.grant_failure = False
@@ -50,8 +52,11 @@ class FakeDevice:
             out = self.sdk + '\n'
         elif a[:3] == ['shell', 'am', 'get-current-user']:
             out = self.user + '\n'
+        elif a[:5] == ['shell', 'settings', 'put', 'global', 'adb_allowed_connection_time']:
+            if not self.reject_timeout_change:
+                self.auth_timeout = a[5]
         elif a[:4] == ['shell', 'settings', 'get', 'global']:
-            out = self.wireless + '\n'
+            out = (self.auth_timeout if a[4] == 'adb_allowed_connection_time' else self.wireless) + '\n'
         elif a[:4] == ['shell', 'cmd', 'package', 'resolve-activity']:
             out = 'com.nhn.android.nmap/com.naver.map.LaunchActivity\n'
         elif a[:3] == ['shell', 'am', 'start'] and a[-1].startswith('com.nhn.android.nmap/'):
@@ -74,6 +79,7 @@ class PhoneSetupTest(unittest.TestCase):
         self.fake.versions[V6.PHONE_APP_PACKAGE] = self.bundle[V6.PHONE_APP_PACKAGE]['versionCode']
         self.mock = patch.object(V6, 'run_command', side_effect=self.fake.run)
         self.mock.start()
+        pairing = patch.object(V6.phone_autostart, 'prepare'); pairing.start(); self.addCleanup(pairing.stop)
         sleep = patch.object(V6.time, 'sleep'); sleep.start(); self.addCleanup(sleep.stop)
         self.addCleanup(self.mock.stop)
         V6.POST_RUN_NOTICES.clear()
@@ -158,6 +164,17 @@ class PhoneSetupTest(unittest.TestCase):
             V6.prepare_wireless_reset('TEST')
         self.assertFalse(V6.POST_RUN_NOTICES)
 
+    def test_provisioning_keeps_existing_adb_authorizations_from_expiring(self):
+        V6.prepare_wireless_reset('TEST')
+        self.assertEqual('0', self.fake.auth_timeout)
+        self.assertFalse(any('unpair' in c or 'clear' in c or 'uninstall' in c for c in self.fake.calls))
+
+    def test_ignored_timeout_setting_does_not_claim_ready(self):
+        self.fake.reject_timeout_change = True
+        with self.assertRaisesRegex(RuntimeError, 'ADB 인증 자동 만료 해제 확인 실패'):
+            V6.prepare_wireless_reset('TEST')
+        self.assertFalse(V6.POST_RUN_NOTICES)
+
     def test_starter_uses_official_installed_binary_and_verifies_pid(self):
         self.fake.running = False
         V6.start_shizuku_from_pc('TEST')
@@ -170,7 +187,8 @@ class PhoneSetupTest(unittest.TestCase):
 
     def test_initial_pairing_and_permission_notice_remains_truthful(self):
         V6.prepare_wireless_reset('TEST')
-        self.assertIn('USB 기동만으로 무선 페어링 완료를 뜻하지 않습니다', V6.POST_RUN_NOTICES[-1])
+        self.assertIn('앱 전용 인증을 별도로 등록했습니다', V6.POST_RUN_NOTICES[-1])
+        V6.phone_autostart.prepare.assert_called_once_with('TEST', V6._exec)
         self.assertFalse(any('pair' in c for c in self.fake.calls))
         for pkg in (V6.PHONE_APP_PACKAGE, V6.SHIZUKU_PACKAGE):
             self.assertTrue(any(pkg in c and 'android.permission.WRITE_SECURE_SETTINGS' in c for c in self.fake.calls))
