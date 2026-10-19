@@ -20,6 +20,8 @@ class FakeDevice:
         self.sdk = '37'
         self.user = '0'
         self.wireless = '1'
+        self.auth_timeout = '604800000'
+        self.reject_timeout_change = False
         self.running = True
         self.install_failure = False
         self.grant_failure = False
@@ -50,8 +52,11 @@ class FakeDevice:
             out = self.sdk + '\n'
         elif a[:3] == ['shell', 'am', 'get-current-user']:
             out = self.user + '\n'
+        elif a[:5] == ['shell', 'settings', 'put', 'global', 'adb_allowed_connection_time']:
+            if not self.reject_timeout_change:
+                self.auth_timeout = a[5]
         elif a[:4] == ['shell', 'settings', 'get', 'global']:
-            out = self.wireless + '\n'
+            out = (self.auth_timeout if a[4] == 'adb_allowed_connection_time' else self.wireless) + '\n'
         elif a[:4] == ['shell', 'cmd', 'package', 'resolve-activity']:
             out = 'com.nhn.android.nmap/com.naver.map.LaunchActivity\n'
         elif a[:3] == ['shell', 'am', 'start'] and a[-1].startswith('com.nhn.android.nmap/'):
@@ -155,6 +160,17 @@ class PhoneSetupTest(unittest.TestCase):
     def test_wireless_disabled_does_not_claim_ready(self):
         self.fake.wireless = '0'
         with self.assertRaisesRegex(RuntimeError, '무선 디버깅 활성화 확인 실패'):
+            V6.prepare_wireless_reset('TEST')
+        self.assertFalse(V6.POST_RUN_NOTICES)
+
+    def test_provisioning_keeps_existing_adb_authorizations_from_expiring(self):
+        V6.prepare_wireless_reset('TEST')
+        self.assertEqual('0', self.fake.auth_timeout)
+        self.assertFalse(any('unpair' in c or 'clear' in c or 'uninstall' in c for c in self.fake.calls))
+
+    def test_ignored_timeout_setting_does_not_claim_ready(self):
+        self.fake.reject_timeout_change = True
+        with self.assertRaisesRegex(RuntimeError, 'ADB 인증 자동 만료 해제 확인 실패'):
             V6.prepare_wireless_reset('TEST')
         self.assertFalse(V6.POST_RUN_NOTICES)
 

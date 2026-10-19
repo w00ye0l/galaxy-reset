@@ -1654,12 +1654,17 @@ def prepare_wireless_reset(serial):
             add_post_run_notice('[%s] %s 배터리 제한 제외 실패 — 기기 설정에서 확인하세요.' % (serial, package))
     for name in ('development_settings_enabled', 'adb_enabled', 'adb_wifi_enabled'):
         _pc_required(serial, ['shell', 'settings', 'put', 'global', name, '1'])
+    _pc_required(serial, ['shell', 'settings', 'put', 'global', 'adb_allowed_connection_time', '0'])
+    auth_timeout = _pc_required(serial, ['shell', 'settings', 'get', 'global',
+                                       'adb_allowed_connection_time']).stdout.strip()
+    if auth_timeout != '0':
+        raise RuntimeError('ADB 인증 자동 만료 해제 확인 실패 — 개발자 옵션의 ADB 인증 시간 제한 설정을 확인하세요.')
     wireless = _pc_required(serial, ['shell', 'settings', 'get', 'global', 'adb_wifi_enabled']).stdout.strip()
     if wireless != '1':
         raise RuntimeError('무선 디버깅 활성화 확인 실패 — Wi-Fi 연결과 기기의 허용 팝업을 확인하세요.')
     start_shizuku_from_pc(serial)
     _pc_required(serial, ['shell', 'am', 'start', '--user', '0', '-n', PHONE_APP_PACKAGE + '/.MainActivity'])
-    note = ('[%s] 폰 앱·Shizuku 설치 및 USB 기동 준비 완료. 처음인 기기는 전원을 끄기 전에 '
+    note = ('[%s] 폰 앱·Shizuku 설치 및 USB 기동 준비 완료. ADB 인증 자동 만료 해제 확인 완료. 처음인 기기는 전원을 끄기 전에 '
             'Shizuku 무선 페어링(현재 Wi-Fi 신뢰 포함)과 초기화 앱 권한 허용을 1회 완료하세요. '
             '기존 페어링·권한은 보존하며, USB 기동만으로 무선 페어링 완료를 뜻하지 않습니다.' % serial)
     add_post_run_notice(note)
