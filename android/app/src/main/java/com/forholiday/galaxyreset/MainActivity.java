@@ -126,10 +126,13 @@ public class MainActivity extends Activity {
     }
     void connectionRow(LinearLayout parent,String title,String subtitle,int kind,boolean good,Runnable callback){LinearLayout line=row();line.addView(icon(kind,TEAL,24));LinearLayout copy=column();LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(0,-2,1);p.setMargins(dp(12),0,dp(8),0);line.addView(copy,p);text(copy,title,15,INK,true);space(copy,4);text(copy,subtitle,12,MUTED,false);line.addView(icon(good?UiIcon.CHECK:UiIcon.ARROW,good?TEAL:MUTED,20));line.setMinimumHeight(dp(52));line.setOnClickListener(v->{if(!demo())callback.run();});parent.addView(line);}
     void startScreen(){
-        LinearLayout device=row();card(device,WHITE);LinearLayout info=column();device.addView(info,new LinearLayout.LayoutParams(0,-2,1));
-        text(info,"이 기기",12,MUTED,true);space(info,6);text(info,deviceName(),28,INK,true);space(info,4);text(info,Build.MODEL+" · "+ResetPipeline.series(Build.MODEL)+" 시리즈",12,MUTED,false);space(info,10);
-        LinearLayout chips=row();chip(chips,demo()||wifiConnected()?"Wi-Fi 연결됨":"Wi-Fi 끊김",UiIcon.WIFI);info.addView(chips);space(info,5);LinearLayout auth=row();chip(auth,connectionTitle(),UiIcon.SHIELD);info.addView(auth);
-        LinearLayout image=column();image.setGravity(Gravity.CENTER);image.addView(wallpaperImage(58,112));space(image,5);text(image,"적용할 배경",10,MUTED,false);device.addView(image);body.addView(device);
+        LinearLayout device=row();card(device,WHITE);device.setPadding(dp(14),dp(12),dp(14),dp(12));LinearLayout info=column();device.addView(info,new LinearLayout.LayoutParams(0,-2,1));
+        TextView name=text(info,deviceName(),24,INK,true);name.setSingleLine(true);name.setEllipsize(android.text.TextUtils.TruncateAt.END);space(info,4);
+        TextView model=text(info,Build.MODEL+" · "+ResetPipeline.series(Build.MODEL)+" 시리즈",11,MUTED,false);model.setSingleLine(true);model.setEllipsize(android.text.TextUtils.TruncateAt.END);space(info,8);
+        LinearLayout chips=row();if(getResources().getConfiguration().fontScale>1.15f)chips.setOrientation(LinearLayout.VERTICAL);
+        chip(chips,demo()||wifiConnected()?"Wi-Fi 연결됨":"Wi-Fi 끊김",UiIcon.WIFI);chip(chips,connectionTitle(),UiIcon.SHIELD);info.addView(chips);
+        LinearLayout image=column();image.setGravity(Gravity.CENTER);image.addView(wallpaperImage(40,76));space(image,4);text(image,"적용 배경",10,MUTED,false);
+        LinearLayout.LayoutParams imageParams=new LinearLayout.LayoutParams(-2,-2);imageParams.setMargins(dp(12),0,0,0);device.addView(image,imageParams);body.addView(device);
         if(!demo()&&!ShellConnection.INSTANCE.ready()){
             space(body,12);LinearLayout connection=column();card(connection,WHITE);body.addView(connection);
             text(connection,connectionTitle(),16,INK,true);space(connection,6);text(connection,connectionDetail(),13,MUTED,false);space(connection,12);
