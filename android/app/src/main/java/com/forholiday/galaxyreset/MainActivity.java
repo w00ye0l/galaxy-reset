@@ -292,11 +292,16 @@ public class MainActivity extends Activity {
     void maybeStartWireless(){if(!demo()&&!running()&&!shuttingDown&&!AppUpdater.INSTANCE.active())WirelessStarter.INSTANCE.start(this,false);}
     void wirelessSetup(LinearLayout parent){
         if(demo())return;
-        space(parent,12);LinearLayout setup=column();card(setup,WHITE);parent.addView(setup);
-        boolean paired=WirelessStarter.INSTANCE.configured(this);
-        text(setup,paired?"Shizuku 자동 시작 설정됨":"재부팅 후 자동 시작",14,INK,true);space(setup,5);
-        text(setup,WirelessStarter.INSTANCE.status.isEmpty()?(paired?"앱을 열면 무선 연결과 Shizuku 시작을 확인합니다.":"최초 한 번 코드로 등록하면 앱을 열 때 Shizuku 시작을 시도합니다."):WirelessStarter.INSTANCE.status,12,MUTED,false);
-        TextView change=text(setup,paired?"다시 페어링":"자동 시작 설정",12,TEAL,true);change.setMinHeight(dp(48));change.setGravity(Gravity.CENTER_VERTICAL);change.setOnClickListener(v->showWirelessSetup());
+        space(parent,10);LinearLayout setup=row();setup.setPadding(dp(14),0,dp(14),0);setup.setBackground(ripple(WHITE,12,0));
+        boolean paired=WirelessStarter.INSTANCE.configured(this),busy=WirelessStarter.INSTANCE.busy.get();
+        setup.addView(icon(busy?UiIcon.REFRESH:UiIcon.SHIELD,paired?TEAL:MUTED,18));
+        String title=busy?"자동 연결 중…":paired?"자동 시작 설정됨":"자동 시작 설정 필요";
+        TextView status=label(title,12,paired?INK:MUTED,false);status.setSingleLine(true);status.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        LinearLayout.LayoutParams labelParams=new LinearLayout.LayoutParams(0,-2,1);labelParams.setMargins(dp(8),0,dp(8),0);setup.addView(status,labelParams);
+        TextView change=label("설정",12,TEAL,true);change.setGravity(Gravity.CENTER);setup.addView(change,new LinearLayout.LayoutParams(dp(40),-1));
+        setup.setContentDescription(title+", 자동 시작 설정 열기");setup.setFocusable(true);setup.setOnClickListener(v->showWirelessSetup());
+        setup.setEnabled(!busy&&!running()&&!AppUpdater.INSTANCE.active());setup.setAlpha(setup.isEnabled()?1f:0.5f);
+        parent.addView(setup,new LinearLayout.LayoutParams(-1,dp(48)));
     }
     void showWirelessSetup(){
         if(running()||shuttingDown||AppUpdater.INSTANCE.active()||WirelessStarter.INSTANCE.busy.get())return;
