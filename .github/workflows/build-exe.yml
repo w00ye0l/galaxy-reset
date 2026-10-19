@@ -5,6 +5,10 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -26,7 +30,7 @@ jobs:
         run: python tools/prepare_phone_bundle.py --check
 
       - name: Test phone provisioning
-        run: python -m unittest -v test_phone_setup
+        run: python -m unittest -v test_phone_setup test_phone_autostart
 
       - name: Build EXE
         run: pyinstaller V6.spec

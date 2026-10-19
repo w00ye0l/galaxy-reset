@@ -198,10 +198,10 @@ Shizuku 자체가 종료됐거나 기기를 재부팅한 경우에는 **Shizuku 
 1. Android의 `versionCode`와 `versionName`을 올리고, 기존 서명 키로 빌드합니다.
 2. `python tools/prepare_phone_bundle.py`로 PC 동봉 APK와 업데이트 JSON을 함께 갱신해 커밋·푸시합니다.
 3. GitHub Actions의 **Publish App Update**를 최신 커밋의 브랜치에서 실행합니다. tag를 비우면 APK 버전에 맞춰 `app-v1.1.11` 같은 태그를 사용합니다. 같은 태그가 다른 커밋을 가리키거나 이미 릴리스가 있으면 실패하므로 버전마다 새 태그를 사용하세요.
-4. 워크플로는 동봉 파일을 검증한 뒤 **이미 서명된 `phone-app/galaxy-reset.apk`를 그대로** 초안 릴리스에 올립니다. 두 파일 업로드 후에만 정식·최신 릴리스로 공개합니다. CI에서 임시 debug 키로 APK를 재빌드하지 않습니다.
+4. 워크플로는 Windows EXE 빌드·준비 테스트가 성공한 뒤 **이미 서명된 `phone-app/galaxy-reset.apk`를 그대로**, 업데이트 JSON, Windows EXE ZIP과 SHA-256 파일을 같은 초안 릴리스에 올립니다. 모든 파일 업로드 후에만 정식·최신 릴리스로 공개합니다. CI에서 임시 debug 키로 APK를 재빌드하지 않습니다.
 5. 기기에서 **업데이트 확인 → 다운로드·설치 → Android 업데이트 승인**으로 설치합니다.
 
-버전과 일치하는 `app-v*` 태그를 푸시해도 동일한 게시 워크플로가 실행됩니다. EXE는 기존 **Build Windows EXE**로 별도 배포합니다. 최신 정식 릴리스는 앱 업데이트용 두 파일을 포함해야 합니다.
+버전과 일치하는 `app-v*` 태그를 푸시해도 동일한 APK·EXE 통합 게시 워크플로가 실행됩니다. **Build Windows EXE**만 따로 실행하면 기존처럼 Actions 아티팩트를 내려받을 수도 있습니다. 최신 정식 릴리스는 앱 업데이트용 두 파일을 포함해야 합니다.
 
 새 워크플로가 Actions 목록에 보이지 않으면 기본 브랜치에 워크플로를 반영하거나, 해당 코드가 있는 커밋에 `app-v*` 태그를 붙여 푸시하세요.
 

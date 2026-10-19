@@ -13,13 +13,17 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 concurrency:
   group: publish-app-update
   cancel-in-progress: false
 
 jobs:
+  windows:
+    uses: ./.github/workflows/build-exe.yml
   publish:
+    needs: windows
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -29,11 +33,15 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
+      - uses: actions/download-artifact@v5
+        with:
+          name: galaxy-reset-v8
+          path: release-exe
       - name: Prepare signed APK and update metadata
         id: prepare
         env:
           RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
-        run: python tools/prepare_app_release.py --tag "$RELEASE_TAG" --output release-app --github-output "$GITHUB_OUTPUT"
+        run: python tools/prepare_app_release.py --tag "$RELEASE_TAG" --exe 'release-exe/갤럭시 초기화 V8.exe' --output release-app --github-output "$GITHUB_OUTPUT"
       - name: Verify release tag points to this commit
         env:
           RELEASE_TAG: ${{ steps.prepare.outputs.tag }}
@@ -47,5 +55,5 @@ jobs:
           RELEASE_TAG: ${{ steps.prepare.outputs.tag }}
           RELEASE_TITLE: ${{ steps.prepare.outputs.title }}
         run: |
-          gh release create "$RELEASE_TAG" release-app/galaxy-reset.apk release-app/galaxy-reset-update.json --draft --target "$GITHUB_SHA" --title "$RELEASE_TITLE" --notes-file release-app/release-notes.txt
+          gh release create "$RELEASE_TAG" release-app/galaxy-reset.apk release-app/galaxy-reset-update.json release-app/galaxy-reset-windows-* --draft --target "$GITHUB_SHA" --title "$RELEASE_TITLE" --notes-file release-app/release-notes.txt
           gh release edit "$RELEASE_TAG" --draft=false --latest
