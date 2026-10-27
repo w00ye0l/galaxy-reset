@@ -14,6 +14,7 @@ import hashlib
 import shlex
 import zipfile
 import phone_autostart
+import naver_account_cleanup
 from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 
 
@@ -759,26 +760,8 @@ SAMSUNG_ACCOUNT_TYPES = [
 
 
 def get_device_accounts(serial):
-    """기기에 등록된 계정 목록을 조회합니다."""
-    result = run_command([
-        'adb', '-s', serial, 'shell',
-        'dumpsys', 'account'
-    ])
-    if not hasattr(result, 'stdout') or not result.stdout:
-        return []
-
-    accounts = []
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        # "Account {name=xxx, type=yyy}" 형태를 파싱
-        if line.startswith('Account {') and 'type=' in line:
-            try:
-                type_part = line.split('type=')[1].rstrip('}').strip()
-                name_part = line.split('name=')[1].split(',')[0].strip()
-                accounts.append({'name': name_part, 'type': type_part})
-            except (IndexError, ValueError):
-                continue
-    return accounts
+    """검증된 사용자 0 계정 목록. 조회 실패를 빈 목록으로 간주하지 않습니다."""
+    return [{'type': kind} for kind in naver_account_cleanup.accounts(serial, run_command)]
 
 
 def is_samsung_account(account_type):
@@ -789,65 +772,34 @@ def is_samsung_account(account_type):
     return False
 
 
-def remove_non_samsung_accounts(serial):
-    """삼성 계정을 제외한 모든 계정을 삭제합니다 (app_process + DEX 방식)."""
-    logging.info('[%s] 삼성 계정 제외 전체 계정 삭제 시작...', serial)
-
-    # 삭제 전 계정 현황 로깅
-    accounts = get_device_accounts(serial)
-    if not accounts:
-        logging.info('[%s] 계정 조회 결과 없음 — DEX로 직접 삭제 시도', serial)
-    else:
-        for account in accounts:
-            if is_samsung_account(account['type']):
-                logging.info('[%s] 삼성 계정 보존 대상: %s (%s)', serial, account['name'], account['type'])
-            else:
-                logging.info('[%s] 계정 삭제 대상: %s (%s)', serial, account['name'], account['type'])
-
-    # DEX 파일 푸시
-    if not push_dex_if_needed(serial, 'account_remover.dex'):
-        logging.error('[%s] account_remover.dex 없음 — 계정 삭제 불가', serial)
-        return
-
-    # app_process로 AccountRemover 실행
-    # (IAccountManager.removeAccountAsUser를 직접 호출하여 계정 삭제)
-    result = run_command([
-        'adb', '-s', serial, 'shell',
-        'CLASSPATH=/data/local/tmp/account_remover.dex',
-        'app_process', '/system/bin', 'AccountRemover'
-    ])
-
-    stdout = result.stdout if hasattr(result, 'stdout') else ''
-
-    # 결과 파싱
-    for line in stdout.splitlines():
-        line = line.strip()
-        if line.startswith('REMOVING:'):
-            parts = line.split(':', 2)
-            if len(parts) >= 3:
-                logging.info('[%s] 계정 삭제 시도: %s (%s)', serial, parts[1], parts[2])
-        elif line.startswith('OK:'):
-            logging.info('[%s] 계정 삭제 요청 완료: %s', serial, line[3:])
-        elif line.startswith('FAIL:'):
-            logging.warning('[%s] 계정 삭제 실패: %s', serial, line[5:])
-        elif line.startswith('REMAINING:'):
-            logging.info('[%s] 남은 계정 수: %s', serial, line[10:])
-        elif line.startswith('ACCOUNT:'):
-            parts = line.split(':', 2)
-            if len(parts) >= 3:
-                logging.info('[%s]   - %s (%s)', serial, parts[1], parts[2])
-
-    # 삭제 후 확인
+def verify_non_samsung_accounts_removed(serial):
     remaining = get_device_accounts(serial)
-    non_samsung_remaining = [a for a in remaining if not is_samsung_account(a['type'])]
-    if non_samsung_remaining:
-        logging.warning('[%s] 아직 남아있는 비삼성 계정 %d개:', serial, len(non_samsung_remaining))
-        for a in non_samsung_remaining:
-            logging.warning('[%s]   - %s (%s)', serial, a['name'], a['type'])
-    else:
-        logging.info('[%s] 비삼성 계정 모두 제거 완료', serial)
+    non_samsung = [a for a in remaining if not is_samsung_account(a['type'])]
+    if non_samsung:
+        raise RuntimeError('비삼성 계정 %d개가 기기에 남아 있습니다 · 계정 삭제 실패' % len(non_samsung))
 
-    logging.info('[%s] 삼성 계정 제외 전체 계정 삭제 완료', serial)
+
+def remove_non_samsung_accounts(serial):
+    """백그라운드 삭제 + NAVER 설정 UI 폴백 후 실제 잔존 계정을 검증합니다."""
+    logging.info('[%s] 삼성 계정 제외 전체 계정 삭제 시작...', serial)
+    if naver_account_cleanup.checked(serial, run_command,
+            ['shell', 'am', 'get-current-user']).strip() != '0':
+        raise RuntimeError('소유자(사용자 0) 화면에서만 계정을 삭제합니다.')
+    accounts = get_device_accounts(serial)
+    protected = sum(is_samsung_account(a['type']) for a in accounts)
+    logging.info('[%s] 현재 계정 %d개 · 삼성 계정 보존 %d개', serial, len(accounts), protected)
+    if not push_dex_if_needed(serial, 'account_remover.dex'):
+        raise RuntimeError('account_remover.dex 없음 · 계정 삭제를 완료하지 못했습니다.')
+    # DEX output may contain customer identifiers. Verify inventory instead of logging it.
+    run_command(['adb', '-s', serial, 'shell',
+                 'CLASSPATH=/data/local/tmp/account_remover.dex',
+                 'app_process', '/system/bin', 'AccountRemover'], timeout=120, retries=0)
+    remaining = get_device_accounts(serial)
+    if any(a['type'] == naver_account_cleanup.NAVER for a in remaining):
+        logging.info('[%s] 네이버 계정 잔존 · 설정에서 기기 계정/인증 정보 제거 중...', serial)
+        naver_account_cleanup.remove(serial, run_command)
+    verify_non_samsung_accounts_removed(serial)
+    logging.info('[%s] 비삼성 계정 0개 확인 · 삼성 계정 보존 · 계정 삭제 완료', serial)
 
 
 # ============================================================
@@ -1801,6 +1753,8 @@ def process_device(serial, locale=None):
             action()
             if PROGRESS:
                 PROGRESS.step(serial, number, label)
+        current_label = '최종 계정 확인'
+        verify_non_samsung_accounts_removed(serial)
     except Exception as e:
         # 예외는 main()이 기기별로 잡아 기록하고 해당 기기만 중단 (기존 동작 유지).
         # 단계명을 붙여 다시 던져 실패 사유에 이탈 시점이 남게 한다.

@@ -110,6 +110,8 @@ class FakeFleet:
         if 'dumpsys' in cmd and 'package' in cmd:
             version = V6.load_nmap_bundle()['versionCode'] if cmd[-1] == V6.NMAP_PACKAGE else V6.load_phone_bundle()[cmd[-1]]['versionCode']
             return _cp(cmd, 0, 'versionCode=%s minSdk=30\n' % version)
+        if 'dumpsys' in cmd and 'account' in cmd:
+            return _cp(cmd, 0, 'User UserInfo{0:Owner:13}:\n  Accounts: 0\n')
         if 'dumpsys' in cmd:
             return _cp(cmd, 0, 'Widgets:\nHosts:\n')
         return _cp(cmd, 0, 'SUCCESS\n')
