@@ -5,10 +5,17 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: utf-8
     steps:
       - uses: actions/checkout@v5
         with:
@@ -26,10 +33,18 @@ jobs:
         run: python tools/prepare_phone_bundle.py --check
 
       - name: Test phone provisioning
-        run: python -m unittest -v test_phone_setup
+        run: python -m unittest -v test_phone_setup test_phone_autostart test_naver_account_cleanup
+
+      - name: Test reset fleet and account failure propagation
+        run: python test_simulation.py
 
       - name: Build EXE
         run: pyinstaller V6.spec
+
+      - name: Verify frozen EXE starts without device actions
+        run: |
+          & '.\dist\갤럭시 초기화 V8.exe' --prepare-phone-only --help
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Upload EXE artifact
         uses: actions/upload-artifact@v5

@@ -1,0 +1,68 @@
+name: Publish Windows EXE
+
+on:
+  push:
+    tags:
+      - 'windows-v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: publish-windows-exe
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    uses: ./.github/workflows/build-exe.yml
+  publish:
+    needs: windows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          lfs: true
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - uses: actions/download-artifact@v5
+        with:
+          name: galaxy-reset-v8
+          path: release-exe
+      - name: Prepare EXE for the existing app release
+        id: prepare
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import json, os, re
+          version = json.load(open('phone-app/galaxy-reset-update.json'))['versionName']
+          if os.environ['EVENT_NAME'] == 'push':
+              assert re.fullmatch('windows-v' + re.escape(version) + r'(?:-build[1-9][0-9]*)?', os.environ['REF_NAME']), 'Windows tag must match bundled app version'
+          PY
+          python tools/prepare_app_release.py --exe 'release-exe/갤럭시 초기화 V8.exe' --output release-app --github-output "$GITHUB_OUTPUT"
+      - name: Verify existing release and publish Windows assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP_TAG: ${{ steps.prepare.outputs.tag }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$APP_TAG" > existing-release.json
+          gh release download "$APP_TAG" --pattern galaxy-reset-update.json --dir existing-release
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          release = json.load(open('existing-release.json'))
+          local = json.load(open('phone-app/galaxy-reset-update.json'))
+          public = json.load(open('existing-release/galaxy-reset-update.json'))
+          assert release['tag_name'] == os.environ['APP_TAG'] and not release['draft'] and not release['prerelease']
+          assert local == public, 'Never publish an EXE with a different bundled APK under the same app version'
+          apk = next(a for a in release['assets'] if a['name'] == 'galaxy-reset.apk')
+          assert apk['size'] == local['size'] and apk['digest'] == 'sha256:' + local['sha256']
+          notes = Path('release-app/release-notes.txt')
+          notes.write_text(notes.read_text() + '\nWindows EXE source commit: ' + os.environ['GITHUB_SHA'] + '\n')
+          PY
+          gh release upload "$APP_TAG" release-app/galaxy-reset-windows-*.zip release-app/galaxy-reset-windows-*.zip.sha256
+          gh release edit "$APP_TAG" --notes-file release-app/release-notes.txt
