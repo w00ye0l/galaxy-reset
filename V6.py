@@ -17,6 +17,13 @@ import phone_autostart
 import naver_account_cleanup
 from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 
+# Frozen Windows executables ignore PYTHONIOENCODING. Set streams before logging
+# and argparse, including redirected output and the non-interactive help path.
+if os.name == 'nt':
+    for _console_stream in (sys.stdout, sys.stderr):
+        if hasattr(_console_stream, 'reconfigure'):
+            _console_stream.reconfigure(encoding='utf-8', errors='replace')
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -798,6 +805,7 @@ def remove_non_samsung_accounts(serial):
     if any(a['type'] == naver_account_cleanup.NAVER for a in remaining):
         logging.info('[%s] 네이버 계정 잔존 · 설정에서 기기 계정/인증 정보 제거 중...', serial)
         naver_account_cleanup.remove(serial, run_command)
+    naver_account_cleanup.clear_map_session(serial, run_command)
     verify_non_samsung_accounts_removed(serial)
     logging.info('[%s] 비삼성 계정 0개 확인 · 삼성 계정 보존 · 계정 삭제 완료', serial)
 

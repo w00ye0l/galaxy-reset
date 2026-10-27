@@ -207,6 +207,12 @@ final class ResetPipeline {
                     } catch (ConnectionLost e) { throw e; }
                     catch (Exception e) { warnings.add("네이버 계정 제거 확인 필요 · 화면을 켜고 잠금 해제 후 재시도하세요."); }
                 }
+                if (installed("com.nhn.android.nmap")) {
+                    Result cleared = raw("pm clear --user 0 com.nhn.android.nmap", 120);
+                    if (cleared.code != 0 || cleared.truncated || !cleared.output.trim().equals("Success"))
+                        throw new IOException("네이버 지도 로그인·저장 데이터 초기화 실패");
+                    notes.add("네이버 지도 로그인 세션·저장 데이터 초기화 확인");
+                }
                 int remaining = nonSamsungAccounts(required("dumpsys account").output);
                 if (remaining == 0) {
                     // The final inventory, including NAVER, proves successful fallback removal.

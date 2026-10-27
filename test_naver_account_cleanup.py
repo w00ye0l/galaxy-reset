@@ -27,6 +27,9 @@ class Device:
         self.refuse = self.foreign = self.wrong_dialog = self.timeout = False
         self.broken_inventory = None
         self.user = '0'
+        self.map_installed = True
+        self.session = True
+        self.clear_failure = False
 
     def run(self, command, **kwargs):
         self.calls.append(command)
@@ -41,6 +44,12 @@ class Device:
                 out = self.broken_inventory
         elif args == ['shell', 'am', 'get-current-user']:
             out = self.user + '\n'
+        elif args == ['shell', 'pm', 'list', 'packages', '--user', '0', cleanup.MAP]:
+            out = 'package:' + cleanup.MAP + '\n' if self.map_installed else ''
+        elif args == ['shell', 'pm', 'clear', '--user', '0', cleanup.MAP]:
+            out = 'Failed' if self.clear_failure else 'Success\n'
+            if not self.clear_failure:
+                self.session = False
         elif 'AccountRemover' in args:
             out = 'FAIL:private-naver\n'
         elif 'android.settings.SYNC_SETTINGS' in args:
@@ -74,7 +83,8 @@ class AccountCleanupTest(unittest.TestCase):
             V6.remove_non_samsung_accounts('TEST')
         self.assertEqual(self.device.naver, 0)
         self.assertFalse(any('private-' in line for line in logs.output))
-        self.assertFalse(any('uninstall' in c or 'clear' in c for c in self.device.calls))
+        self.assertFalse(any('uninstall' in c for c in self.device.calls))
+        self.assertFalse(self.device.session)
         self.assertTrue(any(c[3:6] == ['shell', 'rm', '-f'] for c in self.device.calls))
 
     def test_multiple_naver_accounts_are_all_removed(self):
@@ -86,6 +96,17 @@ class AccountCleanupTest(unittest.TestCase):
         self.device.naver = 0
         V6.remove_non_samsung_accounts('TEST')
         self.assertFalse(any('uiautomator' in c for c in self.device.calls))
+        self.assertFalse(self.device.session)
+
+    def test_session_clear_failure_is_not_hidden_by_zero_accounts(self):
+        self.device.naver = 0; self.device.clear_failure = True
+        self.assertRaises(RuntimeError, V6.remove_non_samsung_accounts, 'TEST')
+        self.assertTrue(self.device.session)
+
+    def test_missing_map_is_not_installed_just_to_clear_session(self):
+        self.device.naver = 0; self.device.map_installed = False
+        V6.remove_non_samsung_accounts('TEST')
+        self.assertFalse(any('clear' in c or 'install' in c for c in self.device.calls))
 
     def test_failed_removal_is_an_error_even_when_taps_succeed(self):
         self.device.refuse = True

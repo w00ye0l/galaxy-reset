@@ -21,6 +21,7 @@ public class NaverAccountCleanupTest {
     static class Fake extends ResetPipelineTest.Fake {
         int naver = 1, screen, taps;
         boolean google, refuse, wrongProvider, wrongDialog, timedOut;
+        boolean session = true, clearFailure;
         @Override public ResetPipeline.Result run(String cmd, int seconds) {
             commands.add(cmd);
             if (cmd.equals("dumpsys account")) return new ResetPipeline.Result(0,
@@ -28,6 +29,11 @@ public class NaverAccountCleanupTest {
                 + "Account {name=redacted, type=com.nhn.android.naveraccount}\n".repeat(naver)
                 + (google ? "Account {name=redacted, type=com.google}\n" : ""));
             if (cmd.startsWith("CLASSPATH=")) return new ResetPipeline.Result(0, "FAIL:BACKGROUND_REMOVAL");
+            if (cmd.startsWith("pm list packages")) return new ResetPipeline.Result(0, "package:com.nhn.android.nmap\n");
+            if (cmd.equals("pm clear --user 0 com.nhn.android.nmap")) {
+                if (clearFailure) return new ResetPipeline.Result(0, "Failed");
+                session = false; return new ResetPipeline.Result(0, "Success\n");
+            }
             if (cmd.contains("android.settings.SYNC_SETTINGS")) { screen = 0; return new ResetPipeline.Result(0, "Status: ok"); }
             if (cmd.startsWith("uiautomator")) {
                 if (timedOut) return new ResetPipeline.Result(124, "");
@@ -53,7 +59,8 @@ public class NaverAccountCleanupTest {
         assertEquals(0, fake.naver); assertEquals(3, fake.taps);
         assertFalse(pipeline.manual); assertTrue(pipeline.warnings.isEmpty());
         assertTrue(pipeline.notes.stream().anyMatch(n -> n.contains("인증 정보")));
-        assertFalse(fake.commands.stream().anyMatch(c -> c.contains("uninstall") || c.contains("pm clear")));
+        assertFalse(fake.commands.stream().anyMatch(c -> c.contains("uninstall")));
+        assertFalse(fake.session);
         assertTrue(fake.commands.stream().anyMatch(c -> c.startsWith("rm -f")));
     }
     @Test public void removesMultipleNaverAccountsAndChecksInventoryEachTime() throws Exception {
@@ -65,6 +72,17 @@ public class NaverAccountCleanupTest {
         Fake fake = new Fake(); fake.naver = 0;
         new NaverAccountCleanup(pipeline(fake)).remove();
         assertEquals(List.of("dumpsys account"), fake.commands);
+    }
+    @Test public void zeroSystemAccountsStillClearsMapSession() throws Exception {
+        Fake fake = new Fake(); fake.naver = 0;
+        ResetPipeline pipeline = pipeline(fake); pipeline.step(1, "ja-JP", "SM-S948N");
+        assertFalse(fake.session); assertTrue(pipeline.warnings.isEmpty());
+        assertFalse(fake.commands.stream().anyMatch(c -> c.contains("SYNC_SETTINGS")));
+    }
+    @Test public void failedSessionClearCannotBeReportedAsAccountSuccess() throws Exception {
+        Fake fake = new Fake(); fake.naver = 0; fake.clearFailure = true;
+        assertThrows(Exception.class, () -> pipeline(fake).step(1, "ja-JP", "SM-S948N"));
+        assertTrue(fake.session);
     }
     @Test public void refusesToSelectSamsungOrAnotherProvider() throws Exception {
         Fake fake = new Fake(); fake.wrongProvider = true;
