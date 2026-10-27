@@ -7,8 +7,8 @@ android {
         applicationId 'com.forholiday.galaxyreset'
         minSdk 30
         targetSdk 36
-        versionCode 19
-        versionName '1.1.15'
+        versionCode 20
+        versionName '1.1.16'
         buildConfigField 'long', 'NMAP_VERSION_CODE', nmapBundle.versionCode.toString() + 'L'
         buildConfigField 'String[]', 'NMAP_APKS', 'new String[]{' + nmapBundle.apks.collect { '"' + it.file + '"' }.join(',') + '}'
     }

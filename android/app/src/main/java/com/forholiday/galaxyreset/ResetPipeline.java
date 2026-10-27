@@ -133,16 +133,22 @@ final class ResetPipeline {
         return result;
     }
     static int nonSamsungAccounts(String dump) {
-        int count = 0;
+        return accountTypes(dump).stream().mapToInt(type -> !type.startsWith("com.samsung") && !type.startsWith("com.osp.app.signin") ? 1 : 0).sum();
+    }
+    static int naverAccounts(String dump) {
+        return (int) accountTypes(dump).stream().filter("com.nhn.android.naveraccount"::equals).count();
+    }
+    static List<String> accountTypes(String dump) {
+        List<String> types = new ArrayList<>();
         for (String line : dump.split("\\R")) {
             String trimmed = line.trim();
             if (!trimmed.startsWith("Account {")) continue;
             int typeStart = trimmed.lastIndexOf("type="), close = trimmed.lastIndexOf('}');
             if (typeStart < 0 || close <= typeStart + 5) continue;
             String type = trimmed.substring(typeStart + 5, close).trim();
-            if (!type.startsWith("com.samsung") && !type.startsWith("com.osp.app.signin")) count++;
+            types.add(type);
         }
-        return count;
+        return types;
     }
     static final String WIDGET_QUERY = "dump=$(dumpsys appwidget) || exit $?; printf '%s\\n' \"$dump\" | sed -n '/^[[:space:]]*Widgets:/,/^[[:space:]]*Hosts:/p'";
     Set<String> queryWidgetProviders() throws Exception {
@@ -191,9 +197,21 @@ final class ResetPipeline {
             case 0 -> success(dex("locale_changer.dex", "LocaleChanger", locales(locale).toArray(new String[0])), "SUCCESS", "언어 변경 확인 필요");
             case 1 -> {
                 required("dumpsys account");
-                Result result = dex("account_remover.dex", "AccountRemover");
+                try { dex("account_remover.dex", "AccountRemover"); }
+                catch (ConnectionLost e) { throw e; }
+                catch (Exception ignored) { notes.add("백그라운드 계정 제거 재확인"); }
+                if (naverAccounts(required("dumpsys account").output) > 0) {
+                    try {
+                        new NaverAccountCleanup(this).remove();
+                        notes.add("네이버 계정·인증 정보 기기에서 제거 확인 · 계정 탈퇴 아님");
+                    } catch (ConnectionLost e) { throw e; }
+                    catch (Exception e) { warnings.add("네이버 계정 제거 확인 필요 · 화면을 켜고 잠금 해제 후 재시도하세요."); }
+                }
                 int remaining = nonSamsungAccounts(required("dumpsys account").output);
-                if (remaining > 0 || result.output.contains("FAIL:")) {
+                if (remaining == 0) {
+                    // The final inventory, including NAVER, proves successful fallback removal.
+                    warnings.clear(); notes.add("비삼성 계정 0개 확인 · 삼성 계정 보존");
+                } else {
                     manual = true; warnings.add("비삼성 계정 삭제 실패 · 남은 계정 " + remaining + "개, 설정에서 수동 확인 필요");
                 }
             }
