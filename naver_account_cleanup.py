@@ -9,6 +9,7 @@ import xml.etree.ElementTree as ET
 
 NAVER = 'com.nhn.android.naveraccount'
 MAP = 'com.nhn.android.nmap'
+MEET = 'com.google.android.apps.tachyon'
 SETTINGS = 'com.android.settings'
 UI_FILE = '/data/local/tmp/galaxy-reset-pc-naver.xml'
 REMOVE = {'계정 삭제', 'アカウントを削除', 'Remove account', '删除账号', '删除帐号',
@@ -58,12 +59,16 @@ def accounts(serial, runner):
 
 def clear_map_session(serial, runner):
     """System account removal alone does not invalidate NAVER Map's local session."""
-    packages = checked(serial, runner, ['shell', 'pm', 'list', 'packages', '--user', '0', MAP])
-    if 'package:' + MAP not in packages.splitlines():
+    clear_app_session(serial, runner, MAP, '네이버 지도')
+
+
+def clear_app_session(serial, runner, package, label):
+    packages = checked(serial, runner, ['shell', 'pm', 'list', 'packages', '--user', '0', package])
+    if 'package:' + package not in packages.splitlines():
         return
-    result = checked(serial, runner, ['shell', 'pm', 'clear', '--user', '0', MAP], timeout=120)
+    result = checked(serial, runner, ['shell', 'pm', 'clear', '--user', '0', package], timeout=120)
     if result.strip() != 'Success':
-        raise RuntimeError('네이버 지도 로그인·저장 데이터 초기화 실패')
+        raise RuntimeError(label + ' 로그인·저장 데이터 초기화 실패')
 
 
 def center(node):

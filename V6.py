@@ -579,7 +579,12 @@ def detect_series(serial):
 def clear_app_data(serial, package, desc):
     """특정 앱의 데이터를 초기화합니다."""
     logging.info('[%s] %s 데이터 초기화 중...', serial, desc)
-    run_command(['adb', '-s', serial, 'shell', 'pm', 'clear', package])
+    listed = _pc_required(serial, ['shell','pm','list','packages','--user','0',package])
+    if 'package:' + package not in listed.stdout.splitlines():
+        return
+    result = _pc_required(serial, ['shell','pm','clear','--user','0',package], timeout=120)
+    if result.stdout.strip() != 'Success':
+        raise RuntimeError(desc + ' 데이터 초기화 실패')
 
 
 # ============================================================
@@ -795,6 +800,14 @@ def remove_non_samsung_accounts(serial):
     accounts = get_device_accounts(serial)
     protected = sum(is_samsung_account(a['type']) for a in accounts)
     logging.info('[%s] 현재 계정 %d개 · 삼성 계정 보존 %d개', serial, len(accounts), protected)
+    if len(accounts) > protected:
+        if not push_dex_if_needed(serial, 'account_preparer.dex'):
+            raise RuntimeError('계정 인증 서비스 준비 헬퍼 없음')
+        prepared = run_command(['adb','-s',serial,'shell','CLASSPATH=/data/local/tmp/account_preparer.dex',
+                                'app_process','/system/bin','AccountPreparer','--prepare'],timeout=120,retries=0)
+        if prepared.returncode != 0 or 'SUCCESS:AUTHENTICATORS_READY' not in (prepared.stdout or ''):
+            raise RuntimeError('계정 인증 서비스 활성화·검증 실패')
+        time.sleep(1)
     if not push_dex_if_needed(serial, 'account_remover.dex'):
         raise RuntimeError('account_remover.dex 없음 · 계정 삭제를 완료하지 못했습니다.')
     # DEX output may contain customer identifiers. Verify inventory instead of logging it.
@@ -806,6 +819,7 @@ def remove_non_samsung_accounts(serial):
         logging.info('[%s] 네이버 계정 잔존 · 설정에서 기기 계정/인증 정보 제거 중...', serial)
         naver_account_cleanup.remove(serial, run_command)
     naver_account_cleanup.clear_map_session(serial, run_command)
+    naver_account_cleanup.clear_app_session(serial, run_command, naver_account_cleanup.MEET, 'Google Meet')
     verify_non_samsung_accounts_removed(serial)
     logging.info('[%s] 비삼성 계정 0개 확인 · 삼성 계정 보존 · 계정 삭제 완료', serial)
 
@@ -1666,6 +1680,8 @@ def ensure_essential_apps_installed(serial):
             raise RuntimeError('필수 앱 설치 후 조회 실패: ' + app['name'])
         if 'versionCode' in app and _package_version(serial, package) < app['versionCode']:
             raise RuntimeError('필수 앱 버전 확인 실패: ' + app['name'])
+    for app in apps:
+        _pc_required(serial, ['shell', 'pm', 'enable', '--user', '0', app['package']])
     verify_nmap_launch(serial)
     prepare_wireless_reset(serial)
 

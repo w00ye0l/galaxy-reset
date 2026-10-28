@@ -26,6 +26,8 @@ class FakeDevice:
         self.install_failure = False
         self.grant_failure = False
         self.nmap_alive = True
+        self.disabled = set()
+        self.reject_enable = None
 
     def run(self, command, **kwargs):
         self.calls.append(list(command))
@@ -60,13 +62,16 @@ class FakeDevice:
         elif a[:4] == ['shell', 'cmd', 'package', 'resolve-activity']:
             out = 'com.nhn.android.nmap/com.naver.map.LaunchActivity\n'
         elif a[:3] == ['shell', 'am', 'start'] and a[-1].startswith('com.nhn.android.nmap/'):
-            out = 'Status: ok\n'
+            code, out = (1,'Error: disabled') if V6.NMAP_PACKAGE in self.disabled else (0,'Status: ok\n')
         elif a[:3] == ['shell', 'pidof', V6.NMAP_PACKAGE]:
             code, out = (0, '5555\n') if self.nmap_alive else (1, '')
         elif a[:3] == ['shell', 'pidof', 'shizuku_server']:
             code, out = (0, '2345\n') if self.running else (1, '')
         elif len(a) == 2 and 'libshizuku.so' in a[1]:
             self.running = True
+        elif a[:3] == ['shell', 'pm', 'enable']:
+            if a[-1] == self.reject_enable:code,out=1,'Error: enable denied'
+            else:self.disabled.discard(a[-1]);out='Package '+a[-1]+' new state: enabled\n'
         elif a[:3] == ['shell', 'pm', 'grant'] and self.grant_failure:
             code, err = 1, 'SecurityException: permission denied'
         return subprocess.CompletedProcess(command, code, out, err)
@@ -91,6 +96,17 @@ class PhoneSetupTest(unittest.TestCase):
         self.assertEqual(files, ['galaxy-reset.apk', 'shizuku.apk'])
         self.assertTrue({V6.PHONE_APP_PACKAGE, V6.SHIZUKU_PACKAGE} <= self.fake.installed)
         self.assertFalse(any('uninstall' in c for c in self.fake.calls))
+
+    def test_all_installed_essential_apps_are_enabled_even_without_updates(self):
+        self.fake.disabled=set(self.fake.installed)
+        V6.ensure_essential_apps_installed('TEST')
+        self.assertFalse(self.fake.disabled)
+        self.assertFalse(any(c[3] in ['install','install-multiple'] for c in self.fake.calls))
+
+    def test_disabled_file_manager_activation_failure_blocks_completion(self):
+        self.fake.disabled={'com.alphainventor.filemanager'}
+        self.fake.reject_enable='com.alphainventor.filemanager'
+        self.assertRaises(RuntimeError,V6.ensure_essential_apps_installed,'TEST')
 
     def test_updates_old_reset_app_without_uninstalling(self):
         self.fake.versions[V6.PHONE_APP_PACKAGE] -= 1

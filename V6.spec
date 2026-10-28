@@ -23,6 +23,7 @@ a = Analysis(
         ('phone-app/SHIZUKU-LICENSE', 'phone-app'),
         ('locale_changer.dex', '.'),
         ('account_remover.dex', '.'),
+        ('account_preparer.dex', '.'),
         ('wallpaper_setter.dex', '.'),
         ('recent_tasks_cleaner.dex', '.'),
         ('content_cleaner.dex', '.'),

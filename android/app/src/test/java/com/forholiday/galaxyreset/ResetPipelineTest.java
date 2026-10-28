@@ -57,7 +57,7 @@ public class ResetPipelineTest {
         assertEquals("S24", ResetPipeline.series("unknown"));
         assertEquals(List.of("ja-JP", "ko-KR", "en-US"), ResetPipeline.locales("ja-JP"));
         assertEquals(List.of("zh-CN", "ko-KR", "en-US", "ja-JP"), ResetPipeline.locales("zh-CN"));
-        assertEquals(1, ResetPipeline.nonSamsungAccounts("Account {name=private, type=com.google}\nAccount {name=s, type=com.osp.app.signin}\nAccount {name=s, type=com.samsung.android.mobileservice}"));
+        assertEquals(1, ResetPipeline.nonSamsungAccounts("Accounts: 3\nAccount {name=private, type=com.google}\nAccount {name=s, type=com.osp.app.signin}\nAccount {name=s, type=com.samsung.android.mobileservice}"));
         assertEquals(19, ResetPipeline.LABELS.length);
     }
     @Test public void uncertainEsimRequiresManualHandling() throws Exception {
@@ -89,8 +89,8 @@ public class ResetPipelineTest {
         assertEquals(Set.of("com.widget"), new ResetPipeline(fake, p -> {}, Set.of()).queryWidgetProviders());
     }
     @Test public void androidCompatibleAccountParserHandlesIndentedEntries() {
-        assertEquals(1, ResetPipeline.nonSamsungAccounts("  Account {name=contains}brace, type=com.google}\n  Account {name=s, type=com.samsung}\n"));
-        assertEquals(0, ResetPipeline.nonSamsungAccounts("Account {malformed}\nSome unrelated output\n"));
+        assertEquals(1, ResetPipeline.nonSamsungAccounts("Accounts: 2\n  Account {name=contains}brace, type=com.google}\n  Account {name=s, type=com.samsung}\n"));
+        assertThrows(IllegalArgumentException.class,()->ResetPipeline.nonSamsungAccounts("Account {malformed}\nSome unrelated output\n"));
     }
     @Test public void missingOptionalBrowserDoesNotFailOrInstall() throws Exception {
         Fake fake = new Fake() {

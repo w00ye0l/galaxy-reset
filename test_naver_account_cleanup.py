@@ -44,6 +44,8 @@ class Device:
                 out = self.broken_inventory
         elif args == ['shell', 'am', 'get-current-user']:
             out = self.user + '\n'
+        elif 'AccountPreparer' in args:
+            out = 'SUCCESS:AUTHENTICATORS_READY\n'
         elif args == ['shell', 'pm', 'list', 'packages', '--user', '0', cleanup.MAP]:
             out = 'package:' + cleanup.MAP + '\n' if self.map_installed else ''
         elif args == ['shell', 'pm', 'clear', '--user', '0', cleanup.MAP]:
@@ -102,6 +104,23 @@ class AccountCleanupTest(unittest.TestCase):
         self.device.naver = 0; self.device.clear_failure = True
         self.assertRaises(RuntimeError, V6.remove_non_samsung_accounts, 'TEST')
         self.assertTrue(self.device.session)
+
+    def test_disabled_meet_is_enabled_before_removal_and_session_is_cleared(self):
+        fake = MeetDevice()
+        with patch.object(V6, 'run_command', side_effect=fake.run):
+            V6.remove_non_samsung_accounts('TEST')
+        self.assertTrue(fake.enabled)
+        self.assertEqual(0, fake.meet_count)
+        self.assertFalse(fake.meet_session)
+        enable = next(i for i,c in enumerate(fake.calls) if 'AccountPreparer' in c)
+        dex = next(i for i,c in enumerate(fake.calls) if 'AccountRemover' in c)
+        self.assertLess(enable, dex)
+
+    def test_meet_enable_or_data_clear_failure_cannot_pass(self):
+        for mode in ['enable', 'clear']:
+            fake = MeetDevice(); fake.failure = mode
+            with patch.object(V6, 'run_command', side_effect=fake.run):
+                self.assertRaises(RuntimeError, V6.remove_non_samsung_accounts, 'TEST')
 
     def test_missing_map_is_not_installed_just_to_clear_session(self):
         self.device.naver = 0; self.device.map_installed = False
@@ -167,6 +186,60 @@ class AccountCleanupTest(unittest.TestCase):
         self.assertTrue(all(k['retries'] == 0 for c, k in seen if c[3:6] == ['shell', 'input', 'tap']))
         self.assertTrue(any(k['retries'] == 1 for c, k in seen if c[-2:] == ['dumpsys', 'account']))
         self.assertTrue(any(c[3:6] == ['shell', 'rm', '-f'] for c, _ in seen))
+
+    def test_disabled_app_data_clear_is_verified_without_enabling_app(self):
+        for pkg in ['com.android.chrome','com.google.android.gm','com.google.android.youtube',
+                    'com.google.android.apps.maps','com.nhn.android.nmap','com.google.android.apps.tachyon',
+                    'com.sec.android.gallery3d','com.sec.android.app.camera','com.samsung.android.messaging',
+                    'com.android.providers.contacts','com.android.providers.telephony']:
+            calls=[]
+            def run(cmd,**kwargs):
+                calls.append(cmd)
+                out='package:'+pkg+'\n' if 'list' in cmd else 'Success\n'
+                return subprocess.CompletedProcess(cmd,0,out,'')
+            with self.subTest(pkg=pkg),patch.object(V6,'run_command',side_effect=run):
+                V6.clear_app_data('TEST',pkg,'test')
+                self.assertTrue(any('clear' in c for c in calls))
+                self.assertFalse(any('enable' in c for c in calls))
+
+    def test_disabled_data_clear_failure_cannot_silently_pass(self):
+        def run(cmd,**kwargs):
+            return subprocess.CompletedProcess(cmd,0,'package:com.example.disabled\n' if 'list' in cmd else 'Failed','')
+        with patch.object(V6,'run_command',side_effect=run):
+            self.assertRaises(RuntimeError,V6.clear_app_data,'TEST','com.example.disabled','test')
+
+
+class MeetDevice(Device):
+    def __init__(self):
+        super().__init__()
+        self.naver = 0
+        self.meet_count = 1
+        self.enabled = False
+        self.meet_session = True
+        self.failure = None
+
+    def run(self, command, **kwargs):
+        args = command[3:]
+        if args == ['shell', 'dumpsys', 'account']:
+            self.calls.append(command)
+            out = ('Accounts: %d\nAccount {name=private-samsung, type=com.osp.app.signin}\n' % (1+self.meet_count)
+                   + 'Account {name=Meet, type=com.google.android.apps.tachyon}\n' * self.meet_count)
+            return subprocess.CompletedProcess(command, 0, out, '')
+        if 'AccountPreparer' in args:
+            self.enabled = self.failure != 'enable'
+            self.calls.append(command)
+            return subprocess.CompletedProcess(command,1 if not self.enabled else 0,'SUCCESS:AUTHENTICATORS_READY' if self.enabled else 'FAIL:PREPARATION','')
+        if args[:5] == ['shell','pm','list','packages','--user'] and args[-1] == cleanup.MEET:
+            self.calls.append(command)
+            out = 'package:'+cleanup.MEET+'\n' if '-e' not in args or self.enabled else ''
+            return subprocess.CompletedProcess(command, 0, out, '')
+        if 'AccountRemover' in args and self.enabled:
+            self.meet_count = 0
+        if args == ['shell','pm','clear','--user','0',cleanup.MEET]:
+            self.calls.append(command)
+            if self.failure != 'clear': self.meet_session = False
+            return subprocess.CompletedProcess(command,0,'Failed' if self.failure == 'clear' else 'Success\n','')
+        return super().run(command, **kwargs)
 
 
 if __name__ == '__main__':
