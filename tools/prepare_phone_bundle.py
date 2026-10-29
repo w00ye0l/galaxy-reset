@@ -34,6 +34,9 @@ def validate_apk(path):
 
 
 def check():
+    filemanager = json.loads((ROOT / 'filemanager-bundle.json').read_text(encoding='utf-8'))
+    if sha256(ROOT / filemanager['file']) != filemanager['sha256']:
+        raise ValueError('File Manager APK checksum mismatch')
     nmap = json.loads((ROOT / 'nmap-bundle.json').read_text(encoding='utf-8'))
     for item in nmap['apks']:
         path = ROOT / item['file']
@@ -54,6 +57,8 @@ def check():
     if reset['versionCode'] != version:
         raise ValueError('Rebuild Android and rerun tools/prepare_phone_bundle.py before building the EXE')
     with zipfile.ZipFile(DEST / reset['file']) as archive:
+        if hashlib.sha256(archive.read('assets/filemanager.apk')).hexdigest() != filemanager['sha256']:
+            raise ValueError('Android APK contains an old File Manager APK; rebuild Android and refresh phone-app')
         embedded_nmap = json.loads(archive.read('assets/nmap-bundle.json'))
         if embedded_nmap != nmap:
             raise ValueError('Android APK contains an old Naver Map bundle; rebuild Android and refresh phone-app first')

@@ -15,7 +15,7 @@ class FakeDevice:
     def __init__(self):
         self.installed = {'com.nhn.android.nmap', 'com.alphainventor.filemanager',
                           V6.PHONE_APP_PACKAGE, V6.SHIZUKU_PACKAGE}
-        self.versions = {V6.PHONE_APP_PACKAGE: 7, V6.SHIZUKU_PACKAGE: 1086, V6.NMAP_PACKAGE: V6.load_nmap_bundle()['versionCode']}
+        self.versions = {V6.PHONE_APP_PACKAGE: 7, V6.SHIZUKU_PACKAGE: 1086, V6.NMAP_PACKAGE: V6.load_nmap_bundle()['versionCode'], V6.FILEMANAGER_PACKAGE: V6.load_filemanager_bundle()['versionCode']}
         self.calls = []
         self.sdk = '37'
         self.user = '0'
@@ -46,7 +46,8 @@ class FakeDevice:
                 pkg = V6.NMAP_PACKAGE if a[0] == 'install-multiple' else {'galaxy-reset.apk': V6.PHONE_APP_PACKAGE, 'shizuku.apk': V6.SHIZUKU_PACKAGE,
                        'nmap.apk': 'com.nhn.android.nmap', 'filemanager.apk': 'com.alphainventor.filemanager'}[Path(a[-1]).name]
                 self.installed.add(pkg)
-                if pkg == V6.NMAP_PACKAGE: self.versions[pkg] = V6.load_nmap_bundle()['versionCode']
+                if pkg == V6.FILEMANAGER_PACKAGE: self.versions[pkg] = V6.load_filemanager_bundle()['versionCode']
+                elif pkg == V6.NMAP_PACKAGE: self.versions[pkg] = V6.load_nmap_bundle()['versionCode']
                 elif pkg in (V6.PHONE_APP_PACKAGE, V6.SHIZUKU_PACKAGE): self.versions[pkg] = V6.load_phone_bundle()[pkg]['versionCode']
                 out = 'Success\n'
         elif a[:3] == ['shell', 'pm', 'path']:
@@ -109,7 +110,19 @@ class PhoneSetupTest(unittest.TestCase):
     def test_disabled_file_manager_activation_failure_blocks_completion(self):
         self.fake.disabled={'com.alphainventor.filemanager'}
         self.fake.reject_enable='com.alphainventor.filemanager'
-        self.assertRaises(RuntimeError,V6.ensure_essential_apps_installed,'TEST')
+        V6.ensure_essential_apps_installed('TEST')
+        self.assertTrue(any('딥 슬립' in note for note in V6.POST_RUN_NOTICES))
+
+    def test_filemanager_updates_only_when_older_and_never_uninstalls(self):
+        self.fake.versions[V6.FILEMANAGER_PACKAGE] -= 1
+        V6.ensure_essential_apps_installed('TEST')
+        self.assertTrue(any(c[3] == 'install' and Path(c[-1]).name == 'filemanager.apk' for c in self.fake.calls))
+        self.assertFalse(any('uninstall' in c for c in self.fake.calls))
+
+    def test_newer_filemanager_is_not_downgraded(self):
+        self.fake.versions[V6.FILEMANAGER_PACKAGE] += 100
+        V6.ensure_essential_apps_installed('TEST')
+        self.assertFalse(any(c[3] == 'install' and Path(c[-1]).name == 'filemanager.apk' for c in self.fake.calls))
 
     def test_updates_old_reset_app_without_uninstalling(self):
         self.fake.versions[V6.PHONE_APP_PACKAGE] -= 1
@@ -251,11 +264,61 @@ class PhoneSetupTest(unittest.TestCase):
             wait.assert_not_called()
 
     def test_prepare_only_mode_never_enters_reset_pipeline(self):
-        with patch('sys.argv', ['V6.py', '--prepare-phone-only', '--serial', 'TEST']), patch.object(V6, 'load_phone_bundle'), patch.object(V6, 'ensure_essential_apps_installed') as install, patch.object(V6, 'build_pipeline') as pipeline:
+        with patch('sys.argv', ['V6.py', '--prepare-phone-only', '--serial', 'TEST']), patch.object(V6, 'load_phone_bundle'), patch.object(V6, 'ensure_essential_apps_installed') as install, patch.object(V6, 'build_pipeline') as pipeline, patch.object(V6, 'prepare_wireless_reset') as wireless:
             V6.prepare_phone_only_main()
             install.assert_called_once_with('TEST')
             pipeline.assert_not_called()
         self.assertEqual(V6.PIPELINE_STEP_COUNT, 19)
+
+
+class PipelineResilienceTest(unittest.TestCase):
+    def test_order_deletes_apps_first_and_verifies_before_recent_tasks(self):
+        names = [name for name, _ in V6.build_pipeline('TEST', 'ko-KR', 'S25.png', 'S25')]
+        self.assertEqual(len(names), 19)
+        self.assertEqual(names[:3], ['사용자 설치 앱 삭제', '계정 삭제', '유지 앱 데이터 초기화'])
+        self.assertLess(names.index('필수 앱 설치·버전 확인'), names.index('런처 초기화'))
+        self.assertEqual(names[-2:], ['최종 검증', '최근 앱 목록 제거'])
+        self.assertFalse(any('Galaxy Store' in name for name in names))
+
+    def run_pipeline(self, steps):
+        with patch.object(V6, 'PROGRESS', None), patch.object(V6, 'run_command', return_value=subprocess.CompletedProcess([], 0, '0', '')), patch.object(V6, 'configure_screen_timeout'), patch.object(V6, 'get_device_model', return_value='SM-S938N'), patch.object(V6, 'build_pipeline', return_value=steps), patch.object(V6, 'verify_non_samsung_accounts_removed'):
+            V6.process_device('TEST', 'ko-KR')
+
+    def test_ordinary_failure_does_not_skip_remaining_cleanup(self):
+        completed = []
+        def failed(): raise RuntimeError('data clear failed')
+        with self.assertRaisesRegex(RuntimeError, 'data clear failed'):
+            self.run_pipeline([('앱 데이터 정리', failed), ('나머지 정리', lambda: completed.append(True))])
+        self.assertEqual(completed, [True])
+
+    def test_restore_failure_blocks_further_cleanup(self):
+        completed = []
+        def failed(): raise V6.RestorationError('restore failed')
+        with self.assertRaisesRegex(RuntimeError, 'restore failed'):
+            self.run_pipeline([('앱 복구', failed), ('나머지 정리', lambda: completed.append(True))])
+        self.assertEqual(completed, [])
+
+    def test_wireless_failure_is_separate_and_recent_tasks_still_run(self):
+        completed = []; V6.POST_RUN_NOTICES.clear()
+        with patch.object(V6, 'prepare_wireless_reset', side_effect=RuntimeError('pairing failed')):
+            self.run_pipeline([('최근 앱 목록 제거', lambda: completed.append(True))])
+        self.assertEqual(completed, [True])
+        self.assertTrue(any('초기화 결과와 별도' in n for n in V6.POST_RUN_NOTICES))
+
+
+class CommandFailureReportingTest(unittest.TestCase):
+    def test_security_error_is_not_replaced_with_timeout_after_retries(self):
+        result = subprocess.CompletedProcess([], 255, '', 'SecurityException: Shell cannot change component state')
+        with patch.object(V6, '_exec', return_value=result) as execute, patch.object(V6.time, 'sleep'):
+            actual = V6.run_command(['adb', '-s', 'TEST', 'shell', 'pm', 'enable', 'example.app'], check=True)
+        self.assertIs(actual, result)
+        self.assertEqual(execute.call_count, 2)
+
+    def test_real_timeout_is_still_reported_as_timeout(self):
+        with patch.object(V6, '_exec', side_effect=subprocess.TimeoutExpired('adb', 15)), patch.object(V6, 'device_alive', return_value=True):
+            actual = V6.run_command(['adb', '-s', 'TEST', 'shell', 'true'], timeout=15, retries=0)
+        self.assertEqual(actual.returncode, -1)
+        self.assertEqual(actual.stderr, 'TIMEOUT')
 
 
 if __name__ == '__main__':

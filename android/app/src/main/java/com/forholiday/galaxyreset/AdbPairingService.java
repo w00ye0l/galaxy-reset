@@ -10,6 +10,7 @@ public class AdbPairingService extends Service {
     static final String START="local_adb.START", SUBMIT="local_adb.SUBMIT", CODE="pairing_code";
     private static final String CHANNEL="wireless_pairing";
     private static final int NOTIFICATION=31;
+    static final int COMPLETION_NOTIFICATION=32; // Remove completion notices left by older versions.
     private final Handler main=new Handler(Looper.getMainLooper());
     private AdbMdns discovery;
     private volatile int port=-1;
@@ -47,9 +48,9 @@ public class AdbPairingService extends Service {
             WirelessStarter.INSTANCE.pair(this,port,code,error->{
                 submitting=false;
                 if(error==null){
-                    Notification done=new Notification.Builder(this,CHANNEL).setSmallIcon(R.drawable.ic_reset).setContentTitle("자동 시작 설정 완료")
-                            .setContentText("초기화 앱으로 돌아가면 Shizuku 연결을 확인합니다.").setContentIntent(openApp()).setAutoCancel(true).build();
-                    stopForeground(STOP_FOREGROUND_REMOVE);getSystemService(NotificationManager.class).notify(32,done);stopSelf();
+                    stopForeground(STOP_FOREGROUND_REMOVE);
+                    getSystemService(NotificationManager.class).cancel(COMPLETION_NOTIFICATION);
+                    stopSelf();
                 }else notifyState(error,true);
             });
             return START_NOT_STICKY;

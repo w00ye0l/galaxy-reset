@@ -17,6 +17,7 @@ a = Analysis(
         ('S26.png', '.'),
         ('nmap-bundle.json', '.'),
         ('filemanager.apk', '.'),
+        ('filemanager-bundle.json', '.'),
         ('phone-app/galaxy-reset.apk', 'phone-app'),
         ('phone-app/shizuku.apk', 'phone-app'),
         ('phone-app/bundle.json', 'phone-app'),

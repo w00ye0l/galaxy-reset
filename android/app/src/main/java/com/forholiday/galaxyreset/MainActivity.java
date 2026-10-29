@@ -43,7 +43,9 @@ public class MainActivity extends Activity {
     private final Runnable tick=new Runnable(){public void run(){if(!demo()){maybeStartWireless();ShellConnection.INSTANCE.connect(false);}refresh();handler.postDelayed(this,1000);}};
 
     @Override public void onCreate(Bundle saved) {
-        super.onCreate(saved); state=new RunState(this); state.detectInterruption();
+        super.onCreate(saved); state=new RunState(this); state.migratePipeline(); state.detectInterruption();
+        if(!running())getSystemService(NotificationManager.class).cancel(ResetService.NOTIFICATION);
+        getSystemService(NotificationManager.class).cancel(AdbPairingService.COMPLETION_NOTIFICATION);
         if(Build.VERSION.SDK_INT>=33)getOnBackInvokedDispatcher().registerOnBackInvokedCallback(android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT,this::handleBack);
         selected=saved==null?state.locale():saved.getString("selected",state.locale());
         if(saved!=null){override=saved.getInt("override",-1);}
@@ -184,6 +186,7 @@ public class MainActivity extends Activity {
         resultRow(results,"언어",languageText(demo()?selected:state.locale()),false);divider(results);
         resultRow(results,"필수 앱",demo()||!summary.contains(": 없음")?"네이버 지도 · File Manager · 갤럭시 초기화":"필수 앱 설치 결과 확인 필요",false);divider(results);
         resultRow(results,"배경화면",ResetPipeline.series(Build.MODEL)+" 기본 배경 · 단계 처리 완료",true);body.addView(results);space(body,16);
+        if(summary.contains("주의:")){text(body,summary.substring(summary.indexOf("주의:")),12,AMBER,false);space(body,12);}
         action(body,"19단계 결과 상세 보기",UiIcon.INFO,WHITE,INK,()->{if(demo())preview=3;else override=3;render();});
         LinearLayout actions=row();
         Button home=button("시작 화면으로",UiIcon.HOME,WHITE,INK,()->{goHome();render();});
@@ -202,7 +205,7 @@ public class MainActivity extends Activity {
         }
         action(footer,"전체 단계 기록 보기",UiIcon.INFO,WHITE,INK,()->{if(demo())preview=3;else override=3;render();});space(footer,8);action(footer,"시작 화면으로",UiIcon.HOME,WHITE,INK,()->{if(demo())preview=1;else goHome();render();});
     }
-    void issueCard(int index,String status,String detail){LinearLayout issue=column();card(issue,WHITE);text(issue,status+" · "+ResetPipeline.LABELS[index],16,INK,true);space(issue,10);text(issue,detail.isEmpty()?"단계 기록을 눌러 상세 결과를 확인하세요.":detail,13,MUTED,false);space(issue,14);Button retry=action(issue,"이 단계 다시 시도",UiIcon.REFRESH,WHITE,INK,()->{if(demo()){preview=3;render();}else confirmRun(index,true,false);});retry.setEnabled(demo()||ShellConnection.INSTANCE.ready());if(index==2&&status.equals("수동 확인")){space(issue,8);action(issue,"SIM 관리자 열기",UiIcon.PHONE,WHITE,INK,()->{if(demo())previewNotice("SIM 관리자");else open(new Intent("android.telephony.euicc.action.MANAGE_EMBEDDED_SUBSCRIPTIONS"));});}body.addView(issue);}
+    void issueCard(int index,String status,String detail){LinearLayout issue=column();card(issue,WHITE);text(issue,status+" · "+ResetPipeline.LABELS[index],16,INK,true);space(issue,10);text(issue,detail.isEmpty()?"단계 기록을 눌러 상세 결과를 확인하세요.":detail,13,MUTED,false);space(issue,14);Button retry=action(issue,"이 단계 다시 시도",UiIcon.REFRESH,WHITE,INK,()->{if(demo()){preview=3;render();}else confirmRun(index,true,false);});retry.setEnabled(demo()||ShellConnection.INSTANCE.ready());if(index==3&&status.equals("수동 확인")){space(issue,8);action(issue,"SIM 관리자 열기",UiIcon.PHONE,WHITE,INK,()->{if(demo())previewNotice("SIM 관리자");else open(new Intent("android.telephony.euicc.action.MANAGE_EMBEDDED_SUBSCRIPTIONS"));});}body.addView(issue);}
     void showStep(int index){LinearLayout content=column();card(content,WHITE);text(content,String.format(Locale.ROOT,"%02d",index+1)+" · "+ResetPipeline.LABELS[index],20,INK,true);space(content,10);text(content,"상태: "+displayedStatus(index)+(demo()?" (미리보기)":""),13,TEAL,true);space(content,18);text(content,"작업 내용",12,MUTED,true);space(content,6);text(content,StepDetails.DESCRIPTIONS[index],14,INK,false);space(content,16);text(content,"마지막 결과",12,MUTED,true);space(content,6);String detail=demo()?"화면 예시입니다. 실제 작업은 실행되지 않습니다.":state.detail(index);text(content,detail.isEmpty()?state.status(index).equals("완료")?"단계가 완료됐으며 기록된 오류가 없습니다.":"아직 상세 결과가 기록되지 않았습니다.":detail,13,MUTED,false);space(content,20);action(content,"닫기",UiIcon.CLOSE,TEAL,WHITE,this::dismissDialog);showDialog(content);}
     void showDialog(LinearLayout content){dismissDialog();activeDialog=new Dialog(this);ScrollView scroll=new ScrollView(this);scroll.addView(content);activeDialog.setContentView(scroll);Window window=activeDialog.getWindow();if(window!=null){window.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));window.setLayout(getResources().getDisplayMetrics().widthPixels-dp(40),-2);}activeDialog.show();if(window!=null)window.setLayout(getResources().getDisplayMetrics().widthPixels-dp(40),-2);}
     void dismissDialog(){if(activeDialog!=null){activeDialog.dismiss();activeDialog=null;}}

@@ -11,10 +11,7 @@ final class ResetPipeline {
     static final String SHIZUKU = "moe.shizuku.privileged.api";
     static final String TMP = "/data/local/tmp/galaxy-reset/";
     static final String LAUNCHER = "com.sec.android.app.launcher/.activities.LauncherActivity";
-    static final String[] LABELS = {"언어 설정", "계정 삭제", "e-SIM 프로필 삭제", "Google 앱 기록 삭제", "사용자 설치 앱 삭제",
-        "내부 저장소 초기화", "로그·캐시 정리", "갤러리 휴지통 정리", "미디어 스토어 갱신", "썸네일 잔여물 제거",
-        "카메라 설정 초기화", "내비게이션 바 초기화", "글자 크기 초기화", "홈 독 앱 배치", "런처 초기화",
-        "Galaxy Store 복원 차단", "배경화면 적용", "필수 앱 설치", "최근 앱 목록 제거"};
+    static final String[] LABELS = {"사용자 설치 앱 삭제", "계정 삭제", "유지 앱 데이터 초기화", "e-SIM 프로필 삭제", "내부 저장소 초기화", "로그·캐시 정리", "갤러리 휴지통 정리", "미디어 스토어 갱신", "썸네일 잔여물 제거", "언어 설정", "카메라 설정 초기화", "내비게이션 바 초기화", "글자 크기 초기화", "필수 앱 설치·버전 확인", "홈 독 앱 배치", "런처 초기화", "배경화면 적용", "최종 검증", "최근 앱 목록 제거"};
     static final Set<String> KEEP = Set.of(SELF, SHIZUKU, KNOX_CONFIGURE, "com.sec.android.app.popupcalculator", "com.nhn.android.nmap", "com.alphainventor.filemanager", "com.sec.android.app.sbrowser");
     static final String[] LIVE = {"com.samsung.android.wallpaper.live", "com.samsung.android.dynamiclock", "com.samsung.android.app.dressroom"};
     static final String[] FOLDERS = {"DCIM", "Pictures", "Music", "Movies", "Download"};
@@ -34,6 +31,18 @@ final class ResetPipeline {
     final List<String> warnings = new ArrayList<>();
     final List<String> notes = new ArrayList<>();
     boolean manual;
+    final Set<String> cleared = new HashSet<>();
+    final Set<String> failedClears = new HashSet<>();
+    final List<String> advisories = new ArrayList<>();
+    int finalAccountCount = -1;
+    boolean finalUserAppsClear;
+    String summaryText = "";
+    interface Work { void run() throws Exception; }
+    void attempt(String label, Work work) throws Exception {
+        try { work.run(); }
+        catch (ConnectionLost e) { throw e; }
+        catch (Exception e) { warnings.add(label + " · " + (e.getMessage() == null ? "실행 실패" : e.getMessage())); }
+    }
     ResetPipeline(Bridge bridge, Recovery recovery, Set<String> pending) {
         this.bridge = bridge; this.recovery = recovery; this.pending = new LinkedHashSet<>(pending);
     }
@@ -112,10 +121,15 @@ final class ResetPipeline {
     }
     void commands(String... commands) throws Exception { for (String c : commands) checked(c, 120); }
     void clear(String... packages) throws Exception {
-        for (String pkg : packages) if (installed(pkg)) {
+        for (String pkg : packages) attempt("앱 데이터 초기화 실패: " + pkg, () -> {
+            if (cleared.contains(pkg)) return;
+            failedClears.add(pkg);
+            if (!installed(pkg)) { failedClears.remove(pkg); return; }
             Result result = raw("pm clear --user 0 " + quote(pkg), 120);
-            if(result.code!=0||result.truncated||!result.output.trim().equals("Success"))warnings.add("앱 데이터 초기화 실패: "+pkg);
-        }
+            if (result.code != 0 || result.truncated || !result.output.trim().equals("Success"))
+                { failedClears.add(pkg); throw new IOException("삭제 결과 확인 필요"); }
+            cleared.add(pkg);failedClears.remove(pkg);
+        });
     }
     Result dex(String file, String main, String... args) throws Exception {
         bridge.copy(file, TMP + file);
@@ -190,19 +204,29 @@ final class ResetPipeline {
         if (lost != null) throw lost;
         if (!pending.isEmpty()) throw new IOException("앱 재활성화 실패 · 다시 연결 후 재시도 필요");
     }
+    String configureScreenTimeout() throws Exception {
+        try {
+            required("settings --user 0 put system screen_off_timeout 600000");
+            if (!required("settings --user 0 get system screen_off_timeout").output.trim().equals("600000"))
+                throw new IOException("설정값 불일치");
+            return "화면 꺼짐 시간: 10분 설정 확인";
+        } catch (ConnectionLost e) { throw e; }
+        catch (Exception e) { return "화면 꺼짐 시간: 10분 적용 확인 필요 · 초기화는 계속 진행"; }
+    }
     void step(int index, String locale, String model) throws Exception {
         warnings.clear(); notes.clear(); manual = false;
         switch (index) {
-            case 0 -> success(dex("locale_changer.dex", "LocaleChanger", locales(locale).toArray(new String[0])), "SUCCESS", "언어 변경 확인 필요");
+            case 9 -> success(dex("locale_changer.dex", "LocaleChanger", locales(locale).toArray(new String[0])), "SUCCESS", "언어 변경 확인 필요");
             case 1 -> {
                 String before = required("dumpsys account").output;
-                String meet = "com.google.android.apps.tachyon";
+                if (nonSamsungAccounts(before) == 0) { clearAccountSessions(); notes.add("비삼성 계정 없음 · 제거 생략"); break; }
                 if (nonSamsungAccounts(before)>0) {
-                    Result prepared=dex("account_preparer.dex","AccountPreparer","--prepare");
-                    if(prepared.code!=0||prepared.truncated||!prepared.output.contains("SUCCESS:AUTHENTICATORS_READY"))
-                        throw new IOException("계정 인증 서비스 활성화·검증 실패");
-                    pause(1000);
-                    notes.add("비삼성 계정 인증 서비스 활성화·검증 후 제거 시도");
+                    attempt("계정 인증 서비스 준비 실패 · 제거 계속", () -> {
+                        Result prepared = dex("account_preparer.dex", "AccountPreparer", "--prepare");
+                        if (prepared.code != 0 || prepared.truncated || !prepared.output.contains("SUCCESS:AUTHENTICATORS_READY"))
+                            throw new IOException("일부 인증 서비스 활성화 확인 필요");
+                        pause(1000);
+                    });
                 }
                 try { dex("account_remover.dex", "AccountRemover"); }
                 catch (ConnectionLost e) { throw e; }
@@ -214,18 +238,7 @@ final class ResetPipeline {
                     } catch (ConnectionLost e) { throw e; }
                     catch (Exception e) { warnings.add("네이버 계정 제거 확인 필요 · 화면을 켜고 잠금 해제 후 재시도하세요."); }
                 }
-                if (installed("com.nhn.android.nmap")) {
-                    Result cleared = raw("pm clear --user 0 com.nhn.android.nmap", 120);
-                    if (cleared.code != 0 || cleared.truncated || !cleared.output.trim().equals("Success"))
-                        throw new IOException("네이버 지도 로그인·저장 데이터 초기화 실패");
-                    notes.add("네이버 지도 로그인 세션·저장 데이터 초기화 확인");
-                }
-                if (installed(meet)) {
-                    Result cleared = raw("pm clear --user 0 " + meet, 120);
-                    if (cleared.code != 0 || cleared.truncated || !cleared.output.trim().equals("Success"))
-                        throw new IOException("Google Meet 로그인·저장 데이터 초기화 실패");
-                    notes.add("Google Meet 로그인 세션·저장 데이터 초기화 확인");
-                }
+                clearAccountSessions();
                 int remaining = nonSamsungAccounts(required("dumpsys account").output);
                 if (remaining == 0) {
                     // The final inventory, including NAVER, proves successful fallback removal.
@@ -234,7 +247,7 @@ final class ResetPipeline {
                     manual = true; warnings.add("비삼성 계정 삭제 실패 · 남은 계정 " + remaining + "개, 설정에서 수동 확인 필요");
                 }
             }
-            case 2 -> {
+            case 3 -> {
                 Result result = dex("esim_manager.dex", "EsimManager", "delete-all");
                 boolean done = result.output.contains("SUCCESS:NO_ESIM") || result.output.contains("SUCCESS:ALL_ESIM_DELETED");
                 if (!done || result.output.contains("FAIL:ESIM_DELETE") || result.output.contains("FAIL:ALL_ESIM_DELETE_FAILED")) {
@@ -242,19 +255,20 @@ final class ResetPipeline {
                     commands("am start -a android.telephony.euicc.action.MANAGE_EMBEDDED_SUBSCRIPTIONS");
                 }
             }
-            case 3 -> clear("com.google.android.googlequicksearchbox", "com.android.chrome", "com.google.android.youtube", "com.google.android.gm",
-                "com.google.android.apps.maps", "com.google.android.apps.docs", "com.google.android.calendar", "com.google.android.apps.photos", "com.sec.android.app.sbrowser");
-            case 4 -> {
+            case 2 -> clear("com.google.android.googlequicksearchbox", "com.android.chrome", "com.google.android.youtube", "com.google.android.gm",
+                "com.google.android.apps.maps", "com.google.android.apps.docs", "com.google.android.calendar", "com.google.android.apps.photos", "com.sec.android.app.sbrowser", "com.nhn.android.nmap",
+                "com.alphainventor.filemanager", "com.sec.android.app.popupcalculator", "com.google.android.apps.tachyon");
+            case 0 -> {
                 Result r = required("pm list packages --user 0 -3");
                 for (String line : r.output.split("\\R")) {
                     if (!line.startsWith("package:")) continue;
                     String pkg = line.substring(8).trim();
                     if (!pkg.matches("[A-Za-z0-9_.]+")) throw new IOException("잘못된 패키지 목록");
                     if(pkg.equals(KNOX_CONFIGURE))notes.add("Knox Configure 관리 앱 보존 · 관리자 등록 유지");
-                    if (!KEEP.contains(pkg)) success(checked("pm uninstall --user 0 " + quote(pkg), 120), "Success", "앱 삭제 실패: " + pkg);
+                    if (!KEEP.contains(pkg)) attempt("앱 삭제 실패: " + pkg, () -> success(checked("pm uninstall --user 0 " + quote(pkg), 120), "Success", "앱 삭제 실패: " + pkg));
                 }
             }
-            case 5 -> {
+            case 4 -> {
                 checked("rm -rf /storage/emulated/0/*", 300);
                 checked("rm -rf /storage/emulated/0/.[!.]* /storage/emulated/0/..?*", 300);
                 // Scoped-storage restrictions can leave entries even when rm's reporting varies.
@@ -262,7 +276,7 @@ final class ResetPipeline {
                 int remaining = remainingUserFiles(r.output);
                 if (remaining > 0) { manual = true; warnings.add("내부 저장소 잔여 파일 " + remaining + "개 · 수동 확인 필요"); }
             }
-            case 6 -> {
+            case 5 -> {
                 Result result;
                 try { result = dex("content_cleaner.dex", "ContentCleaner"); }
                 catch (ConnectionLost e) { throw e; }
@@ -273,10 +287,10 @@ final class ResetPipeline {
                 if (output.contains("PERMISSION_DENIED:SMS") || output.contains("FALLBACK:SMS")) clear("com.android.providers.telephony");
                 if (output.contains("FAIL:") || (!output.contains("SUCCESS:") && !output.contains("PARTIAL:") && !output.contains("PERMISSION_DENIED:") && !output.contains("FALLBACK:"))) warnings.add("통화/SMS/주소록 삭제 결과 확인 필요");
                 clear("com.samsung.android.messaging", "com.samsung.android.providers.contacts", "com.samsung.android.app.contacts",
-                    "com.samsung.android.dsms", "com.android.mms.service", "com.sec.android.gallery3d", "com.nhn.android.nmap", "com.sec.android.themestore",
+                    "com.samsung.android.dsms", "com.android.mms.service", "com.sec.android.gallery3d", "com.sec.android.themestore",
                     "com.sec.android.app.vepreload", "com.samsung.android.app.clipboardedge", "com.samsung.android.honeyboard");
             }
-            case 7 -> {
+            case 6 -> {
                 commands("am force-stop com.sec.android.gallery3d", "am force-stop com.sec.android.app.myfiles");
                 List<String> paths = new ArrayList<>(List.of(
                     "/sdcard/Android/data/com.sec.android.gallery3d/files/Trash", "/sdcard/Android/data/com.sec.android.gallery3d/files/.Trash",
@@ -285,7 +299,6 @@ final class ResetPipeline {
                     "/storage/emulated/0/Android/.Trash", "/sdcard/.Trash", "/sdcard/.Trash-0", "/sdcard/Recycle",
                     "/sdcard/Android/data/com.sec.android.gallery3d/files/.thumbnails", "/sdcard/Android/data/com.android.chrome/cache",
                     "/sdcard/Android/data/dji.mimo/cache", "/sdcard/Android/data/com.nhn.android.nmap/cache"));
-                for (String folder : FOLDERS) paths.add("/sdcard/" + folder + "/.thumbnails");
                 for (String path : paths) checked("rm -rf " + quote(path), 120);
                 clear("com.sec.android.gallery3d", "com.sec.android.app.myfiles", "com.samsung.android.providers.media",
                     "com.samsung.android.providers.trash", "com.android.providers.media", "com.google.android.providers.media.module");
@@ -294,11 +307,11 @@ final class ResetPipeline {
                     commands("am force-stop com.android.providers.media", "am force-stop com.google.android.providers.media.module");
                 pause(2000);
             }
-            case 8 -> {
+            case 7 -> {
                 for (String uri : List.of("images/media", "video/media", "audio/media", "file"))
                     checked("content delete --user 0 --uri content://media/external/" + uri, 120);
             }
-            case 9 -> { for (String folder : FOLDERS) checked("rm -rf /sdcard/" + folder + "/.thumbnails", 120); }
+            case 8 -> { for (String folder : FOLDERS) checked("rm -rf /sdcard/" + folder + "/.thumbnails", 120); }
             case 10 -> clear("com.sec.android.app.camera", "com.samsung.android.app.cameraassistant");
             case 11 -> {
                 for (String overlay : List.of("com.samsung.internal.systemui.navbar.sec_gestural", "com.samsung.internal.systemui.navbar.sec_gestural_no_hint",
@@ -310,7 +323,7 @@ final class ResetPipeline {
             }
             case 12 -> settings("system font_scale 1.0", "system device_font_scale 1.0", "global font_size 2", "global bold_text 0",
                 "global font_style_index 0", "secure enhanced_comfort_font_value 0");
-            case 13 -> {
+            case 14 -> {
                 for (String pkg : List.of("com.samsung.android.dialer", "com.samsung.android.messaging", "com.sec.android.app.sbrowser", "com.sec.android.app.camera")) {
                     if (pkg.equals("com.sec.android.app.sbrowser") && !installed(pkg)) {
                         notes.add("삼성 인터넷 없음 · 선택 항목이므로 건너뜀");
@@ -321,7 +334,7 @@ final class ResetPipeline {
                     commands("pm enable --user 0 " + quote(pkg));
                 }
             }
-            case 14 -> {
+            case 15 -> {
                 clear("com.sec.android.app.launcher"); pause(1000);
                 commands("am start --user 0 -n " + LAUNCHER); pause(4000);
                 Set<String> providers = queryWidgetProviders();
@@ -330,31 +343,88 @@ final class ResetPipeline {
                     if (!providers.isEmpty()) { restartLauncher(); pause(4000); commands("input keyevent KEYCODE_HOME"); pause(8000); }
                 } finally { restorePending(); }
             }
-            case 15 -> {
-                List<String> packages = new ArrayList<>();
-                for (String pkg : List.of("com.sec.android.app.samsungapps", "com.samsung.android.scloud")) if (installed(pkg)) packages.add(pkg);
-                clear(packages.toArray(new String[0]));
-                try { disableTemporarily(packages); restartLauncher(); pause(5000); }
-                finally { restorePending(); }
-            }
+            case 17 -> verifyFinalState(model);
             case 16 -> wallpaper(model);
-            case 17 -> {
-                prepareNmap();
-                for (String pkg : List.of("com.alphainventor.filemanager", SELF)) {
-                    if (installed(pkg)) continue;
-                    if (pkg.equals(SELF)) { warnings.add("초기화 앱 설치 상태 확인 필요"); continue; }
-                    String asset = "filemanager.apk";
-                    bridge.copy(asset, TMP + asset);
-                    success(checked("pm install -r --user 0 " + quote(TMP + asset), 300), "Success", "필수 앱 설치 실패: " + pkg);
-                    if (!installed(pkg)) warnings.add("필수 앱 없음: " + pkg);
-                    checked("rm -f " + quote(TMP + asset), 30);
-                }
-                commands("pm grant --user 0 " + SELF + " android.permission.WRITE_SECURE_SETTINGS");
-                for(String pkg:List.of("com.alphainventor.filemanager",SELF,SHIZUKU))if(installed(pkg))ensureEnabled(pkg);
+            case 13 -> {
+                attempt("네이버 지도 준비 실패", this::prepareNmap);
+                attempt("파일 관리자 설치·버전 확인 실패", this::prepareFileManager);
+                attempt("초기화 앱 설정 권한 확인 실패", () -> commands("pm grant --user 0 " + SELF + " android.permission.WRITE_SECURE_SETTINGS"));
+                for (String pkg : List.of(SELF, SHIZUKU)) attempt("실행 기반 앱 확인 실패: " + pkg, () -> {
+                    if (!installed(pkg)) throw new IOException("필수 앱 없음");
+                    ensureEnabled(pkg);
+                });
             }
             case 18 -> success(dex("recent_tasks_cleaner.dex", "RecentTasksCleaner"), "SUCCESS", "최근 앱 삭제 확인 필요");
             default -> throw new IllegalArgumentException("잘못된 단계");
         }
+    }
+    void clearAccountSessions() throws Exception {
+        int failures = warnings.size();
+        clear("com.nhn.android.nmap", "com.google.android.apps.tachyon");
+        if (warnings.size() > failures) throw new IOException("로그인·저장 데이터 초기화 실패");
+        if (cleared.contains("com.nhn.android.nmap")) notes.add("네이버 지도 로그인 세션·저장 데이터 초기화 확인");
+        if (cleared.contains("com.google.android.apps.tachyon")) notes.add("Google Meet 로그인 세션·저장 데이터 초기화 확인");
+    }
+    void prepareFileManager() throws Exception {
+        String pkg = "com.alphainventor.filemanager", asset = "filemanager.apk";
+        if (!installed(pkg) || packageVersion(pkg) < BuildConfig.FILEMANAGER_VERSION_CODE) {
+            try {
+                bridge.copy(asset, TMP + asset);
+                Result installed = raw("pm install -r --user 0 " + quote(TMP + asset), 300);
+                if (!installed.output.contains("INSTALL_FAILED_VERSION_DOWNGRADE") &&
+                    (installed.code != 0 || installed.truncated || !installed.output.contains("Success")))
+                    throw new IOException("파일 관리자 설치 결과 확인 필요");
+            } finally { try { raw("rm -f " + quote(TMP + asset), 30); } catch (Exception ignored) {} }
+        }
+        if (!installed(pkg) || packageVersion(pkg) < BuildConfig.FILEMANAGER_VERSION_CODE)
+            throw new IOException("파일 관리자 설치·버전 확인 실패");
+        try { ensureEnabled(pkg); }
+        catch (ConnectionLost e) { throw e; }
+        catch (Exception e) {
+            String note = "파일 관리자 설치 유지 · 딥 슬립/활성 상태 확인 필요 (초기화 계속)";
+            if (!advisories.contains(note)) advisories.add(note);
+            notes.add(note);
+        }
+    }
+    void verifyFinalState(String model) throws Exception {
+        finalAccountCount = -1; finalUserAppsClear = false;
+        StringBuilder result = new StringBuilder();
+        attempt("최종 계정 조회 실패", () -> {
+            finalAccountCount = nonSamsungAccounts(required("dumpsys account").output);
+            result.append("남은 비삼성 계정: ").append(finalAccountCount).append("개\n");
+            if (finalAccountCount > 0) throw new IOException("비삼성 계정 " + finalAccountCount + "개 남음");
+        });
+        attempt("최종 삭제 대상 앱 확인 실패", () -> {
+            String listed = required("pm list packages --user 0 -3").output;
+            List<String> remaining = new ArrayList<>();
+            for (String line : listed.split("\\R")) {
+                if (!line.startsWith("package:")) { if (!line.isBlank()) throw new IOException("잘못된 앱 목록"); continue; }
+                String pkg = line.substring(8).trim();
+                if (!KEEP.contains(pkg)) remaining.add(pkg);
+            }
+            finalUserAppsClear = remaining.isEmpty();
+            if (!finalUserAppsClear) throw new IOException("삭제 대상 앱 잔존: " + String.join(", ", remaining));
+        });
+        attempt("최종 언어 조회 실패", () -> result.append("실제 언어 목록: ").append(required("settings get system system_locales").output.trim()).append('\n'));
+        for (String pkg : List.of("com.nhn.android.nmap", "com.alphainventor.filemanager", SELF, SHIZUKU)) {
+            attempt("필수 앱 최종 확인 실패: " + pkg, () -> {
+                if (!installed(pkg)) { result.append(pkg).append(": 없음\n"); throw new IOException("필수 앱 없음"); }
+                long minimum = pkg.equals("com.nhn.android.nmap") ? BuildConfig.NMAP_VERSION_CODE : pkg.equals("com.alphainventor.filemanager") ? BuildConfig.FILEMANAGER_VERSION_CODE : pkg.equals(SELF) ? BuildConfig.VERSION_CODE : 1086;
+                if (packageVersion(pkg) < minimum) throw new IOException("필수 앱 버전 부족");
+                result.append(pkg).append(": 설치됨\n");
+                if (!pkg.equals("com.alphainventor.filemanager")) {
+                    if (!Arrays.asList(required("pm list packages -e --user 0 " + quote(pkg)).output.split("\\R")).contains("package:" + pkg))
+                        throw new IOException("필수 앱 활성 상태 확인 필요");
+                }
+            });
+        }
+        attempt("최종 배경 확인 실패", () -> {
+            boolean live = liveOverride(required("dumpsys wallpaper").output);
+            result.append("배경: ").append(series(model)).append(live ? " · 라이브 배경 확인 필요" : " · 라이브 오버레이 미탐지 (이미지는 화면 확인)");
+            if (live) throw new IOException("라이브 배경이 남아 있음");
+        });
+        if (!advisories.isEmpty()) result.append("\n주의: ").append(String.join("\n", advisories));
+        summaryText = result.toString();
     }
     void settings(String... entries) throws Exception { for (String entry : entries) checked("settings --user 0 put " + entry, 120); }
     void cleanLive() throws Exception {

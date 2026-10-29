@@ -401,6 +401,10 @@ class ProgressConsole:
 PROGRESS = None  # main()에서 기기 수를 알 때 생성
 
 
+class RestorationError(RuntimeError):
+    """임시 비활성화 앱 복구 실패: 이후 삭제 작업을 계속하면 안 됩니다."""
+
+
 class DeviceLostError(RuntimeError):
     """adb가 기기를 더 이상 보지 못함 — 해당 기기의 파이프라인 즉시 중단용."""
 
@@ -463,7 +467,9 @@ def run_command(cmd, check=False, timeout=90, retries=1):
                 # 앱 출력의 우연한 'not found'와 구분하기 위해 실제 연결 상태로 확정
                 if not device_alive(serial):
                     raise DeviceLostError(serial, (result.stderr or '').strip().split('\n')[0])
-            if result.returncode == 0 or not check:
+            # Preserve a real command failure after the final retry; only an actual
+            # subprocess timeout should fall through to the synthetic TIMEOUT result.
+            if result.returncode == 0 or not check or attempt == retries:
                 return result
         except subprocess.TimeoutExpired:
             logging.warning('명령어 타임아웃(%ds): %s (시도 %d/%d)', timeout, ' '.join(cmd), attempt + 1, 1 + retries)
@@ -481,16 +487,19 @@ def run_command(cmd, check=False, timeout=90, retries=1):
 
 
 def _reenable_packages(serial, packages):
-    """disable-user 했던 패키지를 재활성화합니다(finally 블록용, raise 없음).
-
-    기기 이탈 등으로 실패해도 원래 예외 전파를 막지 않도록 모든 예외를 삼키되,
-    비활성 상태로 남을 수 있음을 로그에 남깁니다.
-    """
+    failures = []
     for pkg in packages:
         try:
-            run_command(['adb', '-s', serial, 'shell', 'pm', 'enable', pkg])
+            _pc_required(serial, ['shell', 'pm', 'enable', '--user', '0', pkg])
+            active = _pc_required(serial, ['shell', 'pm', 'list', 'packages', '-e', '--user', '0', pkg])
+            if 'package:' + pkg not in active.stdout.splitlines():
+                failures.append(pkg)
+        except DeviceLostError:
+            raise
         except Exception:
-            logging.warning('[%s] %s 재활성화 실패 — 기기에서 앱 활성 상태 확인 필요', serial, pkg)
+            failures.append(pkg)
+    if failures:
+        raise RestorationError('앱 재활성화 복구 실패: ' + ', '.join(failures))
 
 
 # 상태별 조치 안내 (scan_devices가 문제 기기 표에 사용)
@@ -578,6 +587,9 @@ def detect_series(serial):
 
 def clear_app_data(serial, package, desc):
     """특정 앱의 데이터를 초기화합니다."""
+    cleared = getattr(_TLS, 'cleared', None)
+    if cleared is not None and package in cleared:
+        return
     logging.info('[%s] %s 데이터 초기화 중...', serial, desc)
     listed = _pc_required(serial, ['shell','pm','list','packages','--user','0',package])
     if 'package:' + package not in listed.stdout.splitlines():
@@ -585,6 +597,21 @@ def clear_app_data(serial, package, desc):
     result = _pc_required(serial, ['shell','pm','clear','--user','0',package], timeout=120)
     if result.stdout.strip() != 'Success':
         raise RuntimeError(desc + ' 데이터 초기화 실패')
+    if cleared is not None:
+        cleared.add(package)
+
+
+def clear_app_group(serial, apps):
+    failures = []
+    for package, name in apps:
+        try:
+            clear_app_data(serial, package, name)
+        except DeviceLostError:
+            raise
+        except Exception as e:
+            failures.append(str(e))
+    if failures:
+        raise RuntimeError('; '.join(failures))
 
 
 # ============================================================
@@ -791,6 +818,19 @@ def verify_non_samsung_accounts_removed(serial):
         raise RuntimeError('비삼성 계정 %d개가 기기에 남아 있습니다 · 계정 삭제 실패' % len(non_samsung))
 
 
+def clear_account_sessions(serial):
+    failures = []
+    for pkg, name in [(NMAP_PACKAGE, '네이버 지도'), (naver_account_cleanup.MEET, 'Google Meet')]:
+        try:
+            clear_app_data(serial, pkg, name)
+        except DeviceLostError:
+            raise
+        except Exception as e:
+            failures.append(str(e))
+    if failures:
+        raise RuntimeError('; '.join(failures))
+
+
 def remove_non_samsung_accounts(serial):
     """백그라운드 삭제 + NAVER 설정 UI 폴백 후 실제 잔존 계정을 검증합니다."""
     logging.info('[%s] 삼성 계정 제외 전체 계정 삭제 시작...', serial)
@@ -800,14 +840,22 @@ def remove_non_samsung_accounts(serial):
     accounts = get_device_accounts(serial)
     protected = sum(is_samsung_account(a['type']) for a in accounts)
     logging.info('[%s] 현재 계정 %d개 · 삼성 계정 보존 %d개', serial, len(accounts), protected)
-    if len(accounts) > protected:
-        if not push_dex_if_needed(serial, 'account_preparer.dex'):
-            raise RuntimeError('계정 인증 서비스 준비 헬퍼 없음')
-        prepared = run_command(['adb','-s',serial,'shell','CLASSPATH=/data/local/tmp/account_preparer.dex',
-                                'app_process','/system/bin','AccountPreparer','--prepare'],timeout=120,retries=0)
-        if prepared.returncode != 0 or 'SUCCESS:AUTHENTICATORS_READY' not in (prepared.stdout or ''):
-            raise RuntimeError('계정 인증 서비스 활성화·검증 실패')
-        time.sleep(1)
+    if len(accounts) == protected:
+        logging.info('[%s] 비삼성 계정 없음 · 계정 제거 생략', serial)
+        clear_account_sessions(serial)
+        return
+    try:
+        if push_dex_if_needed(serial, 'account_preparer.dex'):
+            prepared = run_command(['adb', '-s', serial, 'shell', 'CLASSPATH=/data/local/tmp/account_preparer.dex',
+                                    'app_process', '/system/bin', 'AccountPreparer', '--prepare'], timeout=120, retries=0)
+            if prepared.returncode == 0 and 'SUCCESS:AUTHENTICATORS_READY' in (prepared.stdout or ''):
+                time.sleep(1)
+            else:
+                logging.warning('[%s] 일부 계정 인증 서비스 준비 실패 · 계정 제거와 최종 확인 계속', serial)
+    except DeviceLostError:
+        raise
+    except Exception:
+        logging.warning('[%s] 계정 인증 서비스 준비 실패 · 계정 제거와 최종 확인 계속', serial)
     if not push_dex_if_needed(serial, 'account_remover.dex'):
         raise RuntimeError('account_remover.dex 없음 · 계정 삭제를 완료하지 못했습니다.')
     # DEX output may contain customer identifiers. Verify inventory instead of logging it.
@@ -818,8 +866,7 @@ def remove_non_samsung_accounts(serial):
     if any(a['type'] == naver_account_cleanup.NAVER for a in remaining):
         logging.info('[%s] 네이버 계정 잔존 · 설정에서 기기 계정/인증 정보 제거 중...', serial)
         naver_account_cleanup.remove(serial, run_command)
-    naver_account_cleanup.clear_map_session(serial, run_command)
-    naver_account_cleanup.clear_app_session(serial, run_command, naver_account_cleanup.MEET, 'Google Meet')
+    clear_account_sessions(serial)
     verify_non_samsung_accounts_removed(serial)
     logging.info('[%s] 비삼성 계정 0개 확인 · 삼성 계정 보존 · 계정 삭제 완료', serial)
 
@@ -849,11 +896,6 @@ def deep_clean_gallery_trash(serial):
         '/sdcard/.Trash-0',
         '/sdcard/Recycle',
         # 썸네일 캐시 (갤러리가 이걸 참조하여 삭제된 이미지 표시)
-        '/sdcard/DCIM/.thumbnails',
-        '/sdcard/Pictures/.thumbnails',
-        '/sdcard/Music/.thumbnails',
-        '/sdcard/Movies/.thumbnails',
-        '/sdcard/Download/.thumbnails',
         '/sdcard/Android/data/com.sec.android.gallery3d/files/.thumbnails',
         # 추가 캐시 경로
         '/sdcard/Android/data/com.android.chrome/cache',
@@ -881,12 +923,14 @@ def deep_clean_gallery_trash(serial):
         logging.warning('[%s] rm -rf 일부 실패 (계속 진행)', serial)
 
     # Step 3: 미디어/갤러리 프로바이더 데이터 초기화
-    pm_cmd = '; '.join(f'pm clear {pkg}' for pkg in clear_packages)
-    result = run_command(['adb', '-s', serial, 'shell', pm_cmd], timeout=120)
-    stdout = result.stdout if hasattr(result, 'stdout') else ''
-    for line in stdout.splitlines():
-        if 'Exception' in line or 'Error' in line:
-            logging.warning('[%s] pm clear 경고: %s', serial, line.strip())
+    failures = []
+    for pkg in clear_packages:
+        try:
+            clear_app_data(serial, pkg, pkg)
+        except DeviceLostError:
+            raise
+        except Exception as e:
+            failures.append(str(e))
 
     # MediaStore 전체 리프레시 (pm clear 후 provider 재기동 트리거)
     # Android 16에서 MEDIA_MOUNTED는 SecurityException 발생 → 폴백으로 MediaProvider 재시작
@@ -904,6 +948,8 @@ def deep_clean_gallery_trash(serial):
                      'am', 'force-stop', 'com.google.android.providers.media.module'])
     time.sleep(2)
 
+    if failures:
+        raise RuntimeError('; '.join(failures))
     logging.info('[%s] 갤러리 휴지통 완전 정리 완료', serial)
 
 
@@ -928,18 +974,24 @@ def delete_user_installed_apps(serial):
     ], timeout=120)
     if result.returncode != 0:
         raise RuntimeError('사용자 앱 목록 조회 실패 · 앱 삭제 완료로 처리하지 않습니다.')
-    installed_apps = [line.replace('package:', '').strip() for line in result.stdout.splitlines() if line.strip()]
+    rows = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if any(not re.fullmatch(r'package:[A-Za-z0-9_.]+', row) for row in rows):
+        raise RuntimeError('사용자 앱 목록 형식 확인 실패')
+    installed_apps = [row[8:] for row in rows]
 
+    failures = []
     for app in installed_apps:
         if app not in exclude_apps:
             logging.info('[%s] 앱 삭제: %s', serial, app)
             removed = run_command(['adb', '-s', serial, 'shell', 'pm', 'uninstall', '--user', '0', app])
             if removed.returncode != 0 or (removed.stdout or '').strip() != 'Success':
-                raise RuntimeError('앱 삭제 실패: ' + app)
+                failures.append(app)
         elif app == 'com.sec.knox.kccagent':
             logging.info('[%s] Knox Configure 관리 앱 보존 · 관리자 등록 유지', serial)
         else:
             logging.info('[%s] 앱 보존: %s', serial, app)
+    if failures:
+        raise RuntimeError('앱 삭제 실패: ' + ', '.join(failures))
 
 
 def clear_google_apps_history(serial):
@@ -954,10 +1006,22 @@ def clear_google_apps_history(serial):
         'com.google.android.calendar': 'Google 캘린더',
         'com.google.android.apps.photos': 'Google 포토',
         'com.sec.android.app.sbrowser': '삼성 인터넷 브라우저',
+        'com.nhn.android.nmap': '네이버 지도',
+        'com.alphainventor.filemanager': '파일 관리자',
+        'com.sec.android.app.popupcalculator': '계산기',
+        'com.google.android.apps.tachyon': 'Google Meet',
     }
     logging.info('[%s] Google 앱 사용 기록 삭제 시작...', serial)
+    failures = []
     for package, name in google_apps.items():
-        clear_app_data(serial, package, name)
+        try:
+            clear_app_data(serial, package, name)
+        except DeviceLostError:
+            raise
+        except Exception as e:
+            failures.append(str(e))
+    if failures:
+        raise RuntimeError('; '.join(failures))
     logging.info('[%s] Google 앱 사용 기록 삭제 완료.', serial)
 
 
@@ -968,8 +1032,7 @@ def reset_camera_settings(serial):
         'com.samsung.android.app.cameraassistant': '카메라 어시스턴트',
     }
     logging.info('[%s] 카메라 설정 초기화 시작...', serial)
-    for package, name in camera_apps.items():
-        clear_app_data(serial, package, name)
+    clear_app_group(serial, camera_apps.items())
     logging.info('[%s] 카메라 설정 초기화 완료.', serial)
 
 
@@ -1030,11 +1093,21 @@ def reset_font_settings(serial):
 def clear_call_sms_contacts(serial):
     """통화기록, SMS, 주소록을 DEX(ContentCleaner)를 통해 삭제합니다."""
     logging.info('[%s] 통화기록/SMS/주소록 DEX 삭제 시작...', serial)
+    failures = []
+    def safe_clear(package, name):
+        try:
+            clear_app_data(serial, package, name)
+        except DeviceLostError:
+            raise
+        except Exception as e:
+            failures.append(str(e))
 
     if not push_dex_if_needed(serial, 'content_cleaner.dex'):
         logging.warning('[%s] content_cleaner.dex 없음 — 폴백: pm clear 사용', serial)
-        clear_app_data(serial, 'com.android.providers.contacts', '주소록/통화기록')
-        clear_app_data(serial, 'com.android.providers.telephony', 'SMS/MMS')
+        safe_clear( 'com.android.providers.contacts', '주소록/통화기록')
+        safe_clear( 'com.android.providers.telephony', 'SMS/MMS')
+        if failures:
+            raise RuntimeError('; '.join(failures))
         return
 
     result = run_command([
@@ -1044,7 +1117,7 @@ def clear_call_sms_contacts(serial):
     ])
 
     stdout = result.stdout if hasattr(result, 'stdout') else ''
-    needs_fallback = {'CALL_LOG': False, 'SMS': False, 'CONTACTS': False}
+    needs_fallback = {'CALL_LOG': result.returncode != 0, 'SMS': result.returncode != 0, 'CONTACTS': result.returncode != 0}
 
     for line in stdout.splitlines():
         line = line.strip()
@@ -1061,22 +1134,28 @@ def clear_call_sms_contacts(serial):
         elif line.startswith('FAIL:'):
             parts = line.split(':', 3)
             if len(parts) >= 2:
+                if parts[1] in needs_fallback:
+                    needs_fallback[parts[1]] = True
+                else:
+                    failures.append('통화/문자/주소록 삭제 결과 확인 필요')
                 logging.warning('[%s] %s 삭제 실패: %s', serial, parts[1],
                               parts[2] if len(parts) > 2 else '')
 
     # 실패한 항목에 대해 pm clear 폴백
     if needs_fallback.get('CALL_LOG') or needs_fallback.get('CONTACTS'):
-        clear_app_data(serial, 'com.android.providers.contacts', '주소록/통화기록 (폴백)')
+        safe_clear( 'com.android.providers.contacts', '주소록/통화기록 (폴백)')
     if needs_fallback.get('SMS'):
-        clear_app_data(serial, 'com.android.providers.telephony', 'SMS/MMS (폴백)')
+        safe_clear( 'com.android.providers.telephony', 'SMS/MMS (폴백)')
 
     # 삼성 메시지 앱 데이터 초기화 (임시저장 문자 등 앱 자체 DB 삭제)
-    clear_app_data(serial, 'com.samsung.android.messaging', '삼성 메시지 (임시저장 포함)')
-    clear_app_data(serial, 'com.samsung.android.providers.contacts', '삼성 연락처 프로바이더')
-    clear_app_data(serial, 'com.samsung.android.app.contacts', '삼성 연락처 앱')
-    clear_app_data(serial, 'com.samsung.android.dsms', '삼성 DSMS')
-    clear_app_data(serial, 'com.android.mms.service', 'MMS 서비스')
+    safe_clear( 'com.samsung.android.messaging', '삼성 메시지 (임시저장 포함)')
+    safe_clear( 'com.samsung.android.providers.contacts', '삼성 연락처 프로바이더')
+    safe_clear( 'com.samsung.android.app.contacts', '삼성 연락처 앱')
+    safe_clear( 'com.samsung.android.dsms', '삼성 DSMS')
+    safe_clear( 'com.android.mms.service', 'MMS 서비스')
 
+    if failures:
+        raise RuntimeError('; '.join(failures))
     logging.info('[%s] 통화기록/SMS/주소록 삭제 완료', serial)
 
 
@@ -1158,18 +1237,25 @@ def delete_esim_profiles(serial):
 
 
 def clear_logs_and_cache(serial):
-    """로그, 통화기록, 주소록, 앱 캐시를 삭제합니다."""
-    # DEX 기반 통화기록/SMS/주소록 삭제
-    clear_call_sms_contacts(serial)
-
-    clear_app_data(serial, 'com.sec.android.gallery3d', '갤러리')
-    clear_app_data(serial, 'com.nhn.android.nmap', 'Nmap')
-    clear_app_data(serial, 'com.sec.android.themestore', '테마')
-    clear_app_data(serial, 'com.sec.android.app.vepreload', '삼성 스튜디오')
-
-    # 클립보드 기록 제거 (엣지 패널 + 키보드 내 클립보드)
-    clear_app_data(serial, 'com.samsung.android.app.clipboardedge', '클립보드 엣지')
-    clear_app_data(serial, 'com.samsung.android.honeyboard', '삼성 키보드 (클립보드 포함)')
+    failures = []
+    try:
+        clear_call_sms_contacts(serial)
+    except DeviceLostError:
+        raise
+    except Exception as e:
+        failures.append(str(e))
+    try:
+        clear_app_group(serial, [
+            ('com.sec.android.gallery3d', '갤러리'), ('com.sec.android.themestore', '테마'),
+            ('com.sec.android.app.vepreload', '삼성 스튜디오'),
+            ('com.samsung.android.app.clipboardedge', '클립보드 엣지'),
+            ('com.samsung.android.honeyboard', '삼성 키보드·클립보드')])
+    except DeviceLostError:
+        raise
+    except Exception as e:
+        failures.append(str(e))
+    if failures:
+        raise RuntimeError('; '.join(failures))
 
 
 def clear_recent_tasks(serial):
@@ -1304,6 +1390,11 @@ def wipe_internal_storage(serial):
     run_command(['adb', '-s', serial, 'shell', 'rm', '-rf', '/storage/emulated/0/*'], timeout=300)
     run_command(['adb', '-s', serial, 'shell', 'rm', '-rf',
                  '/storage/emulated/0/.[!.]*', '/storage/emulated/0/..?*'], timeout=300)
+    listing = _pc_required(serial, ['shell', 'find', '/storage/emulated/0', '-type', 'f'], timeout=120).stdout
+    remaining = [path for path in listing.splitlines() if path.strip() and not path.endswith('/.nomedia')
+                 and not ('/.thumbnails/' in path and path.endswith('/.database_uuid'))]
+    if remaining:
+        raise RuntimeError('내부 저장소 잔여 파일 %d개 · 삭제 완료로 처리하지 않습니다.' % len(remaining))
     logging.info('[%s] 내장 메모리 전체 삭제 완료', serial)
 
 
@@ -1368,7 +1459,8 @@ def reset_widgets_only(serial):
         if in_widgets_section and 'provider=ProviderId' in line:
             match = re.search(r'cmp:ComponentInfo\{([^/]+)/', line)
             if match:
-                providers.add(match.group(1))
+                if match.group(1) not in KEEP_APPS:
+                    providers.add(match.group(1))
 
     if not providers:
         logging.info('[%s] 바인딩된 위젯 없음 — 스킵', serial)
@@ -1466,7 +1558,8 @@ def reset_launcher_with_clean_home(serial):
         if in_widgets_section and 'provider=ProviderId' in line:
             match = re.search(r'cmp:ComponentInfo\{([^/]+)/', line)
             if match:
-                providers.add(match.group(1))
+                if match.group(1) not in KEEP_APPS:
+                    providers.add(match.group(1))
 
     if not providers:
         logging.info('[%s] 바인딩된 위젯 없음 — 2차 clear 생략', serial)
@@ -1475,11 +1568,10 @@ def reset_launcher_with_clean_home(serial):
     logging.info('[%s] 탐지된 위젯 provider (%d개): %s',
                  serial, len(providers), ', '.join(sorted(providers)))
 
-    # Provider 일시 disable
-    for pkg in providers:
-        run_command(['adb', '-s', serial, 'shell', 'pm', 'disable-user', '--user', '0', pkg])
-
+    # Journal the intended restore set before the first mutation.
     try:
+        for pkg in providers:
+            _pc_required(serial, ['shell', 'pm', 'disable-user', '--user', '0', pkg])
         # 위젯 + placeholder 제거: launcher.db 보존하면서 launcher만 재시작.
         # force-stop + start 시점에 launcher가 db row의 패키지 존재성 재검증 →
         # 누락된 위젯과 app drawer placeholder를 자동 정리.
@@ -1507,6 +1599,9 @@ PHONE_APP_PACKAGE = 'com.forholiday.galaxyreset'
 SHIZUKU_PACKAGE = 'moe.shizuku.privileged.api'
 PHONE_APK_FILES = {PHONE_APP_PACKAGE: 'galaxy-reset.apk', SHIZUKU_PACKAGE: 'shizuku.apk'}
 NMAP_PACKAGE = 'com.nhn.android.nmap'
+FILEMANAGER_PACKAGE = 'com.alphainventor.filemanager'
+KEEP_APPS = frozenset({PHONE_APP_PACKAGE, SHIZUKU_PACKAGE, NMAP_PACKAGE, FILEMANAGER_PACKAGE,
+    'com.sec.android.app.popupcalculator', 'com.sec.android.app.sbrowser', 'com.sec.knox.kccagent'})
 
 
 def load_nmap_bundle(verify_hash=False):
@@ -1537,6 +1632,19 @@ def load_nmap_bundle(verify_hash=False):
         return dict(bundle, apk_path=paths[0], apk_paths=paths)
     except (OSError, ValueError, KeyError, TypeError, zipfile.BadZipFile) as error:
         raise RuntimeError('네이버 지도 동봉 파일 검증 실패: %s' % error) from error
+
+
+def load_filemanager_bundle(verify_hash=False):
+    with open(resource_path('filemanager-bundle.json'), encoding='utf-8') as source:
+        app = json.load(source)
+    if app['package'] != FILEMANAGER_PACKAGE or app['file'] != 'filemanager.apk' or not isinstance(app['versionCode'], int):
+        raise RuntimeError('파일 관리자 APK 메타데이터 오류')
+    path = resource_path(app['file'])
+    if verify_hash:
+        with open(path, 'rb') as source:
+            if hashlib.sha256(source.read()).hexdigest() != app['sha256']:
+                raise RuntimeError('파일 관리자 APK 해시 불일치')
+    return dict(app, apk_path=path)
 
 
 def load_phone_bundle(verify_hash=False):
@@ -1658,36 +1766,63 @@ def ensure_essential_apps_installed(serial):
     bundled = load_phone_bundle()
     apps = [
         dict(load_nmap_bundle(), name='네이버 지도'),
-        {'package': 'com.alphainventor.filemanager', 'name': 'File Manager', 'apk_path': resource_path('filemanager.apk')},
+        dict(load_filemanager_bundle(), name='File Manager'),
         dict(bundled[PHONE_APP_PACKAGE], name='갤럭시 초기화'),
         dict(bundled[SHIZUKU_PACKAGE], name='Shizuku'),
     ]
     listed = _pc_required(serial, ['shell', 'pm', 'list', 'packages', '--user', '0'], timeout=120)
     installed = {line[8:].strip() for line in listed.stdout.splitlines() if line.startswith('package:')}
+    failures = []
     for app in apps:
-        package = app['package']
-        if package in installed:
-            if 'versionCode' not in app or _package_version(serial, package) >= app['versionCode']:
-                logging.info('[%s] %s 설치됨 (같거나 최신 버전 유지)', serial, app['name'])
-                continue
-        apk = app['apk_path']
-        if not os.path.isfile(apk):
-            raise RuntimeError('필수 APK 없음: ' + apk)
-        logging.info('[%s] %s 설치/업데이트 중...', serial, app['name'])
-        paths = app.get('apk_paths', [apk])
-        command = 'install-multiple' if len(paths) > 1 else 'install'
-        result = _pc_required(serial, [command, '-r', '--user', '0'] + paths, timeout=600)
-        if 'Success' not in (result.stdout or ''):
-            raise RuntimeError('필수 앱 설치 확인 실패: ' + app['name'])
-        verify = _pc_required(serial, ['shell', 'pm', 'path', '--user', '0', package])
-        if not (verify.stdout or '').strip().startswith('package:'):
-            raise RuntimeError('필수 앱 설치 후 조회 실패: ' + app['name'])
-        if 'versionCode' in app and _package_version(serial, package) < app['versionCode']:
-            raise RuntimeError('필수 앱 버전 확인 실패: ' + app['name'])
+        try:
+            package = app['package']
+            if package in installed:
+                if 'versionCode' not in app or _package_version(serial, package) >= app['versionCode']:
+                    logging.info('[%s] %s 설치됨 (같거나 최신 버전 유지)', serial, app['name'])
+                    continue
+            apk = app['apk_path']
+            if not os.path.isfile(apk):
+                raise RuntimeError('필수 APK 없음: ' + apk)
+            logging.info('[%s] %s 설치/업데이트 중...', serial, app['name'])
+            paths = app.get('apk_paths', [apk])
+            command = 'install-multiple' if len(paths) > 1 else 'install'
+            result = run_command(['adb', '-s', serial, command, '-r', '--user', '0'] + paths, check=True, timeout=600)
+            downgrade = 'INSTALL_FAILED_VERSION_DOWNGRADE' in ((result.stdout or '') + (result.stderr or ''))
+            if not downgrade and (result.returncode != 0 or 'Success' not in (result.stdout or '')):
+                raise RuntimeError('필수 앱 설치 확인 실패: ' + app['name'] + ' · ' + ((result.stdout or '') + (result.stderr or '')).strip()[:180])
+            verify = _pc_required(serial, ['shell', 'pm', 'path', '--user', '0', package])
+            if not (verify.stdout or '').strip().startswith('package:'):
+                raise RuntimeError('필수 앱 설치 후 조회 실패: ' + app['name'])
+            if 'versionCode' in app and _package_version(serial, package) < app['versionCode']:
+                raise RuntimeError('필수 앱 버전 확인 실패: ' + app['name'])
+        except DeviceLostError:
+            raise
+        except Exception as e:
+            failures.append(str(e))
     for app in apps:
-        _ensure_package_enabled(serial, app['package'])
-    verify_nmap_ready(serial)
-    prepare_wireless_reset(serial)
+        if app['package'] == FILEMANAGER_PACKAGE:
+            continue
+        try:
+            _ensure_package_enabled(serial, app['package'])
+        except DeviceLostError:
+            raise
+        except Exception as e:
+            failures.append(str(e))
+    # Installation success is independent of Samsung deep-sleep activation.
+    try:
+        _ensure_package_enabled(serial, FILEMANAGER_PACKAGE)
+    except DeviceLostError:
+        raise
+    except Exception:
+        add_post_run_notice('[%s] 파일 관리자 설치 유지 · 딥 슬립/활성 상태 확인 필요 (초기화 계속)' % serial)
+    try:
+        verify_nmap_ready(serial)
+    except DeviceLostError:
+        raise
+    except Exception as e:
+        failures.append(str(e))
+    if failures:
+        raise RuntimeError('; '.join(failures))
 
 
 def _ensure_package_enabled(serial, package):
@@ -1717,6 +1852,56 @@ def verify_nmap_ready(serial):
 # 4. 메인 프로세스
 # ============================================================
 
+def verify_final_reset(serial):
+    errors = []
+    _TLS.accounts_clear = False
+    _TLS.user_apps_clear = False
+    try:
+        verify_non_samsung_accounts_removed(serial)
+        _TLS.accounts_clear = True
+    except DeviceLostError:
+        raise
+    except Exception as e:
+        errors.append(str(e))
+    try:
+        listed = _pc_required(serial, ['shell', 'pm', 'list', 'packages', '--user', '0', '-3'])
+        rows = [line.strip() for line in listed.stdout.splitlines() if line.strip()]
+        if any(not re.fullmatch(r'package:[A-Za-z0-9_.]+', row) for row in rows):
+            raise RuntimeError('최종 앱 목록 조회 형식 확인 실패')
+        packages = [row[8:] for row in rows]
+        remaining = sorted(set(packages) - KEEP_APPS)
+        if remaining:
+            errors.append('삭제 대상 앱 잔존: ' + ', '.join(remaining))
+        else:
+            _TLS.user_apps_clear = True
+    except DeviceLostError:
+        raise
+    except Exception as e:
+        errors.append(str(e))
+    apps = [load_nmap_bundle(), load_filemanager_bundle(), *load_phone_bundle().values()]
+    for app in apps:
+        try:
+            path = _pc_required(serial, ['shell', 'pm', 'path', '--user', '0', app['package']])
+            if not path.stdout.strip().startswith('package:') or _package_version(serial, app['package']) < app['versionCode']:
+                raise RuntimeError('필수 앱 설치·버전 확인 실패: ' + app['package'])
+        except DeviceLostError:
+            raise
+        except Exception as e:
+            errors.append(str(e))
+    if errors:
+        raise RuntimeError('; '.join(errors))
+
+
+def prepare_wireless_separately(serial):
+    try:
+        prepare_wireless_reset(serial)
+    except DeviceLostError:
+        raise
+    except Exception as e:
+        add_post_run_notice('[%s] 무선 초기화 준비 실패 (초기화 결과와 별도): %s' % (serial, e))
+        logging.warning('[%s] 무선 준비 실패 · 최근 앱 정리 계속: %s', serial, e)
+
+
 def build_pipeline(serial, locale, wallpaper, series):
     """초기화 단계를 (표시 이름, 실행 함수) 순서대로 정의합니다.
 
@@ -1730,30 +1915,49 @@ def build_pipeline(serial, locale, wallpaper, series):
             run_command(['adb', '-s', serial, 'shell', 'rm', '-rf', f'/sdcard/{folder}/.thumbnails'])
 
     return [
-        ('언어 설정', lambda: set_device_language(serial, locale)),
-        ('계정 삭제', lambda: remove_non_samsung_accounts(serial)),
-        ('e-SIM 프로필 삭제', lambda: delete_esim_profiles(serial)),
-        ('Google 앱 기록 삭제', lambda: clear_google_apps_history(serial)),
         ('사용자 설치 앱 삭제', lambda: delete_user_installed_apps(serial)),
+        ('계정 삭제', lambda: remove_non_samsung_accounts(serial)),
+        ('유지 앱 데이터 초기화', lambda: clear_google_apps_history(serial)),
+        ('e-SIM 프로필 삭제', lambda: delete_esim_profiles(serial)),
         ('내부 저장소 초기화', lambda: wipe_internal_storage(serial)),
         ('로그·캐시 정리', lambda: clear_logs_and_cache(serial)),
         ('갤러리 휴지통 정리', lambda: deep_clean_gallery_trash(serial)),
         ('미디어 스토어 갱신', lambda: clear_media_store(serial)),
-        ('썸네일 잔여물 제거', clear_thumbnails),
+        ('썸네일 잔여물 제거', lambda: clear_thumbnails()),
+        ('언어 설정', lambda: set_device_language(serial, locale)),
         ('카메라 설정 초기화', lambda: reset_camera_settings(serial)),
         ('내비게이션 바 초기화', lambda: reset_navigation_bar(serial)),
         ('글자 크기 초기화', lambda: reset_font_settings(serial)),
+        ('필수 앱 설치·버전 확인', lambda: ensure_essential_apps_installed(serial)),
         ('홈 독 앱 배치', lambda: ensure_hotseat_apps(serial)),
         ('런처 초기화', lambda: reset_launcher_with_clean_home(serial)),
-        ('Galaxy Store 복원 차단', lambda: block_galaxy_store_auto_restore(serial)),
         ('배경화면 적용', lambda: push_default_wallpaper(serial, wallpaper, series)),
-        ('필수 앱 설치·무선 초기화 준비', lambda: ensure_essential_apps_installed(serial)),
+        ('최종 검증', lambda: verify_final_reset(serial)),
         ('최근 앱 목록 제거', lambda: clear_recent_tasks(serial)),
     ]
 
 
 # 단계를 추가/삭제해도 진행률 분모가 자동으로 따라가도록 실제 목록에서 센다
 PIPELINE_STEP_COUNT = len(build_pipeline('', None, '', ''))
+
+
+def configure_screen_timeout(serial):
+    """초기화 전에 소유자 화면 꺼짐 시간을 10분으로 설정하고 유지합니다."""
+    try:
+        for args in (['put', 'system', 'screen_off_timeout', '600000'],
+                     ['get', 'system', 'screen_off_timeout']):
+            result = run_command(['adb', '-s', serial, 'shell', 'settings', '--user', '0'] + args, timeout=15)
+            if result.returncode != 0 or (result.stderr or '').strip():
+                raise RuntimeError('설정 명령 실패')
+        if result.stdout.strip() != '600000':
+            raise RuntimeError('설정값 불일치')
+        logging.info('[%s] 화면 꺼짐 시간 10분 설정 확인', serial)
+    except DeviceLostError:
+        raise
+    except Exception:
+        message = '[%s] 화면 꺼짐 시간 10분 적용 확인 필요 · 초기화는 계속 진행합니다.' % serial
+        logging.warning(message)
+        add_post_run_notice(message)
 
 
 def process_device(serial, locale=None):
@@ -1763,8 +1967,15 @@ def process_device(serial, locale=None):
     logging.info('[%s] 초기화 시작', serial)
     logging.info('========================================')
 
-    current_label = '모델 확인'
+    current_label = '연결·소유자 확인'
+    _TLS.cleared = set()
+    errors = {}
     try:
+        if _pc_required(serial, ['shell', 'am', 'get-current-user']).stdout.strip() != '0':
+            raise RestorationError('소유자(사용자 0) 화면에서만 초기화할 수 있습니다.')
+        current_label = '화면 꺼짐 시간 설정'
+        configure_screen_timeout(serial)
+        current_label = '모델 확인'
         # 모델명은 한 번만 조회해 시리즈 판정과 화면 표시에 함께 쓴다
         model = get_device_model(serial)
         series = series_from_model(model, serial)
@@ -1778,11 +1989,32 @@ def process_device(serial, locale=None):
             if PROGRESS:
                 PROGRESS.step(serial, number - 1, label)
             logging.info('[%s] (%d/%d) %s', serial, number, len(steps), label)
-            action()
+            if label == '최근 앱 목록 제거':
+                prepare_wireless_separately(serial)
+            try:
+                action()
+            except (DeviceLostError, RestorationError):
+                raise
+            except Exception as e:
+                errors[label] = str(e)
+                logging.error('[%s] %s 실패 · 다음 단계 계속: %s', serial, label, e)
             if PROGRESS:
                 PROGRESS.step(serial, number, label)
         current_label = '최종 계정 확인'
-        verify_non_samsung_accounts_removed(serial)
+        try:
+            verify_non_samsung_accounts_removed(serial)
+            _TLS.accounts_clear = True
+        except DeviceLostError:
+            raise
+        except Exception as e:
+            errors[current_label] = str(e)
+        if getattr(_TLS, 'accounts_clear', False):
+            errors.pop('계정 삭제', None)
+        if getattr(_TLS, 'user_apps_clear', False):
+            errors.pop('사용자 설치 앱 삭제', None)
+        if errors:
+            current_label = '최종 결과'
+            raise RuntimeError('; '.join('%s: %s' % item for item in errors.items()))
     except Exception as e:
         # 예외는 main()이 기기별로 잡아 기록하고 해당 기기만 중단 (기존 동작 유지).
         # 단계명을 붙여 다시 던져 실패 사유에 이탈 시점이 남게 한다.
@@ -1792,6 +2024,9 @@ def process_device(serial, locale=None):
         raise RuntimeError('%s 중 실패: %s' % (current_label, e)) from e
     finally:
         _TLS.serial = None
+        _TLS.cleared = None
+        _TLS.accounts_clear = False
+        _TLS.user_apps_clear = False
 
     if PROGRESS:
         PROGRESS.done(serial)
@@ -1902,6 +2137,7 @@ def report_run(devices, failures, log_buffer, activity='초기화'):
 def main():
     load_phone_bundle(verify_hash=True)
     load_nmap_bundle(verify_hash=True)
+    load_filemanager_bundle(verify_hash=True)
     # 메뉴·표의 색상 표시 (진행률 화면과 동일한 VT 경로, 미지원 콘솔이면 무색)
     global ANSI_OK
     ANSI_OK = sys.stdout.isatty() and _enable_ansi()
@@ -1951,6 +2187,7 @@ def prepare_phone_only_main():
     args = parser.parse_args()
     load_phone_bundle(verify_hash=True)
     load_nmap_bundle(verify_hash=True)
+    load_filemanager_bundle(verify_hash=True)
     devices = args.serial or get_connected_devices()
     if not devices:
         raise RuntimeError('준비할 USB 기기가 없습니다.')
@@ -1960,6 +2197,7 @@ def prepare_phone_only_main():
     for serial in devices:
         try:
             ensure_essential_apps_installed(serial)
+            prepare_wireless_reset(serial)
         except Exception as error:
             failures[serial] = str(error)
     report_run(devices, failures, buffer, activity='폰 앱 준비 (데이터 삭제 없음)')
