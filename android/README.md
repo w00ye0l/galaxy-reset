@@ -240,3 +240,9 @@ Android 앱의 `prepareNmap`과 PC의 `verify_nmap_ready`는 지도를 실행하
 ### 1.1.20 필수 앱 준비 중 프로세스 종료 방지
 
 18단계에서 초기화 앱 자신에게 `pm enable`을 보내면 manifest 기본 활성 상태에서 명시적 활성 상태로 변경되는 과정에 실행 프로세스가 종료될 수 있습니다. `ensureEnabled`는 실제 활성 목록을 먼저 읽어 이미 활성인 앱의 상태를 바꾸지 않습니다. 초기화 앱과 Shizuku는 실행 기반이므로 휴대폰 초기화 중 활성 여부만 검증하고 직접 상태를 변경하지 않습니다. 다른 필수 앱은 비활성일 때만 활성화한 뒤 결과를 다시 읽습니다. PC 준비 경로도 `_ensure_package_enabled`로 이미 활성인 앱을 건드리지 않습니다.
+
+### 1.1.21 REST API 없는 업데이트 확인
+
+`AppUpdater.check`는 `https://github.com/w00ye0l/galaxy-reset/releases/latest/download/galaxy-reset-update.json`을 직접 읽습니다. GitHub REST API와 앱에 내장한 토큰은 사용하지 않습니다. 메타데이터의 `versionName`이 숫자 세 자리 버전 형식인지 확인한 뒤 해당 `app-v<versionName>` 릴리스의 APK 주소를 생성해, 최신 릴리스 변경과 다운로드 간의 버전 혼동을 방지합니다. 허용된 HTTPS 다운로드 호스트와 SHA-256·서명·패키지·버전 검증은 유지합니다. 앱의 다운로드 허용 목록에서 `api.github.com`도 제거했습니다.
+
+1.1.20 이하의 조회 경로가 제한된 상태에서는 GitHub 릴리스의 APK를 직접 설치하거나 갱신된 EXE로 한 번 업데이트할 수 있습니다. 기존 앱 삭제나 데이터 초기화는 필요 없습니다. 파일 다운로드 서버의 일시 장애·403·429까지 없어지는 것은 아니며 해당 오류는 계속 표시합니다.
