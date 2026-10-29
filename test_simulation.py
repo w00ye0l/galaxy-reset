@@ -72,6 +72,9 @@ class FakeFleet:
             return _cp(cmd, 0, MODEL_BY_SERIAL[serial] + '\n')
         if 'pm' in cmd and 'list' in cmd:
             return _cp(cmd, 0, ''.join('package:%s\n' % pkg for pkg in sorted(self.installed[serial])))
+        if 'pm' in cmd and 'uninstall' in cmd:
+            self.installed[serial].discard(cmd[-1])
+            return _cp(cmd, 0, 'Success\n')
         if 'pm' in cmd and 'path' in cmd:
             return _cp(cmd, 0, 'package:/data/app/%s/base.apk\n' % cmd[-1])
         if 'pidof' in cmd:

@@ -920,20 +920,24 @@ def delete_user_installed_apps(serial):
         'com.forholiday.galaxyreset',
         'moe.shizuku.privileged.api',
         'com.sec.android.app.sbrowser',
+        'com.sec.knox.kccagent',  # Knox Configure 관리 앱·등록 보존
     ]
     result = run_command([
         'adb', '-s', serial, 'shell',
         'pm', 'list', 'packages', '--user', '0', '-3'
     ], timeout=120)
     if result.returncode != 0:
-        logging.warning('[%s] 사용자 앱 목록 조회 실패 — 앱 삭제 단계 건너뜀', serial)
-        return
+        raise RuntimeError('사용자 앱 목록 조회 실패 · 앱 삭제 완료로 처리하지 않습니다.')
     installed_apps = [line.replace('package:', '').strip() for line in result.stdout.splitlines() if line.strip()]
 
     for app in installed_apps:
         if app not in exclude_apps:
             logging.info('[%s] 앱 삭제: %s', serial, app)
-            run_command(['adb', '-s', serial, 'shell', 'pm', 'uninstall', '--user', '0', app])
+            removed = run_command(['adb', '-s', serial, 'shell', 'pm', 'uninstall', '--user', '0', app])
+            if removed.returncode != 0 or (removed.stdout or '').strip() != 'Success':
+                raise RuntimeError('앱 삭제 실패: ' + app)
+        elif app == 'com.sec.knox.kccagent':
+            logging.info('[%s] Knox Configure 관리 앱 보존 · 관리자 등록 유지', serial)
         else:
             logging.info('[%s] 앱 보존: %s', serial, app)
 

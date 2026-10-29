@@ -22,9 +22,24 @@ public class ResetPipelineTest {
     }
     @Test public void protectsResetAndShizukuDuringUninstall() throws Exception {
         Fake fake = new Fake();
-        fake.packages = "package:" + ResetPipeline.SELF + "\npackage:" + ResetPipeline.SHIZUKU + "\npackage:com.nhn.android.nmap\npackage:com.sec.android.app.sbrowser\npackage:com.customer.app\n";
-        new ResetPipeline(fake, p -> {}, Set.of()).step(4, "ja-JP", "SM-S948N");
+        fake.packages = "package:" + ResetPipeline.SELF + "\npackage:" + ResetPipeline.SHIZUKU + "\npackage:com.nhn.android.nmap\npackage:com.sec.android.app.sbrowser\npackage:com.sec.knox.kccagent\npackage:com.customer.app\n";
+        ResetPipeline pipeline=new ResetPipeline(fake, p -> {}, Set.of());pipeline.step(4, "ja-JP", "SM-S948N");
         assertEquals(List.of("pm list packages --user 0 -3", "pm uninstall --user 0 'com.customer.app'"), fake.commands);
+        assertTrue(pipeline.warnings.isEmpty());
+        assertTrue(pipeline.notes.contains("Knox Configure 관리 앱 보존 · 관리자 등록 유지"));
+    }
+    @Test public void knoxExceptionDoesNotHideOtherPackageDeletionFailures() throws Exception {
+        Fake fake=new Fake(){
+            @Override public ResetPipeline.Result run(String cmd,int seconds) throws Exception {
+                if(cmd.startsWith("pm uninstall")){commands.add(cmd);return new ResetPipeline.Result(1,"Failure [DELETE_FAILED_INTERNAL_ERROR]");}
+                return super.run(cmd,seconds);
+            }
+        };
+        fake.packages="package:com.sec.knox.kccagent\npackage:com.sec.knox.kccagent.extra\n";
+        ResetPipeline pipeline=new ResetPipeline(fake,p->{},Set.of());pipeline.step(4,"ja-JP","SM-S918N");
+        assertTrue(fake.commands.contains("pm uninstall --user 0 'com.sec.knox.kccagent.extra'"));
+        assertFalse(fake.commands.contains("pm uninstall --user 0 'com.sec.knox.kccagent'"));
+        assertFalse(pipeline.warnings.isEmpty());
     }
     @Test public void parsesWidgetsOnlyAndProtectsInfrastructure() {
         String dump = "Providers:\n provider=ProviderId{cmp:ComponentInfo{com.outside/.Widget}}\nWidgets:\n"

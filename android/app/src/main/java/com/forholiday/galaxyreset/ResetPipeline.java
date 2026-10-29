@@ -7,6 +7,7 @@ import java.util.regex.*;
 /** Android-independent V6 port. Only Bridge performs privileged operations. */
 final class ResetPipeline {
     static final String SELF = "com.forholiday.galaxyreset";
+    static final String KNOX_CONFIGURE = "com.sec.knox.kccagent";
     static final String SHIZUKU = "moe.shizuku.privileged.api";
     static final String TMP = "/data/local/tmp/galaxy-reset/";
     static final String LAUNCHER = "com.sec.android.app.launcher/.activities.LauncherActivity";
@@ -14,7 +15,7 @@ final class ResetPipeline {
         "내부 저장소 초기화", "로그·캐시 정리", "갤러리 휴지통 정리", "미디어 스토어 갱신", "썸네일 잔여물 제거",
         "카메라 설정 초기화", "내비게이션 바 초기화", "글자 크기 초기화", "홈 독 앱 배치", "런처 초기화",
         "Galaxy Store 복원 차단", "배경화면 적용", "필수 앱 설치", "최근 앱 목록 제거"};
-    static final Set<String> KEEP = Set.of(SELF, SHIZUKU, "com.sec.android.app.popupcalculator", "com.nhn.android.nmap", "com.alphainventor.filemanager", "com.sec.android.app.sbrowser");
+    static final Set<String> KEEP = Set.of(SELF, SHIZUKU, KNOX_CONFIGURE, "com.sec.android.app.popupcalculator", "com.nhn.android.nmap", "com.alphainventor.filemanager", "com.sec.android.app.sbrowser");
     static final String[] LIVE = {"com.samsung.android.wallpaper.live", "com.samsung.android.dynamiclock", "com.samsung.android.app.dressroom"};
     static final String[] FOLDERS = {"DCIM", "Pictures", "Music", "Movies", "Download"};
     static final String[] LOCALES = {"ja-JP", "en-US", "ko-KR", "zh-CN", "zh-TW"};
@@ -249,6 +250,7 @@ final class ResetPipeline {
                     if (!line.startsWith("package:")) continue;
                     String pkg = line.substring(8).trim();
                     if (!pkg.matches("[A-Za-z0-9_.]+")) throw new IOException("잘못된 패키지 목록");
+                    if(pkg.equals(KNOX_CONFIGURE))notes.add("Knox Configure 관리 앱 보존 · 관리자 등록 유지");
                     if (!KEEP.contains(pkg)) success(checked("pm uninstall --user 0 " + quote(pkg), 120), "Success", "앱 삭제 실패: " + pkg);
                 }
             }

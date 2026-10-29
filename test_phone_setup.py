@@ -51,6 +51,8 @@ class FakeDevice:
                 out = 'Success\n'
         elif a[:3] == ['shell', 'pm', 'path']:
             out = 'package:/data/app/%s/base.apk\n' % a[-1] if a[-1] in self.installed else ''
+        elif a[:3] == ['shell', 'pm', 'uninstall']:
+            self.installed.discard(a[-1]);out='Success\n'
         elif a[:3] == ['shell', 'getprop', 'ro.build.version.sdk']:
             out = self.sdk + '\n'
         elif a[:3] == ['shell', 'am', 'get-current-user']:
@@ -154,10 +156,22 @@ class PhoneSetupTest(unittest.TestCase):
         self.assertFalse(any('settings' in c for c in self.fake.calls))
 
     def test_user_app_cleanup_preserves_reset_shizuku_and_browser(self):
-        self.fake.installed |= {'com.customer.app', 'com.sec.android.app.sbrowser'}
+        self.fake.installed |= {'com.customer.app', 'com.sec.android.app.sbrowser', 'com.sec.knox.kccagent'}
         V6.delete_user_installed_apps('TEST')
         removed = [c[-1] for c in self.fake.calls if 'uninstall' in c]
         self.assertEqual(removed, ['com.customer.app'])
+        self.assertIn('com.sec.knox.kccagent',self.fake.installed)
+
+    def test_knox_exception_is_exact_and_other_uninstall_failure_cannot_pass(self):
+        self.fake.installed |= {'com.sec.knox.kccagent','com.sec.knox.kccagent.extra'}
+        original=self.fake.run
+        def run(command,**kwargs):
+            if command[3:6] == ['shell','pm','uninstall']:
+                self.assertEqual(command[-1],'com.sec.knox.kccagent.extra')
+                return subprocess.CompletedProcess(command,1,'Failure [DELETE_FAILED_INTERNAL_ERROR]','')
+            return original(command,**kwargs)
+        with patch.object(V6,'run_command',side_effect=run):
+            self.assertRaisesRegex(RuntimeError,'앱 삭제 실패',V6.delete_user_installed_apps,'TEST')
 
     def test_setup_requires_owner_profile_before_changing_settings(self):
         self.fake.user = '10'
