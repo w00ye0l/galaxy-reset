@@ -18,10 +18,22 @@ public class UpdatePolicyTest {
             assertFalse(url,UpdatePolicy.releaseAsset(url,"galaxy-reset.apk"));
     }
     @Test public void rejectsNonGithubRedirectsAndInsecureDownloads(){
-        for(String host:new String[]{"github.com","api.github.com","release-assets.githubusercontent.com","objects.githubusercontent.com"})
+        for(String host:new String[]{"github.com","release-assets.githubusercontent.com","objects.githubusercontent.com"})
             assertTrue(UpdatePolicy.downloadHost(URI.create("https://"+host+"/asset")));
-        for(String url:new String[]{"http://github.com/asset","https://example.org/asset","file:///tmp/file","https://github.com:8443/asset","https://user@github.com/asset"})
+        for(String url:new String[]{"https://api.github.com/repos/w00ye0l/galaxy-reset/releases/latest","http://github.com/asset","https://example.org/asset","file:///tmp/file","https://github.com:8443/asset","https://user@github.com/asset"})
             assertFalse(url,UpdatePolicy.downloadHost(URI.create(url)));
+    }
+    @Test public void latestMetadataUsesPublicReleaseDownloadWithoutRestApi(){
+        assertEquals("https://github.com/w00ye0l/galaxy-reset/releases/latest/download/galaxy-reset-update.json",UpdatePolicy.LATEST_METADATA);
+        assertTrue(UpdatePolicy.downloadHost(URI.create(UpdatePolicy.LATEST_METADATA)));
+    }
+    @Test public void apkIsPinnedToMetadataVersionEvenWhenLatestMoves(){
+        String pinned=UpdatePolicy.apkForVersion("1.1.20");
+        assertEquals("https://github.com/w00ye0l/galaxy-reset/releases/download/app-v1.1.20/galaxy-reset.apk",pinned);
+        assertTrue(UpdatePolicy.releaseAsset(pinned,UpdatePolicy.APK_NAME));
+        assertNotEquals(pinned,UpdatePolicy.apkForVersion("1.1.21"));
+        for(String version:new String[]{null,"","latest","1.1.21/../../evil","1.1.21?x=1","v1.1.21","1.1.21-beta"})
+            assertThrows(IllegalArgumentException.class,()->UpdatePolicy.apkForVersion(version));
     }
     @Test public void requiresFullSha256Digest(){
         assertTrue(UpdatePolicy.validHash("a".repeat(64)));

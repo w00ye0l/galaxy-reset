@@ -8,9 +8,9 @@ import phone_autostart as setup
 
 
 def screen(*texts, package='com.android.settings'):
-    return '<?xml version="1.0"?><hierarchy>' + ''.join(
-        '<node package="%s" text="%s" resource-id="%s" bounds="[10,20][210,120]" />' %
-        (package, escape(t), 'com.android.settings:id/pairing_code' if t == '123456' else 'com.android.settings:id/ip_addr' if ':' in t else '') for t in texts) + '</hierarchy>'
+    return '<?xml version="1.0"?><hierarchy><node class="android.widget.FrameLayout" bounds="[0,0][1080,2400]">' + ''.join(
+        '<node package="%s" text="%s" resource-id="%s" enabled="true" bounds="[100,800][900,900]" />' %
+        (package, escape(t), 'com.android.settings:id/pairing_code' if t == '123456' else 'com.android.settings:id/ip_addr' if ':' in t else '') for t in texts) + '</node></hierarchy>'
 
 
 class Fake:
@@ -36,6 +36,61 @@ class Fake:
 
 
 class PhoneAutostartTest(unittest.TestCase):
+    def test_clipped_wireless_row_is_scrolled_away_from_navigation_bar(self):
+        class Clipped(Fake):
+            scrolled = False
+            def run(self, command, timeout):
+                if command[3:6] == ['shell', 'input', 'swipe']:
+                    self.scrolled = True
+                if command[3:5] == ['exec-out', 'cat'] and self.screen == 0 and not self.scrolled:
+                    self.calls.append(command)
+                    return subprocess.CompletedProcess(command, 0, screen('ワイヤレス デバッグ').replace('[100,800][900,900]', '[100,2190][900,2261]'), '')
+                return super().run(command, timeout)
+        fake=Clipped();setup.prepare('TEST',fake.run)
+        self.assertTrue(fake.scrolled)
+        self.assertFalse(any(c[3:6] == ['shell','input','tap'] and c[-1] == '2225' for c in fake.calls))
+
+    def test_disabled_pair_row_does_not_skip_enabling_wireless(self):
+        class Off(Fake):
+            off = True
+            def run(self, command, timeout):
+                if self.screen == 1 and self.off and command[3:5] == ['exec-out','cat']:
+                    self.calls.append(command)
+                    xml=screen('専用コードによるデバイスのペア設定').replace('enabled="true"','enabled="false"')
+                    xml=xml.replace('</hierarchy>','<node package="com.android.settings" class="android.widget.Switch" checked="false" enabled="true" bounds="[100,400][900,500]" /></hierarchy>')
+                    return subprocess.CompletedProcess(command,0,xml,'')
+                if self.screen == 1 and self.off and command[3:6] == ['shell','input','tap']:
+                    self.calls.append(command);self.off=False
+                    return subprocess.CompletedProcess(command,0,'','')
+                return super().run(command,timeout)
+        fake=Off();setup.prepare('TEST',fake.run);self.assertFalse(fake.off)
+
+    def test_valid_saved_identity_skips_pairing_ui(self):
+        class Authenticated(Fake):
+            def run(self, command, timeout):
+                if setup.PACKAGE+'.CHECK_ADB_AUTH_FROM_USB' in command:
+                    self.calls.append(command)
+                    return subprocess.CompletedProcess(command,0,'Broadcast completed: result=0, data="AUTHENTICATED"','')
+                return super().run(command,timeout)
+        fake=Authenticated();setup.prepare('TEST',fake.run)
+        self.assertFalse(any(setup.PACKAGE+'.PAIR_FROM_USB' in c for c in fake.calls))
+        self.assertFalse(any('android.settings.APPLICATION_DEVELOPMENT_SETTINGS' in c for c in fake.calls))
+
+    def test_unknown_pairing_timeout_is_never_replayed_or_leaked(self):
+        class Timeout(Fake):
+            attempts = 0
+            def run(self, command, timeout):
+                if setup.PACKAGE+'.PAIR_FROM_USB' in command:
+                    self.attempts+=1;raise subprocess.TimeoutExpired(command,timeout)
+                return super().run(command,timeout)
+        fake=Timeout()
+        with self.assertRaises(RuntimeError) as caught:setup.prepare('TEST',fake.run)
+        self.assertEqual(fake.attempts,1);self.assertNotIn('123456',str(caught.exception))
+
+    def test_ipv6_and_spaced_pair_code_are_supported(self):
+        xml=screen('123456','[fe80::1234%wlan0]:34567').replace('text="123456"','text="123 456"')
+        self.assertEqual((34567,'123456'),setup.pairing_details(E.fromstring(xml)))
+
     def test_first_shizuku_request_is_approved_only_for_our_named_app(self):
         class PermissionFake(Fake):
             def run(self, command, timeout):

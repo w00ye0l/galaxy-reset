@@ -22,9 +22,24 @@ public class ResetPipelineTest {
     }
     @Test public void protectsResetAndShizukuDuringUninstall() throws Exception {
         Fake fake = new Fake();
-        fake.packages = "package:" + ResetPipeline.SELF + "\npackage:" + ResetPipeline.SHIZUKU + "\npackage:com.nhn.android.nmap\npackage:com.sec.android.app.sbrowser\npackage:com.customer.app\n";
-        new ResetPipeline(fake, p -> {}, Set.of()).step(4, "ja-JP", "SM-S948N");
+        fake.packages = "package:" + ResetPipeline.SELF + "\npackage:" + ResetPipeline.SHIZUKU + "\npackage:com.nhn.android.nmap\npackage:com.sec.android.app.sbrowser\npackage:com.sec.knox.kccagent\npackage:com.customer.app\n";
+        ResetPipeline pipeline=new ResetPipeline(fake, p -> {}, Set.of());pipeline.step(0, "ja-JP", "SM-S948N");
         assertEquals(List.of("pm list packages --user 0 -3", "pm uninstall --user 0 'com.customer.app'"), fake.commands);
+        assertTrue(pipeline.warnings.isEmpty());
+        assertTrue(pipeline.notes.contains("Knox Configure 관리 앱 보존 · 관리자 등록 유지"));
+    }
+    @Test public void knoxExceptionDoesNotHideOtherPackageDeletionFailures() throws Exception {
+        Fake fake=new Fake(){
+            @Override public ResetPipeline.Result run(String cmd,int seconds) throws Exception {
+                if(cmd.startsWith("pm uninstall")){commands.add(cmd);return new ResetPipeline.Result(1,"Failure [DELETE_FAILED_INTERNAL_ERROR]");}
+                return super.run(cmd,seconds);
+            }
+        };
+        fake.packages="package:com.sec.knox.kccagent\npackage:com.sec.knox.kccagent.extra\n";
+        ResetPipeline pipeline=new ResetPipeline(fake,p->{},Set.of());pipeline.step(0,"ja-JP","SM-S918N");
+        assertTrue(fake.commands.contains("pm uninstall --user 0 'com.sec.knox.kccagent.extra'"));
+        assertFalse(fake.commands.contains("pm uninstall --user 0 'com.sec.knox.kccagent'"));
+        assertFalse(pipeline.warnings.isEmpty());
     }
     @Test public void parsesWidgetsOnlyAndProtectsInfrastructure() {
         String dump = "Providers:\n provider=ProviderId{cmp:ComponentInfo{com.outside/.Widget}}\nWidgets:\n"
@@ -48,7 +63,7 @@ public class ResetPipelineTest {
         Fake fake = new Fake() {
             @Override public ResetPipeline.Result run(String cmd, int seconds) { return new ResetPipeline.Result(0, "package:com.customer.app", true); }
         };
-        try { new ResetPipeline(fake, p -> {}, Set.of()).step(4, "ja-JP", "SM-S928N"); fail(); } catch (IOException expected) {}
+        try { new ResetPipeline(fake, p -> {}, Set.of()).step(0, "ja-JP", "SM-S928N"); fail(); } catch (IOException expected) {}
         assertTrue(fake.commands.isEmpty());
     }
     @Test public void modelLanguageAndAccountRulesMatchV6() {
@@ -66,7 +81,7 @@ public class ResetPipelineTest {
                 commands.add(cmd); return new ResetPipeline.Result(0, "SUCCESS:ALL_ESIM_DISABLED\nFAIL:ALL_ESIM_DELETE_FAILED");
             }
         };
-        ResetPipeline pipeline = new ResetPipeline(fake, p -> {}, Set.of()); pipeline.step(2, "ja-JP", "SM-S928N");
+        ResetPipeline pipeline = new ResetPipeline(fake, p -> {}, Set.of()); pipeline.step(3, "ja-JP", "SM-S928N");
         assertTrue(pipeline.manual); assertFalse(pipeline.warnings.isEmpty());
         assertTrue(fake.commands.stream().anyMatch(s -> s.contains("MANAGE_EMBEDDED_SUBSCRIPTIONS")));
     }
@@ -101,7 +116,7 @@ public class ResetPipelineTest {
             }
         };
         ResetPipeline pipeline = new ResetPipeline(fake, p -> {}, Set.of());
-        pipeline.step(13, "ja-JP", "SM-S948N");
+        pipeline.step(14, "ja-JP", "SM-S948N");
         assertTrue(pipeline.warnings.isEmpty()); assertFalse(pipeline.manual);
         assertEquals(1, pipeline.notes.size());
         assertFalse(fake.commands.stream().anyMatch(c -> c.startsWith("cmd package install-existing") && c.contains("sbrowser")));
@@ -175,17 +190,71 @@ public class ResetPipelineTest {
     @Test public void essentialStepNeverChangesActiveSelfOrShizukuPackageState() throws Exception {
         EssentialFake fake=new EssentialFake();
         fake.disabledPackages.add("com.alphainventor.filemanager");
-        ResetPipeline pipeline=nmapPipeline(fake);pipeline.step(17,"ja-JP","SM-S938N");
+        ResetPipeline pipeline=nmapPipeline(fake);pipeline.step(13,"ja-JP","SM-S938N");
         assertTrue(pipeline.warnings.isEmpty());
         assertTrue(fake.disabledPackages.isEmpty());
         assertEquals(1,fake.commands.stream().filter(c->c.startsWith("pm enable")).count());
         assertTrue(fake.commands.stream().anyMatch(c->c.startsWith("pm enable")&&c.contains("com.alphainventor.filemanager")));
     }
-    @Test public void disabledInfrastructureIsReportedWithoutTryingToRestartIt() {
+    @Test public void disabledInfrastructureIsReportedWithoutTryingToRestartIt() throws Exception {
         for(String pkg:List.of(ResetPipeline.SELF,ResetPipeline.SHIZUKU)) {
             EssentialFake fake=new EssentialFake();fake.disabledPackages.add(pkg);
-            assertThrows(IOException.class,()->nmapPipeline(fake).step(17,"ja-JP","SM-S938N"));
+            ResetPipeline failed=nmapPipeline(fake); failed.step(13,"ja-JP","SM-S938N"); assertFalse(failed.warnings.isEmpty());
             assertFalse(fake.commands.stream().anyMatch(c->c.startsWith("pm enable")));
         }
     }
+    @Test public void fileManagerDeepSleepIsAdvisoryAndNeverUninstalls() throws Exception {
+        EssentialFake fake = new EssentialFake() {
+            @Override public ResetPipeline.Result run(String cmd, int sec) {
+                if (cmd.startsWith("pm enable") && cmd.contains("com.alphainventor.filemanager"))
+                    return new ResetPipeline.Result(255, "SecurityException: Shell cannot change component state");
+                return super.run(cmd, sec);
+            }
+        };
+        fake.disabledPackages.add("com.alphainventor.filemanager");
+        ResetPipeline pipeline=nmapPipeline(fake); pipeline.step(13,"ko-KR","SM-S938N");
+        assertTrue(pipeline.warnings.isEmpty());
+        assertTrue(pipeline.advisories.stream().anyMatch(n->n.contains("딥 슬립")));
+        assertFalse(fake.commands.stream().anyMatch(c->c.startsWith("pm uninstall")));
+    }
+    @Test public void dataClearContinuesAfterOneFailureAndCachesOnlySuccesses() throws Exception {
+        Fake fake = new Fake() {
+            @Override public ResetPipeline.Result run(String cmd, int seconds) {
+                commands.add(cmd);
+                if(cmd.startsWith("pm list packages"))return new ResetPipeline.Result(0,"package:"+cmd.substring(cmd.lastIndexOf(' ')+1).replace("'", ""));
+                return new ResetPipeline.Result(0,cmd.contains("bad.app")?"Failed":"Success");
+            }
+        };
+        ResetPipeline pipeline=new ResetPipeline(fake,p->{},Set.of());
+        pipeline.clear("bad.app","good.app"); pipeline.clear("good.app");
+        assertFalse(pipeline.warnings.isEmpty());
+        assertEquals(1,fake.commands.stream().filter(c->c.startsWith("pm clear")&&c.contains("good.app")).count());
+        assertFalse(pipeline.cleared.contains("bad.app"));
+    }
+
+    static class FinalFake extends Fake {
+        boolean remainingAccount, remainingApp, brokenAccounts;
+        @Override public ResetPipeline.Result run(String cmd,int seconds) {
+            commands.add(cmd);
+            if(cmd.equals("dumpsys account"))return new ResetPipeline.Result(0,brokenAccounts?"Permission denied":remainingAccount?"Accounts: 1\nAccount {name=redacted, type=com.google}\n":"Accounts: 0\n");
+            if(cmd.equals("pm list packages --user 0 -3"))return new ResetPipeline.Result(0,remainingApp?"package:customer.app\n":"");
+            if(cmd.startsWith("pm list packages"))return new ResetPipeline.Result(0,"package:"+cmd.substring(cmd.lastIndexOf(' ')+1).replace("'", "")+"\n");
+            if(cmd.startsWith("dumpsys package"))return new ResetPipeline.Result(0,"versionCode=999999999 minSdk=30");
+            if(cmd.startsWith("dumpsys wallpaper"))return new ResetPipeline.Result(0,"mName=WallpaperSetter");
+            return new ResetPipeline.Result(0,"ko-KR");
+        }
+    }
+    @Test public void finalVerificationCannotHideRemainingCustomerAccountsOrApps() throws Exception {
+        FinalFake fake=new FinalFake();fake.remainingAccount=true;fake.remainingApp=true;
+        ResetPipeline p=new ResetPipeline(fake,x->{},Set.of());p.step(17,"ko-KR","SM-S938N");
+        assertEquals(1,p.finalAccountCount);assertFalse(p.finalUserAppsClear);assertFalse(p.warnings.isEmpty());
+        assertFalse(p.summaryText.contains("남은 비삼성 계정: 0개"));
+    }
+    @Test public void unknownAccountInventoryIsNotZero() throws Exception {
+        FinalFake fake=new FinalFake();fake.brokenAccounts=true;
+        ResetPipeline p=new ResetPipeline(fake,x->{},Set.of());p.step(17,"ko-KR","SM-S938N");
+        assertEquals(-1,p.finalAccountCount);assertFalse(p.warnings.isEmpty());
+        assertFalse(p.summaryText.contains("남은 비삼성 계정: 0개"));
+    }
+
 }

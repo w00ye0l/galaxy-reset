@@ -72,6 +72,9 @@ class FakeFleet:
             return _cp(cmd, 0, MODEL_BY_SERIAL[serial] + '\n')
         if 'pm' in cmd and 'list' in cmd:
             return _cp(cmd, 0, ''.join('package:%s\n' % pkg for pkg in sorted(self.installed[serial])))
+        if 'pm' in cmd and 'uninstall' in cmd:
+            self.installed[serial].discard(cmd[-1])
+            return _cp(cmd, 0, 'Success\n')
         if 'pm' in cmd and 'path' in cmd:
             return _cp(cmd, 0, 'package:/data/app/%s/base.apk\n' % cmd[-1])
         if 'pidof' in cmd:
@@ -90,7 +93,7 @@ class FakeFleet:
             labels = {'developer': ['무선 디버깅'], 'wireless': ['페어링 코드로 기기 페어링'],
                       'code': ['123456', '127.0.0.1:34567'], 'ready': ['권한 연결됨']}[self.pair_screen[serial]]
             package = V6.PHONE_APP_PACKAGE if self.pair_screen[serial] == 'ready' else 'com.android.settings'
-            xml = '<?xml version="1.0"?><hierarchy>' + ''.join('<node package="%s" text="%s" resource-id="%s" bounds="[10,10][100,100]" />' % (package, t, 'com.android.settings:id/pairing_code' if t == '123456' else 'com.android.settings:id/ip_addr' if ':' in t else '') for t in labels) + '</hierarchy>'
+            xml = '<?xml version="1.0"?><hierarchy><node class="android.widget.FrameLayout" bounds="[0,0][1080,2400]">' + ''.join('<node package="%s" text="%s" resource-id="%s" bounds="[100,800][900,900]" />' % (package, t, 'com.android.settings:id/pairing_code' if t == '123456' else 'com.android.settings:id/ip_addr' if ':' in t else '') for t in labels) + '</node></hierarchy>'
             return _cp(cmd, 0, xml)
         if 'com.forholiday.galaxyreset.PAIR_FROM_USB' in cmd:
             return _cp(cmd, 0, 'Broadcast completed: result=0, data="PAIRED"\n')
@@ -108,8 +111,12 @@ class FakeFleet:
         if 'am' in cmd and 'start' in cmd and any('com.nhn.android.nmap/' in item for item in cmd):
             return _cp(cmd, 0, 'Status: ok\n')
         if 'dumpsys' in cmd and 'package' in cmd:
-            version = V6.load_nmap_bundle()['versionCode'] if cmd[-1] == V6.NMAP_PACKAGE else V6.load_phone_bundle()[cmd[-1]]['versionCode']
+            version = V6.load_nmap_bundle()['versionCode'] if cmd[-1] == V6.NMAP_PACKAGE else V6.load_filemanager_bundle()['versionCode'] if cmd[-1] == V6.FILEMANAGER_PACKAGE else V6.load_phone_bundle()[cmd[-1]]['versionCode']
             return _cp(cmd, 0, 'versionCode=%s minSdk=30\n' % version)
+        if 'find' in cmd:
+            return _cp(cmd, 0, '')
+        if 'settings' in cmd and 'screen_off_timeout' in cmd and 'get' in cmd:
+            return _cp(cmd, 0, '600000\n')
         if 'dumpsys' in cmd and 'account' in cmd:
             return _cp(cmd, 0, 'User UserInfo{0:Owner:13}:\n  Accounts: 0\n')
         if 'dumpsys' in cmd:

@@ -25,6 +25,7 @@ public class RunStateTest {
                 new Class<?>[]{SharedPreferences.Editor.class},(proxy,method,args)->{
                     String name=method.getName();
                     if(name.equals("clear")){staged.clear();return proxy;}
+                    if(name.equals("remove")){staged.remove(args[0]);return proxy;}
                     if(name.startsWith("put")){staged.put((String)args[0],args[1]);return proxy;}
                     if(name.equals("commit")){if(writable){values.clear();values.putAll(staged);}return writable;}
                     throw new UnsupportedOperationException(name);
@@ -57,4 +58,13 @@ public class RunStateTest {
         catch(IllegalStateException expected){assertTrue(expected.getMessage().contains("지우지 못"));}
         assertEquals("done",store.values.get("phase"));
     }
+    @Test public void pipelineMigrationInvalidatesOldIndicesButPreservesRecoveryAndLocale(){
+        Store store=new Store();store.values.put("phase","interrupted");store.values.put("index",15);
+        store.values.put("status15","완료");store.values.put("restore",Set.of("widget.app"));store.values.put("locale","ko-KR");
+        RunState state=new RunState(store.prefs());state.migratePipeline();
+        assertEquals("idle",state.phase());assertEquals(0,state.completed());
+        assertEquals(Set.of("widget.app"),state.pending());assertEquals("ko-KR",state.locale());
+        state.step(0,"완료","");state.migratePipeline();assertEquals(1,state.completed());
+    }
+
 }

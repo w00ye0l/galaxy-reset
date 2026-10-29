@@ -8,6 +8,15 @@ final class RunState {
     final SharedPreferences prefs;
     RunState(Context context) { this(context.getSharedPreferences("run", Context.MODE_PRIVATE)); }
     RunState(SharedPreferences preferences) { prefs = preferences; }
+    void migratePipeline() {
+        if (prefs.getInt("pipeline_schema", 0) == 2) return;
+        SharedPreferences.Editor editor = prefs.edit();
+        for (int i = 0; i < 19; i++) editor.remove("status" + i).remove("detail" + i);
+        if (!editor.putInt("pipeline_schema", 2).putString("phase", "idle").putInt("index", 0)
+            .putString("summary", "").putBoolean("home_after_shutdown", true).commit())
+            throw new IllegalStateException("새 초기화 순서를 저장하지 못했습니다.");
+        // The restore journal is intentionally retained until recovery succeeds.
+    }
     String phase() { return prefs.getString("phase", "idle"); }
     int index() { return prefs.getInt("index", 0); }
     boolean homeOnNextLaunch() { return prefs.getBoolean("home_after_shutdown", false); }

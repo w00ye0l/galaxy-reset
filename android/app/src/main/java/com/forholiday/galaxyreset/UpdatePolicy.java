@@ -5,6 +5,14 @@ import java.util.Set;
 
 final class UpdatePolicy {
     static final String REPOSITORY="w00ye0l/galaxy-reset";
+    static final String META_NAME="galaxy-reset-update.json", APK_NAME="galaxy-reset.apk";
+    static final String LATEST_METADATA="https://github.com/"+REPOSITORY+"/releases/latest/download/"+META_NAME;
+    static String apkForVersion(String versionName){
+        if(versionName==null||!versionName.matches("[0-9]+\\.[0-9]+\\.[0-9]+"))
+            throw new IllegalArgumentException("유효하지 않은 앱 버전입니다.");
+        // Pin the APK to the metadata's release; latest may change during a check.
+        return "https://github.com/"+REPOSITORY+"/releases/download/app-v"+versionName+"/"+APK_NAME;
+    }
     static final long MAX_APK_BYTES=1024L*1024*1024;
     static boolean newer(long installed,long available){return available>installed;}
     static boolean validHash(String value){return value!=null&&value.matches("[0-9a-f]{64}");}
@@ -22,6 +30,6 @@ final class UpdatePolicy {
     }
     static boolean downloadHost(URI uri){
         return "https".equals(uri.getScheme())&&uri.getUserInfo()==null&&uri.getPort()==-1&&uri.getHost()!=null
-            &&Set.of("github.com","api.github.com","release-assets.githubusercontent.com","objects.githubusercontent.com").contains(uri.getHost());
+            &&Set.of("github.com","release-assets.githubusercontent.com","objects.githubusercontent.com").contains(uri.getHost());
     }
 }

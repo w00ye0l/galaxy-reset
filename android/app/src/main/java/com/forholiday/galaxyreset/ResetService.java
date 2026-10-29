@@ -55,6 +55,8 @@ public class ResetService extends Service {
             if (!pipeline.required("am get-current-user").output().trim().equals("0"))
                 throw new IOException("소유자(사용자 0) 화면에서만 초기화할 수 있습니다.");
             if (android.os.Process.myUserHandle().hashCode() != 0) throw new IOException("소유자 프로필에 앱을 설치해주세요.");
+            String screenTimeout = pipeline.configureScreenTimeout();
+            state.prefs.edit().putString("summary", screenTimeout).commit();
             pipeline.restorePending();
             for (int i = from; i < (single ? from + 1 : 19); i++) {
                 current = i;
@@ -67,11 +69,25 @@ public class ResetService extends Service {
                 catch (Exception e) {
                     if (!shell.ready()) throw new ResetPipeline.ConnectionLost("Shizuku 연결 끊김");
                     state.step(i, "실패", e.getMessage() == null ? "단계 실행 실패" : e.getMessage());
+                    // Keep a session-clear failure visible across later single-step retries.
+                    if (i == 1 && (pipeline.failedClears.contains("com.nhn.android.nmap") || pipeline.failedClears.contains("com.google.android.apps.tachyon")))
+                        state.step(2, "실패", "로그인·저장 데이터 초기화 재확인 필요");
                     // Restoration failure must block further destructive work until recovered.
                     if (!pipeline.pending.isEmpty()) throw new IOException("앱 재활성화 복구가 필요합니다.");
                 }
             }
-            state.prefs.edit().putString("summary", summary(pipeline)).commit();
+            if (pipeline.summaryText.isEmpty()) {
+                try {
+                    pipeline.step(17, state.locale(), Build.MODEL);
+                    state.step(17, pipeline.warnings.isEmpty() ? "완료" : "실패", String.join("\n", pipeline.warnings));
+                } catch (ResetPipeline.ConnectionLost e) { throw e; }
+                catch (Exception e) { state.step(17, "실패", "최종 검증 실패 · " + e.getMessage()); }
+            }
+            if (pipeline.finalAccountCount == 0 && !pipeline.failedClears.contains("com.nhn.android.nmap") && !pipeline.failedClears.contains("com.google.android.apps.tachyon") && !state.status(1).equals("대기"))
+                state.step(1, "완료", "최종 검증: 비삼성 계정 0개 확인");
+            if (pipeline.finalUserAppsClear && state.status(0).equals("실패"))
+                state.step(0, "완료", "최종 검증: 삭제 대상 앱 없음");
+            state.prefs.edit().putString("summary", screenTimeout + "\n" + pipeline.summaryText).commit();
             state.phase(state.issues() ? "issues" : "done", 18, state.issues() ? "일부 실패 · 수동 확인 항목을 확인하세요." : "19단계 완료");
         } catch (Exception e) {
             state.phase("interrupted", current, e.getMessage() == null ? "실행 중단" : e.getMessage());
@@ -81,24 +97,12 @@ public class ResetService extends Service {
             main.post(() -> {
                 alive = false;
                 if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
-                stopForeground(STOP_FOREGROUND_DETACH);
-                getSystemService(NotificationManager.class).notify(NOTIFICATION,
-                    notification(state.prefs.getString("message", "처리 종료"), false));
+                stopForeground(STOP_FOREGROUND_REMOVE);
+                getSystemService(NotificationManager.class).cancel(NOTIFICATION);
+                getSystemService(NotificationManager.class).cancel(AdbPairingService.COMPLETION_NOTIFICATION);
                 stopSelf();
             });
         }
-    }
-    String summary(ResetPipeline p) throws Exception {
-        int accounts = ResetPipeline.nonSamsungAccounts(p.required("dumpsys account").output());
-        StringBuilder result = new StringBuilder("남은 비삼성 계정: " + accounts + "개\n");
-        result.append("실제 언어 목록: ").append(p.required("settings get system system_locales").output().trim()).append('\n');
-        for (String pkg : new String[]{"com.nhn.android.nmap", "com.alphainventor.filemanager", ResetPipeline.SELF, ResetPipeline.SHIZUKU})
-            result.append(pkg).append(": ").append(p.installed(pkg) ? "설치됨" : "없음").append('\n');
-        String wallpaper = p.required("dumpsys wallpaper").output();
-        result.append("배경: ").append(ResetPipeline.series(Build.MODEL)).append(" · ")
-            .append(ResetPipeline.liveOverride(wallpaper) ? "라이브 배경 확인 필요" : "라이브 오버레이 미탐지 (이미지 일치 여부는 화면 확인)");
-        if (accounts > 0) state.step(1, "수동 확인", "최종 확인: 비삼성 계정 " + accounts + "개 남음");
-        return result.toString();
     }
     @Override public void onDestroy() {
         if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();

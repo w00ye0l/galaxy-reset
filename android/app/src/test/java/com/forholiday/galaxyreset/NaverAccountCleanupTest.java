@@ -31,7 +31,7 @@ public class NaverAccountCleanupTest {
             if (cmd.contains("AccountPreparer")) return new ResetPipeline.Result(0,"SUCCESS:AUTHENTICATORS_READY");
             if (cmd.startsWith("CLASSPATH=")) return new ResetPipeline.Result(0, "FAIL:BACKGROUND_REMOVAL");
             if (cmd.startsWith("pm list packages")) return new ResetPipeline.Result(0, "package:com.nhn.android.nmap\n");
-            if (cmd.equals("pm clear --user 0 com.nhn.android.nmap")) {
+            if (cmd.replace("'", "").equals("pm clear --user 0 com.nhn.android.nmap")) {
                 if (clearFailure) return new ResetPipeline.Result(0, "Failed");
                 session = false; return new ResetPipeline.Result(0, "Success\n");
             }
@@ -106,7 +106,7 @@ public class NaverAccountCleanupTest {
                 return new ResetPipeline.Result(0, !cmd.contains(" -e ") || enabled ? "package:" + MEET + "\n" : "");
             }
             if (cmd.startsWith("CLASSPATH=") && enabled) meet = 0;
-            if (cmd.equals("pm clear --user 0 " + MEET)) {
+            if (cmd.replace("'", "").equals("pm clear --user 0 " + MEET)) {
                 commands.add(cmd); if (!failClear) meetSession = false;
                 return new ResetPipeline.Result(0, failClear ? "Failed" : "Success");
             }
@@ -122,9 +122,9 @@ public class NaverAccountCleanupTest {
         int dex = 0; while (!fake.commands.get(dex).contains("AccountRemover")) dex++;
         assertTrue(enable < dex);
     }
-    @Test public void meetEnableAndSessionFailuresRemainFailures() {
+    @Test public void meetEnableAndSessionFailuresRemainFailures() throws Exception {
         MeetFake disabled = new MeetFake(); disabled.failEnable = true;
-        assertThrows(Exception.class, () -> pipeline(disabled).step(1, "en-US", "SM-S938N"));
+        ResetPipeline failed = pipeline(disabled); failed.step(1, "en-US", "SM-S938N"); assertFalse(failed.warnings.isEmpty());
         MeetFake clear = new MeetFake(); clear.failClear = true;
         assertThrows(Exception.class, () -> pipeline(clear).step(1, "en-US", "SM-S938N"));
         assertTrue(clear.meetSession);

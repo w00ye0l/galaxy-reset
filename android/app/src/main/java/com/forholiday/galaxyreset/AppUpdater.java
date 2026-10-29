@@ -14,8 +14,7 @@ import org.json.*;
 
 final class AppUpdater {
     static final AppUpdater INSTANCE=new AppUpdater();
-    static final String META_NAME="galaxy-reset-update.json", APK_NAME="galaxy-reset.apk";
-    static final String API="https://api.github.com/repos/"+UpdatePolicy.REPOSITORY+"/releases/latest";
+    static final String META_NAME=UpdatePolicy.META_NAME, APK_NAME=UpdatePolicy.APK_NAME;
     final AtomicBoolean busy=new AtomicBoolean();
     volatile boolean installPending;
     boolean active(){return busy.get()||installPending;}
@@ -33,7 +32,8 @@ final class AppUpdater {
             HttpURLConnection connection=(HttpURLConnection)uri.toURL().openConnection();
             connection.setConnectTimeout(15000);connection.setReadTimeout(30000);connection.setInstanceFollowRedirects(false);connection.setUseCaches(false);
             connection.setRequestProperty("User-Agent","GalaxyReset/"+BuildConfig.VERSION_NAME);
-            connection.setRequestProperty("Accept","application/vnd.github+json");
+            connection.setRequestProperty("Accept","*/*");
+            connection.setRequestProperty("Cache-Control","no-cache");
             int code=connection.getResponseCode();
             if(code==301||code==302||code==303||code==307||code==308){String location=connection.getHeaderField("Location");connection.disconnect();if(location==null)throw new IOException("업데이트 다운로드 주소가 없습니다.");uri=uri.resolve(location);continue;}
             if(code!=200){connection.disconnect();throw new IOException(code==404?"게시된 앱 업데이트가 없습니다.":code==403||code==429?"업데이트 서버 요청이 제한됐습니다. 잠시 후 다시 확인하세요.":"업데이트 서버 오류 (HTTP "+code+")");}
@@ -49,24 +49,13 @@ final class AppUpdater {
             return new JSONObject(output.toString(StandardCharsets.UTF_8.name()));
         }finally{connection.disconnect();}
     }
-    String asset(JSONArray assets,String name) throws Exception {
-        String result=null;
-        for(int i=0;i<assets.length();i++){JSONObject item=assets.getJSONObject(i);if(name.equals(item.optString("name"))){
-            if(result!=null)throw new IOException("업데이트 파일이 중복됐습니다.");result=item.getString("browser_download_url");
-        }}
-        if(result==null||!UpdatePolicy.releaseAsset(result,name))throw new IOException("릴리스에 "+name+" 파일이 없습니다.");
-        return result;
-    }
     void check(Callback<Release> callback){
         if(!busy.compareAndSet(false,true))return;status="업데이트 확인 중…";
         new Thread(()->{
             try{
-                JSONObject release=json(API,512*1024);
-                if(release.optBoolean("draft")||release.optBoolean("prerelease"))throw new IOException("정식 앱 릴리스가 아닙니다.");
-                JSONArray assets=release.getJSONArray("assets");String apk=asset(assets,APK_NAME);
-                JSONObject metadata=json(asset(assets,META_NAME),64*1024);
+                JSONObject metadata=json(UpdatePolicy.LATEST_METADATA,64*1024);
                 if(metadata.getInt("schemaVersion")!=1||!BuildConfig.APPLICATION_ID.equals(metadata.getString("packageName"))||!APK_NAME.equals(metadata.getString("apkName")))throw new IOException("앱 업데이트 정보가 일치하지 않습니다.");
-                Release next=new Release(metadata.getLong("versionCode"),metadata.getString("versionName"),metadata.getString("sha256"),metadata.getLong("size"),apk);
+                Release next=new Release(metadata.getLong("versionCode"),metadata.getString("versionName"),metadata.getString("sha256"),metadata.getLong("size"),UpdatePolicy.apkForVersion(metadata.getString("versionName")));
                 if(!UpdatePolicy.validHash(next.hash)||next.version<1||next.size<1||next.size>UpdatePolicy.MAX_APK_BYTES)throw new IOException("유효하지 않은 앱 업데이트 정보입니다.");
                 status=UpdatePolicy.newer(BuildConfig.VERSION_CODE,next.version)?"새 버전 "+next.name+" 사용 가능":"최신 버전입니다.";
                 main.post(()->{busy.set(false);callback.success(next);});

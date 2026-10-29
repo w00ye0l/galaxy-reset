@@ -1,5 +1,6 @@
 plugins { id 'com.android.application' }
 def nmapBundle = new groovy.json.JsonSlurper().parse(rootProject.file('../nmap-bundle.json'))
+def filemanagerBundle = new groovy.json.JsonSlurper().parse(rootProject.file('../filemanager-bundle.json'))
 android {
     namespace 'com.forholiday.galaxyreset'
     compileSdk 36
@@ -7,9 +8,10 @@ android {
         applicationId 'com.forholiday.galaxyreset'
         minSdk 30
         targetSdk 36
-        versionCode 24
-        versionName '1.1.20'
+        versionCode 27
+        versionName '1.1.23'
         testInstrumentationRunner 'com.forholiday.galaxyreset.ProgressLayoutCheck'
+        buildConfigField 'long', 'FILEMANAGER_VERSION_CODE', filemanagerBundle.versionCode.toString() + 'L'
         buildConfigField 'long', 'NMAP_VERSION_CODE', nmapBundle.versionCode.toString() + 'L'
         buildConfigField 'String[]', 'NMAP_APKS', 'new String[]{' + nmapBundle.apks.collect { '"' + it.file + '"' }.join(',') + '}'
     }
