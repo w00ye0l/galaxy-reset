@@ -93,17 +93,13 @@ final class ResetPipeline {
             }
         }
         if(!installed(pkg)||packageVersion(pkg)<BuildConfig.NMAP_VERSION_CODE)throw new IOException("네이버 지도 설치 버전 확인 실패");
-        checked("pm enable --user 0 "+pkg,30);checked("am force-stop --user 0 "+pkg,30);
-        try{
-            String[] resolved=required("cmd package resolve-activity --brief --user 0 -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p "+pkg).output.trim().split("\\R");
-            String component=resolved[resolved.length-1];
-            if(!component.matches("com\\.nhn\\.android\\.nmap/[A-Za-z0-9_.$]+"))throw new IOException("네이버 지도 실행 화면 조회 실패");
-            Result start=required("am start -W --user 0 -n "+quote(component));
-            if(!start.output.contains("Status: ok"))throw new IOException("네이버 지도 실행 실패");
-            pause(2000);
-            if(!required("pidof "+pkg).output.trim().matches("[0-9\\s]+"))throw new IOException("네이버 지도 실행 직후 종료됨");
-            notes.add("네이버 지도 버전·시작 확인 완료 · 첫 안내/권한 및 지도 로딩은 별도 확인");
-        }finally{try{raw("am force-stop --user 0 "+pkg,30);}catch(Exception ignored){}}
+        Result enabled=raw("pm enable --user 0 "+pkg,30);
+        if(enabled.code!=0||enabled.truncated||enabled.output.contains("Exception")||enabled.output.contains("Error:"))
+            throw new IOException("네이버 지도 활성화 실패");
+        Result active=required("pm list packages -e --user 0 "+quote(pkg));
+        if(!Arrays.asList(active.output.split("\\R")).contains("package:"+pkg))
+            throw new IOException("네이버 지도 활성 상태 확인 실패");
+        notes.add("네이버 지도 설치·버전·활성 상태 확인 완료");
     }
     void commands(String... commands) throws Exception { for (String c : commands) checked(c, 120); }
     void clear(String... packages) throws Exception {

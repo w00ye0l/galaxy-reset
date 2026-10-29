@@ -1682,31 +1682,21 @@ def ensure_essential_apps_installed(serial):
             raise RuntimeError('필수 앱 버전 확인 실패: ' + app['name'])
     for app in apps:
         _pc_required(serial, ['shell', 'pm', 'enable', '--user', '0', app['package']])
-    verify_nmap_launch(serial)
+    verify_nmap_ready(serial)
     prepare_wireless_reset(serial)
 
 
-def verify_nmap_launch(serial):
-    _pc_required(serial, ['shell', 'pm', 'enable', '--user', '0', NMAP_PACKAGE])
-    _pc_required(serial, ['shell', 'am', 'force-stop', '--user', '0', NMAP_PACKAGE])
-    try:
-        resolved = _pc_required(serial, ['shell', 'cmd', 'package', 'resolve-activity', '--brief', '--user', '0',
-                                        '-a', 'android.intent.action.MAIN', '-c', 'android.intent.category.LAUNCHER',
-                                        '-p', NMAP_PACKAGE]).stdout.strip().splitlines()
-        component = resolved[-1] if resolved else ''
-        if not re.fullmatch(r'com\.nhn\.android\.nmap/[A-Za-z0-9_.$]+', component):
-            raise RuntimeError('네이버 지도 실행 화면 조회 실패')
-        result = _pc_required(serial, ['shell', 'am', 'start', '-W', '--user', '0',
-                                      '-n', component], timeout=45)
-        if 'Status: ok' not in result.stdout:
-            raise RuntimeError('네이버 지도 실행 실패: 시작 결과를 확인하세요.')
-        time.sleep(2)
-        running = _pc_required(serial, ['shell', 'pidof', NMAP_PACKAGE], timeout=10)
-        if not re.fullmatch(r'[0-9\s]+', running.stdout.strip()):
-            raise RuntimeError('네이버 지도 실행 후 프로세스가 종료되었습니다.')
-        logging.info('[%s] 네이버 지도 버전·시작 확인 완료 (첫 안내/권한 및 지도 로딩은 별도 확인)', serial)
-    finally:
-        run_command(['adb', '-s', serial, 'shell', 'am', 'force-stop', '--user', '0', NMAP_PACKAGE])
+def verify_nmap_ready(serial):
+    """네이버 지도를 실행하지 않고 설치·최소 버전·실제 활성 상태를 확인합니다."""
+    path = _pc_required(serial, ['shell', 'pm', 'path', '--user', '0', NMAP_PACKAGE])
+    if not path.stdout.strip().startswith('package:'):
+        raise RuntimeError('네이버 지도 설치 확인 실패')
+    if _package_version(serial, NMAP_PACKAGE) < load_nmap_bundle()['versionCode']:
+        raise RuntimeError('네이버 지도 설치 버전 확인 실패')
+    enabled = _pc_required(serial, ['shell', 'pm', 'list', 'packages', '-e', '--user', '0', NMAP_PACKAGE])
+    if 'package:' + NMAP_PACKAGE not in enabled.stdout.splitlines():
+        raise RuntimeError('네이버 지도 활성 상태 확인 실패')
+    logging.info('[%s] 네이버 지도 설치·버전·활성 상태 확인 완료', serial)
 
 
 # ============================================================
