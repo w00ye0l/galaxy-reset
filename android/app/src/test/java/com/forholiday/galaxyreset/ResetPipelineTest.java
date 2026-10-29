@@ -57,7 +57,7 @@ public class ResetPipelineTest {
         assertEquals("S24", ResetPipeline.series("unknown"));
         assertEquals(List.of("ja-JP", "ko-KR", "en-US"), ResetPipeline.locales("ja-JP"));
         assertEquals(List.of("zh-CN", "ko-KR", "en-US", "ja-JP"), ResetPipeline.locales("zh-CN"));
-        assertEquals(1, ResetPipeline.nonSamsungAccounts("Account {name=private, type=com.google}\nAccount {name=s, type=com.osp.app.signin}\nAccount {name=s, type=com.samsung.android.mobileservice}"));
+        assertEquals(1, ResetPipeline.nonSamsungAccounts("Accounts: 3\nAccount {name=private, type=com.google}\nAccount {name=s, type=com.osp.app.signin}\nAccount {name=s, type=com.samsung.android.mobileservice}"));
         assertEquals(19, ResetPipeline.LABELS.length);
     }
     @Test public void uncertainEsimRequiresManualHandling() throws Exception {
@@ -89,8 +89,8 @@ public class ResetPipelineTest {
         assertEquals(Set.of("com.widget"), new ResetPipeline(fake, p -> {}, Set.of()).queryWidgetProviders());
     }
     @Test public void androidCompatibleAccountParserHandlesIndentedEntries() {
-        assertEquals(1, ResetPipeline.nonSamsungAccounts("  Account {name=contains}brace, type=com.google}\n  Account {name=s, type=com.samsung}\n"));
-        assertEquals(0, ResetPipeline.nonSamsungAccounts("Account {malformed}\nSome unrelated output\n"));
+        assertEquals(1, ResetPipeline.nonSamsungAccounts("Accounts: 2\n  Account {name=contains}brace, type=com.google}\n  Account {name=s, type=com.samsung}\n"));
+        assertThrows(IllegalArgumentException.class,()->ResetPipeline.nonSamsungAccounts("Account {malformed}\nSome unrelated output\n"));
     }
     @Test public void missingOptionalBrowserDoesNotFailOrInstall() throws Exception {
         Fake fake = new Fake() {
@@ -109,38 +109,43 @@ public class ResetPipelineTest {
 
     static class NmapFake extends Fake {
         long version=BuildConfig.NMAP_VERSION_CODE-1;
-        boolean failWrite;
+        boolean failWrite, disabled, ignoreEnable;
         final List<String> copies=new ArrayList<>();
         @Override public void copy(String asset,String destination){copies.add(asset);}
         @Override public ResetPipeline.Result run(String command,int seconds){
             commands.add(command);
-            if(command.startsWith("pm list packages"))return new ResetPipeline.Result(0,"package:com.nhn.android.nmap\n");
+            if(command.startsWith("pm list packages"))return new ResetPipeline.Result(0,command.contains(" -e ")&&disabled?"":"package:com.nhn.android.nmap\n");
             if(command.startsWith("dumpsys package"))return new ResetPipeline.Result(0,"versionCode="+version+" minSdk=26");
             if(command.startsWith("pm install-create"))return new ResetPipeline.Result(0,"Success: created install session [123]");
             if(command.startsWith("pm install-write")&&failWrite)return new ResetPipeline.Result(1,"Failure [INVALID_APK]");
             if(command.startsWith("pm install-commit"))version=BuildConfig.NMAP_VERSION_CODE;
-            if(command.startsWith("cmd package resolve-activity"))return new ResetPipeline.Result(0,"com.nhn.android.nmap/com.naver.map.LaunchActivity\n");
-            if(command.startsWith("am start"))return new ResetPipeline.Result(0,"Status: ok");
-            if(command.startsWith("pidof"))return new ResetPipeline.Result(0,"1234");
+            if(command.startsWith("pm enable")&&!ignoreEnable)disabled=false;
             return new ResetPipeline.Result(0,"Success");
         }
     }
     ResetPipeline nmapPipeline(NmapFake fake){
         return new ResetPipeline(fake,p->{},Set.of());
     }
-    @Test public void updatesNmapWithEverySplitAndVerifiesVersionAndLaunch() throws Exception {
-        NmapFake fake=new NmapFake();nmapPipeline(fake).prepareNmap();
+    @Test public void updatesNmapWithEverySplitAndChecksEnabledWithoutOpeningApp() throws Exception {
+        NmapFake fake=new NmapFake();fake.disabled=true;nmapPipeline(fake).prepareNmap();
         assertEquals(Arrays.asList(BuildConfig.NMAP_APKS),fake.copies);
         assertEquals(BuildConfig.NMAP_APKS.length,fake.commands.stream().filter(c->c.startsWith("pm install-write")).count());
         assertTrue(fake.commands.stream().anyMatch(c->c.startsWith("pm install-commit")));
-        assertTrue(fake.commands.stream().anyMatch(c->c.startsWith("pidof")));
+        assertFalse(fake.disabled);
+        assertTrue(fake.commands.stream().anyMatch(c->c.startsWith("pm list packages -e")));
+        assertFalse(fake.commands.stream().anyMatch(c->c.startsWith("am ")||c.startsWith("pidof")||c.contains("resolve-activity")));
         assertFalse(fake.commands.stream().anyMatch(c->c.startsWith("pm uninstall")));
     }
-    @Test public void newerNmapSkipsInstallButChecksLaunch() throws Exception {
+    @Test public void newerNmapSkipsInstallButChecksEnabledWithoutOpeningApp() throws Exception {
         NmapFake fake=new NmapFake();fake.version=BuildConfig.NMAP_VERSION_CODE+1;nmapPipeline(fake).prepareNmap();
         assertTrue(fake.copies.isEmpty());
         assertFalse(fake.commands.stream().anyMatch(c->c.startsWith("pm install-create")));
-        assertTrue(fake.commands.stream().anyMatch(c->c.startsWith("pidof")));
+        assertTrue(fake.commands.stream().anyMatch(c->c.startsWith("pm list packages -e")));
+        assertFalse(fake.commands.stream().anyMatch(c->c.startsWith("am ")||c.startsWith("pidof")||c.contains("resolve-activity")));
+    }
+    @Test public void nmapStillDisabledAfterEnableCannotPass() throws Exception {
+        NmapFake fake=new NmapFake();fake.disabled=true;fake.ignoreEnable=true;
+        assertThrows(IOException.class,()->nmapPipeline(fake).prepareNmap());
     }
     @Test public void failedNmapSplitAbandonsSessionAndNeverCommits() throws Exception {
         NmapFake fake=new NmapFake();fake.failWrite=true;
@@ -148,5 +153,39 @@ public class ResetPipelineTest {
         assertTrue(fake.commands.contains("pm install-abandon 123"));
         assertFalse(fake.commands.stream().anyMatch(c->c.startsWith("pm install-commit")));
         assertEquals(BuildConfig.NMAP_APKS.length,fake.commands.stream().filter(c->c.startsWith("rm -f")).count());
+    }
+    static class EssentialFake extends NmapFake {
+        final Set<String> disabledPackages=new HashSet<>();
+        EssentialFake(){version=BuildConfig.NMAP_VERSION_CODE;}
+        @Override public ResetPipeline.Result run(String command,int seconds) {
+            if(command.startsWith("pm list packages")) {
+                commands.add(command);
+                String pkg=command.substring(command.lastIndexOf(' ')+1).replace("'", "");
+                return new ResetPipeline.Result(0,command.contains(" -e ")&&disabledPackages.contains(pkg)?"":"package:"+pkg+"\n");
+            }
+            if(command.startsWith("pm enable")) {
+                String pkg=command.substring(command.lastIndexOf(' ')+1).replace("'", "");
+                if(pkg.equals(ResetPipeline.SELF)||pkg.equals(ResetPipeline.SHIZUKU))
+                    throw new AssertionError("Package state change kills live reset infrastructure");
+                disabledPackages.remove(pkg);
+            }
+            return super.run(command,seconds);
+        }
+    }
+    @Test public void essentialStepNeverChangesActiveSelfOrShizukuPackageState() throws Exception {
+        EssentialFake fake=new EssentialFake();
+        fake.disabledPackages.add("com.alphainventor.filemanager");
+        ResetPipeline pipeline=nmapPipeline(fake);pipeline.step(17,"ja-JP","SM-S938N");
+        assertTrue(pipeline.warnings.isEmpty());
+        assertTrue(fake.disabledPackages.isEmpty());
+        assertEquals(1,fake.commands.stream().filter(c->c.startsWith("pm enable")).count());
+        assertTrue(fake.commands.stream().anyMatch(c->c.startsWith("pm enable")&&c.contains("com.alphainventor.filemanager")));
+    }
+    @Test public void disabledInfrastructureIsReportedWithoutTryingToRestartIt() {
+        for(String pkg:List.of(ResetPipeline.SELF,ResetPipeline.SHIZUKU)) {
+            EssentialFake fake=new EssentialFake();fake.disabledPackages.add(pkg);
+            assertThrows(IOException.class,()->nmapPipeline(fake).step(17,"ja-JP","SM-S938N"));
+            assertFalse(fake.commands.stream().anyMatch(c->c.startsWith("pm enable")));
+        }
     }
 }

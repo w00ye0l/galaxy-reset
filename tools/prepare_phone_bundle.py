@@ -57,6 +57,8 @@ def check():
         embedded_nmap = json.loads(archive.read('assets/nmap-bundle.json'))
         if embedded_nmap != nmap:
             raise ValueError('Android APK contains an old Naver Map bundle; rebuild Android and refresh phone-app first')
+        if hashlib.sha256(archive.read('assets/account_preparer.dex')).hexdigest() != sha256(ROOT / 'account_preparer.dex'):
+            raise ValueError('Android APK contains a stale authenticator helper; rebuild Android and refresh phone-app')
     update = json.loads((DEST / 'galaxy-reset-update.json').read_text(encoding='utf-8'))
     expected = update_metadata(reset)
     if update != expected:

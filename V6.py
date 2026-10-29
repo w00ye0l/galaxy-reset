@@ -579,7 +579,12 @@ def detect_series(serial):
 def clear_app_data(serial, package, desc):
     """특정 앱의 데이터를 초기화합니다."""
     logging.info('[%s] %s 데이터 초기화 중...', serial, desc)
-    run_command(['adb', '-s', serial, 'shell', 'pm', 'clear', package])
+    listed = _pc_required(serial, ['shell','pm','list','packages','--user','0',package])
+    if 'package:' + package not in listed.stdout.splitlines():
+        return
+    result = _pc_required(serial, ['shell','pm','clear','--user','0',package], timeout=120)
+    if result.stdout.strip() != 'Success':
+        raise RuntimeError(desc + ' 데이터 초기화 실패')
 
 
 # ============================================================
@@ -795,6 +800,14 @@ def remove_non_samsung_accounts(serial):
     accounts = get_device_accounts(serial)
     protected = sum(is_samsung_account(a['type']) for a in accounts)
     logging.info('[%s] 현재 계정 %d개 · 삼성 계정 보존 %d개', serial, len(accounts), protected)
+    if len(accounts) > protected:
+        if not push_dex_if_needed(serial, 'account_preparer.dex'):
+            raise RuntimeError('계정 인증 서비스 준비 헬퍼 없음')
+        prepared = run_command(['adb','-s',serial,'shell','CLASSPATH=/data/local/tmp/account_preparer.dex',
+                                'app_process','/system/bin','AccountPreparer','--prepare'],timeout=120,retries=0)
+        if prepared.returncode != 0 or 'SUCCESS:AUTHENTICATORS_READY' not in (prepared.stdout or ''):
+            raise RuntimeError('계정 인증 서비스 활성화·검증 실패')
+        time.sleep(1)
     if not push_dex_if_needed(serial, 'account_remover.dex'):
         raise RuntimeError('account_remover.dex 없음 · 계정 삭제를 완료하지 못했습니다.')
     # DEX output may contain customer identifiers. Verify inventory instead of logging it.
@@ -806,6 +819,7 @@ def remove_non_samsung_accounts(serial):
         logging.info('[%s] 네이버 계정 잔존 · 설정에서 기기 계정/인증 정보 제거 중...', serial)
         naver_account_cleanup.remove(serial, run_command)
     naver_account_cleanup.clear_map_session(serial, run_command)
+    naver_account_cleanup.clear_app_session(serial, run_command, naver_account_cleanup.MEET, 'Google Meet')
     verify_non_samsung_accounts_removed(serial)
     logging.info('[%s] 비삼성 계정 0개 확인 · 삼성 계정 보존 · 계정 삭제 완료', serial)
 
@@ -1604,7 +1618,7 @@ def prepare_wireless_reset(serial):
         raise RuntimeError('폰 앱 준비는 소유자(사용자 0) 화면에서 진행하세요.')
     sdk = int(sdk_text)
     for package in (PHONE_APP_PACKAGE, SHIZUKU_PACKAGE):
-        _pc_required(serial, ['shell', 'pm', 'enable', '--user', '0', package])
+        _ensure_package_enabled(serial, package)
         _pc_required(serial, ['shell', 'pm', 'grant', '--user', '0', package,
                               'android.permission.WRITE_SECURE_SETTINGS'])
         if sdk >= 33:
@@ -1666,31 +1680,33 @@ def ensure_essential_apps_installed(serial):
             raise RuntimeError('필수 앱 설치 후 조회 실패: ' + app['name'])
         if 'versionCode' in app and _package_version(serial, package) < app['versionCode']:
             raise RuntimeError('필수 앱 버전 확인 실패: ' + app['name'])
-    verify_nmap_launch(serial)
+    for app in apps:
+        _ensure_package_enabled(serial, app['package'])
+    verify_nmap_ready(serial)
     prepare_wireless_reset(serial)
 
 
-def verify_nmap_launch(serial):
-    _pc_required(serial, ['shell', 'pm', 'enable', '--user', '0', NMAP_PACKAGE])
-    _pc_required(serial, ['shell', 'am', 'force-stop', '--user', '0', NMAP_PACKAGE])
-    try:
-        resolved = _pc_required(serial, ['shell', 'cmd', 'package', 'resolve-activity', '--brief', '--user', '0',
-                                        '-a', 'android.intent.action.MAIN', '-c', 'android.intent.category.LAUNCHER',
-                                        '-p', NMAP_PACKAGE]).stdout.strip().splitlines()
-        component = resolved[-1] if resolved else ''
-        if not re.fullmatch(r'com\.nhn\.android\.nmap/[A-Za-z0-9_.$]+', component):
-            raise RuntimeError('네이버 지도 실행 화면 조회 실패')
-        result = _pc_required(serial, ['shell', 'am', 'start', '-W', '--user', '0',
-                                      '-n', component], timeout=45)
-        if 'Status: ok' not in result.stdout:
-            raise RuntimeError('네이버 지도 실행 실패: 시작 결과를 확인하세요.')
-        time.sleep(2)
-        running = _pc_required(serial, ['shell', 'pidof', NMAP_PACKAGE], timeout=10)
-        if not re.fullmatch(r'[0-9\s]+', running.stdout.strip()):
-            raise RuntimeError('네이버 지도 실행 후 프로세스가 종료되었습니다.')
-        logging.info('[%s] 네이버 지도 버전·시작 확인 완료 (첫 안내/권한 및 지도 로딩은 별도 확인)', serial)
-    finally:
-        run_command(['adb', '-s', serial, 'shell', 'am', 'force-stop', '--user', '0', NMAP_PACKAGE])
+def _ensure_package_enabled(serial, package):
+    # Avoid a package state change (and process restart) for already active apps.
+    query = ['shell', 'pm', 'list', 'packages', '-e', '--user', '0', package]
+    if 'package:' + package in _pc_required(serial, query).stdout.splitlines():
+        return
+    _pc_required(serial, ['shell', 'pm', 'enable', '--user', '0', package])
+    if 'package:' + package not in _pc_required(serial, query).stdout.splitlines():
+        raise RuntimeError('필수 앱 활성 상태 확인 실패: ' + package)
+
+
+def verify_nmap_ready(serial):
+    """네이버 지도를 실행하지 않고 설치·최소 버전·실제 활성 상태를 확인합니다."""
+    path = _pc_required(serial, ['shell', 'pm', 'path', '--user', '0', NMAP_PACKAGE])
+    if not path.stdout.strip().startswith('package:'):
+        raise RuntimeError('네이버 지도 설치 확인 실패')
+    if _package_version(serial, NMAP_PACKAGE) < load_nmap_bundle()['versionCode']:
+        raise RuntimeError('네이버 지도 설치 버전 확인 실패')
+    enabled = _pc_required(serial, ['shell', 'pm', 'list', 'packages', '-e', '--user', '0', NMAP_PACKAGE])
+    if 'package:' + NMAP_PACKAGE not in enabled.stdout.splitlines():
+        raise RuntimeError('네이버 지도 활성 상태 확인 실패')
+    logging.info('[%s] 네이버 지도 설치·버전·활성 상태 확인 완료', serial)
 
 
 # ============================================================

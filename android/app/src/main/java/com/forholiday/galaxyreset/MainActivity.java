@@ -99,10 +99,13 @@ public class MainActivity extends Activity {
     }
     void render(){
         startButton=null;updateStatus=null;updateCheck=null;
+        rows=null;records=null;percent=null;
         int current=screen();frame=column();frame.setBackgroundColor(BG);frame.setTag(current==3?"progress:"+preview:"screen:"+current);setContentView(frame);
         frame.setOnApplyWindowInsetsListener((view,insets)->{Insets bars=insets.getInsets(WindowInsets.Type.systemBars());view.setPadding(bars.left,bars.top,bars.right,bars.bottom);return insets;});frame.requestApplyInsets();
         WindowInsetsController controls=frame.getWindowInsetsController();if(controls!=null)controls.setSystemBarsAppearance(WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS|WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS,WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS|WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS);
-        contentScroll=new ScrollView(this);contentScroll.setFillViewport(true);body=column();body.setPadding(dp(20),dp(8),dp(20),dp(20));contentScroll.addView(body);frame.addView(contentScroll,new LinearLayout.LayoutParams(-1,0,1));
+        body=column();body.setPadding(dp(20),dp(8),dp(20),dp(20));
+        if(current==3){contentScroll=null;frame.addView(body,new LinearLayout.LayoutParams(-1,0,1));}
+        else {contentScroll=new ScrollView(this);contentScroll.setFillViewport(true);contentScroll.addView(body);frame.addView(contentScroll,new LinearLayout.LayoutParams(-1,0,1));}
         footer=column();footer.setPadding(dp(20),dp(12),dp(20),dp(16));footer.setBackgroundColor(WHITE);frame.addView(footer);
         switch(current){case 0->connectionScreen();case 1,2->startScreen();case 3->progressScreen();case 4->doneScreen();case 5->failureScreen();}
         renderUpdateStatus();
@@ -156,8 +159,10 @@ public class MainActivity extends Activity {
         progressBar=new ProgressBar(this,null,android.R.attr.progressBarStyleHorizontal);progressBar.setMax(19);progressBar.setProgressTintList(ColorStateList.valueOf(TEAL));progressBar.setProgressBackgroundTintList(ColorStateList.valueOf(BORDER));top.addView(progressBar,new LinearLayout.LayoutParams(-1,dp(8)));space(top,12);progressLabel=text(top,"",15,TEAL,true);body.addView(top);space(body,12);
         LinearLayout tip=row();tip.setPadding(dp(12),dp(12),dp(12),dp(12));tip.setBackground(shape(0xfffff1dc,12,0));tip.addView(icon(UiIcon.ALERT,AMBER,20));TextView message=label("화면이 깜빡이거나 홈 화면으로 나가도 정상이에요. 끝나면 돌아옵니다. 충전기를 연결해 두세요.",12,AMBER,false);LinearLayout.LayoutParams m=new LinearLayout.LayoutParams(0,-2,1);m.setMargins(dp(8),0,0,0);tip.addView(message,m);body.addView(tip);space(body,16);
         LinearLayout title=row();title.addView(label("진행 기록",14,INK,true),new LinearLayout.LayoutParams(0,-2,1));title.addView(label("눌러서 상세 확인",11,MUTED,false));body.addView(title);space(body,8);
-        // One scroll owner: clickable step rows must not compete with a nested ScrollView.
-        records=contentScroll;rows=column();rows.setBackground(shape(WHITE,18,0));rows.setPadding(dp(14),dp(10),dp(14),dp(10));body.addView(rows);
+        // The header is outside every ScrollView. Only the remaining log area scrolls.
+        records=new ScrollView(this);records.setFillViewport(true);records.setBackground(shape(WHITE,18,0));records.setClipToOutline(true);
+        rows=column();rows.setPadding(dp(14),dp(10),dp(14),dp(10));records.addView(rows);
+        body.addView(records,new LinearLayout.LayoutParams(-1,0,1));
         if(demo())action(footer,"완료 화면 보기",UiIcon.ARROW,TEAL,WHITE,()->{preview=4;render();});
         else if(!running())action(footer,"결과 화면으로",UiIcon.ARROW,TEAL,WHITE,()->{override=-1;render();});
         else {text(footer,deviceName()+" · "+ko(state.locale()),12,MUTED,false);footer.setBackgroundColor(BG);}
@@ -167,7 +172,11 @@ public class MainActivity extends Activity {
     void updateProgress(){if(rows==null||percent==null)return;int count=demo()?6:state.completed();percent.setText((count*100/19)+"%");countLabel.setText(count+" / 19");progressBar.setProgress(count);progressLabel.setText(demo()?"로그·캐시 정리 중…":running()?ResetPipeline.LABELS[state.index()]+" 중…":"전체 단계 기록");
         int scrollY=records.getScrollY();rows.removeAllViews();for(int i=0;i<19;i++){final int step=i;String status=displayedStatus(i);boolean done=status.equals("완료"),active=status.equals("진행 중"),problem=status.equals("실패")||status.equals("수동 확인");LinearLayout item=row();item.setPadding(dp(4),dp(10),dp(4),dp(10));item.setMinimumHeight(dp(48));item.setBackground(ripple(active?PALE:WHITE,10,0));item.addView(icon(done?UiIcon.CHECK:problem?UiIcon.ALERT:active?UiIcon.REFRESH:UiIcon.INFO,done||active?TEAL:problem?AMBER:BORDER,20));LinearLayout copy=column();LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(0,-2,1);p.setMargins(dp(10),0,dp(6),0);item.addView(copy,p);text(copy,ResetPipeline.LABELS[i],13,active?TEAL:status.equals("대기")?MUTED:INK,true);
             if(problem){space(copy,3);text(copy,status,11,AMBER,false);}item.addView(label(String.format(Locale.ROOT,"%02d",i+1),11,MUTED,false));item.setContentDescription((i+1)+"단계 "+ResetPipeline.LABELS[i]+", "+status+", 상세 확인");item.setOnClickListener(v->showStep(step));rows.addView(item);}
-        records.post(()->{if(running()&&!demo())records.smoothScrollTo(0,rows.getTop()+rows.getChildAt(state.index()).getTop());else records.scrollTo(0,scrollY);});
+        if(running()&&!demo())scrollRecordsToStep(state.index());else {ScrollView log=records;log.post(()->log.scrollTo(0,scrollY));}
+    }
+    void scrollRecordsToStep(int step){
+        ScrollView log=records;LinearLayout list=rows;
+        log.post(()->{if(records!=log||rows!=list||step<0||step>=list.getChildCount())return;log.smoothScrollTo(0,list.getChildAt(step).getTop());});
     }
     void hero(String title,String subtitle,int kind,int fill){space(body,22);ImageView symbol=icon(kind,WHITE,42);symbol.setPadding(dp(15),dp(15),dp(15),dp(15));symbol.setBackground(shape(fill,40,0));LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(dp(76),dp(76));p.gravity=Gravity.CENTER_HORIZONTAL;body.addView(symbol,p);space(body,18);TextView name=text(body,title,26,INK,true);name.setGravity(Gravity.CENTER);space(body,10);TextView details=text(body,subtitle,12,MUTED,false);details.setGravity(Gravity.CENTER);space(body,24);}
     void doneScreen(){hero("초기화 완료",deviceName()+" · "+(demo()?19:state.completed())+" / 19단계",UiIcon.CHECK,TEAL);LinearLayout results=column();card(results,WHITE);String summary=state.prefs.getString("summary","");

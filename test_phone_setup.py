@@ -25,14 +25,17 @@ class FakeDevice:
         self.running = True
         self.install_failure = False
         self.grant_failure = False
-        self.nmap_alive = True
+        self.disabled = set()
+        self.reject_enable = None
+        self.ignore_enable = None
 
     def run(self, command, **kwargs):
         self.calls.append(list(command))
         a = command[3:]
         code, out, err = 0, '', ''
         if a[:4] == ['shell', 'pm', 'list', 'packages']:
-            out = ''.join('package:%s\n' % p for p in sorted(self.installed))
+            packages = self.installed - self.disabled if '-e' in a else self.installed
+            out = ''.join('package:%s\n' % p for p in sorted(packages))
         elif a[:3] == ['shell', 'dumpsys', 'package']:
             out = ('codePath=/data/app/~~ABC=/moe.shizuku.privileged.api-XYZ==\n'
                    'primaryCpuAbi=arm64-v8a\nversionCode=%d minSdk=24\n' % self.versions[a[-1]])
@@ -57,16 +60,15 @@ class FakeDevice:
                 self.auth_timeout = a[5]
         elif a[:4] == ['shell', 'settings', 'get', 'global']:
             out = (self.auth_timeout if a[4] == 'adb_allowed_connection_time' else self.wireless) + '\n'
-        elif a[:4] == ['shell', 'cmd', 'package', 'resolve-activity']:
-            out = 'com.nhn.android.nmap/com.naver.map.LaunchActivity\n'
-        elif a[:3] == ['shell', 'am', 'start'] and a[-1].startswith('com.nhn.android.nmap/'):
-            out = 'Status: ok\n'
-        elif a[:3] == ['shell', 'pidof', V6.NMAP_PACKAGE]:
-            code, out = (0, '5555\n') if self.nmap_alive else (1, '')
         elif a[:3] == ['shell', 'pidof', 'shizuku_server']:
             code, out = (0, '2345\n') if self.running else (1, '')
         elif len(a) == 2 and 'libshizuku.so' in a[1]:
             self.running = True
+        elif a[:3] == ['shell', 'pm', 'enable']:
+            if a[-1] == self.reject_enable:code,out=1,'Error: enable denied'
+            else:
+                if a[-1] != self.ignore_enable:self.disabled.discard(a[-1])
+                out='Package '+a[-1]+' new state: enabled\n'
         elif a[:3] == ['shell', 'pm', 'grant'] and self.grant_failure:
             code, err = 1, 'SecurityException: permission denied'
         return subprocess.CompletedProcess(command, code, out, err)
@@ -92,6 +94,21 @@ class PhoneSetupTest(unittest.TestCase):
         self.assertTrue({V6.PHONE_APP_PACKAGE, V6.SHIZUKU_PACKAGE} <= self.fake.installed)
         self.assertFalse(any('uninstall' in c for c in self.fake.calls))
 
+    def test_all_installed_essential_apps_are_enabled_even_without_updates(self):
+        self.fake.disabled=set(self.fake.installed)
+        V6.ensure_essential_apps_installed('TEST')
+        self.assertFalse(self.fake.disabled)
+        self.assertFalse(any(c[3] in ['install','install-multiple'] for c in self.fake.calls))
+
+    def test_active_apps_are_verified_without_state_changes_or_restarts(self):
+        V6.ensure_essential_apps_installed('TEST')
+        self.assertFalse(any(c[3:6] == ['shell','pm','enable'] for c in self.fake.calls))
+
+    def test_disabled_file_manager_activation_failure_blocks_completion(self):
+        self.fake.disabled={'com.alphainventor.filemanager'}
+        self.fake.reject_enable='com.alphainventor.filemanager'
+        self.assertRaises(RuntimeError,V6.ensure_essential_apps_installed,'TEST')
+
     def test_updates_old_reset_app_without_uninstalling(self):
         self.fake.versions[V6.PHONE_APP_PACKAGE] -= 1
         V6.ensure_essential_apps_installed('TEST')
@@ -113,18 +130,20 @@ class PhoneSetupTest(unittest.TestCase):
         self.assertEqual(commands[0][7:], V6.load_nmap_bundle()['apk_paths'])
         self.assertIn('-r', commands[0])
 
-    def test_newer_nmap_is_preserved_and_still_launch_checked(self):
+    def test_newer_nmap_is_preserved_and_checked_without_opening_app(self):
         self.fake.versions[V6.NMAP_PACKAGE] += 1
         V6.ensure_essential_apps_installed('TEST')
         self.assertFalse(any(c[3] == 'install-multiple' for c in self.fake.calls))
-        self.assertTrue(any(c[-1] == V6.NMAP_PACKAGE and 'pidof' in c for c in self.fake.calls))
+        self.assertTrue(any(c[-1] == V6.NMAP_PACKAGE and '-e' in c for c in self.fake.calls))
+        self.assertFalse(any(any(x in c for x in ['resolve-activity', 'start', 'pidof', 'force-stop'])
+                             and any(V6.NMAP_PACKAGE in x for x in c) for c in self.fake.calls))
 
-    def test_nmap_immediate_exit_fails_preparation(self):
-        self.fake.nmap_alive = False
-        with self.assertRaises(RuntimeError):
+    def test_nmap_still_disabled_after_enable_fails_preparation(self):
+        self.fake.disabled.add(V6.NMAP_PACKAGE)
+        self.fake.ignore_enable = V6.NMAP_PACKAGE
+        with self.assertRaisesRegex(RuntimeError, '활성 상태 확인 실패'):
             V6.ensure_essential_apps_installed('TEST')
         self.assertFalse(V6.POST_RUN_NOTICES)
-        self.assertTrue(any('force-stop' in c and c[-1] == V6.NMAP_PACKAGE for c in self.fake.calls))
 
     def test_signature_failure_stops_setup_and_never_uninstalls(self):
         self.fake.versions[V6.PHONE_APP_PACKAGE] -= 1

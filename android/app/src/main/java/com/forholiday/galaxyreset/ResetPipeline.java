@@ -70,6 +70,19 @@ final class ResetPipeline {
         if(!version.find())throw new IOException("설치 버전 조회 실패: "+pkg);
         return Long.parseLong(version.group(1));
     }
+    void ensureEnabled(String pkg) throws Exception {
+        String query="pm list packages -e --user 0 "+quote(pkg);
+        if(Arrays.asList(required(query).output.split("\\R")).contains("package:"+pkg))return;
+        // Changing our own package state can kill the running reset service.
+        // Shizuku is also live infrastructure: only inspect it during a phone reset.
+        if(pkg.equals(SELF)||pkg.equals(SHIZUKU))
+            throw new IOException("실행 기반 앱 활성 상태 확인 필요: "+pkg);
+        Result enabled=raw("pm enable --user 0 "+quote(pkg),30);
+        if(enabled.code!=0||enabled.truncated||enabled.output.contains("Exception")||enabled.output.contains("Error:"))
+            throw new IOException("필수 앱 활성화 실패: "+pkg);
+        if(!Arrays.asList(required(query).output.split("\\R")).contains("package:"+pkg))
+            throw new IOException("필수 앱 활성 상태 확인 실패: "+pkg);
+    }
     void nmapInstallSuccess(Result result) throws IOException {
         if(result.code!=0||result.truncated||!result.output.contains("Success")||result.output.contains("Failure"))
             throw new IOException("네이버 지도 분할 APK 설치 실패: "+result.output.substring(0,Math.min(180,result.output.length())));
@@ -93,21 +106,15 @@ final class ResetPipeline {
             }
         }
         if(!installed(pkg)||packageVersion(pkg)<BuildConfig.NMAP_VERSION_CODE)throw new IOException("네이버 지도 설치 버전 확인 실패");
-        checked("pm enable --user 0 "+pkg,30);checked("am force-stop --user 0 "+pkg,30);
-        try{
-            String[] resolved=required("cmd package resolve-activity --brief --user 0 -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p "+pkg).output.trim().split("\\R");
-            String component=resolved[resolved.length-1];
-            if(!component.matches("com\\.nhn\\.android\\.nmap/[A-Za-z0-9_.$]+"))throw new IOException("네이버 지도 실행 화면 조회 실패");
-            Result start=required("am start -W --user 0 -n "+quote(component));
-            if(!start.output.contains("Status: ok"))throw new IOException("네이버 지도 실행 실패");
-            pause(2000);
-            if(!required("pidof "+pkg).output.trim().matches("[0-9\\s]+"))throw new IOException("네이버 지도 실행 직후 종료됨");
-            notes.add("네이버 지도 버전·시작 확인 완료 · 첫 안내/권한 및 지도 로딩은 별도 확인");
-        }finally{try{raw("am force-stop --user 0 "+pkg,30);}catch(Exception ignored){}}
+        ensureEnabled(pkg);
+        notes.add("네이버 지도 설치·버전·활성 상태 확인 완료");
     }
     void commands(String... commands) throws Exception { for (String c : commands) checked(c, 120); }
     void clear(String... packages) throws Exception {
-        for (String pkg : packages) if (installed(pkg)) checked("pm clear --user 0 " + quote(pkg), 120);
+        for (String pkg : packages) if (installed(pkg)) {
+            Result result = raw("pm clear --user 0 " + quote(pkg), 120);
+            if(result.code!=0||result.truncated||!result.output.trim().equals("Success"))warnings.add("앱 데이터 초기화 실패: "+pkg);
+        }
     }
     Result dex(String file, String main, String... args) throws Exception {
         bridge.copy(file, TMP + file);
@@ -139,16 +146,7 @@ final class ResetPipeline {
         return (int) accountTypes(dump).stream().filter("com.nhn.android.naveraccount"::equals).count();
     }
     static List<String> accountTypes(String dump) {
-        List<String> types = new ArrayList<>();
-        for (String line : dump.split("\\R")) {
-            String trimmed = line.trim();
-            if (!trimmed.startsWith("Account {")) continue;
-            int typeStart = trimmed.lastIndexOf("type="), close = trimmed.lastIndexOf('}');
-            if (typeStart < 0 || close <= typeStart + 5) continue;
-            String type = trimmed.substring(typeStart + 5, close).trim();
-            types.add(type);
-        }
-        return types;
+        return AccountPreparationPolicy.accountList(dump);
     }
     static final String WIDGET_QUERY = "dump=$(dumpsys appwidget) || exit $?; printf '%s\\n' \"$dump\" | sed -n '/^[[:space:]]*Widgets:/,/^[[:space:]]*Hosts:/p'";
     Set<String> queryWidgetProviders() throws Exception {
@@ -196,7 +194,15 @@ final class ResetPipeline {
         switch (index) {
             case 0 -> success(dex("locale_changer.dex", "LocaleChanger", locales(locale).toArray(new String[0])), "SUCCESS", "언어 변경 확인 필요");
             case 1 -> {
-                required("dumpsys account");
+                String before = required("dumpsys account").output;
+                String meet = "com.google.android.apps.tachyon";
+                if (nonSamsungAccounts(before)>0) {
+                    Result prepared=dex("account_preparer.dex","AccountPreparer","--prepare");
+                    if(prepared.code!=0||prepared.truncated||!prepared.output.contains("SUCCESS:AUTHENTICATORS_READY"))
+                        throw new IOException("계정 인증 서비스 활성화·검증 실패");
+                    pause(1000);
+                    notes.add("비삼성 계정 인증 서비스 활성화·검증 후 제거 시도");
+                }
                 try { dex("account_remover.dex", "AccountRemover"); }
                 catch (ConnectionLost e) { throw e; }
                 catch (Exception ignored) { notes.add("백그라운드 계정 제거 재확인"); }
@@ -212,6 +218,12 @@ final class ResetPipeline {
                     if (cleared.code != 0 || cleared.truncated || !cleared.output.trim().equals("Success"))
                         throw new IOException("네이버 지도 로그인·저장 데이터 초기화 실패");
                     notes.add("네이버 지도 로그인 세션·저장 데이터 초기화 확인");
+                }
+                if (installed(meet)) {
+                    Result cleared = raw("pm clear --user 0 " + meet, 120);
+                    if (cleared.code != 0 || cleared.truncated || !cleared.output.trim().equals("Success"))
+                        throw new IOException("Google Meet 로그인·저장 데이터 초기화 실패");
+                    notes.add("Google Meet 로그인 세션·저장 데이터 초기화 확인");
                 }
                 int remaining = nonSamsungAccounts(required("dumpsys account").output);
                 if (remaining == 0) {
@@ -336,6 +348,7 @@ final class ResetPipeline {
                     checked("rm -f " + quote(TMP + asset), 30);
                 }
                 commands("pm grant --user 0 " + SELF + " android.permission.WRITE_SECURE_SETTINGS");
+                for(String pkg:List.of("com.alphainventor.filemanager",SELF,SHIZUKU))if(installed(pkg))ensureEnabled(pkg);
             }
             case 18 -> success(dex("recent_tasks_cleaner.dex", "RecentTasksCleaner"), "SUCCESS", "최근 앱 삭제 확인 필요");
             default -> throw new IllegalArgumentException("잘못된 단계");

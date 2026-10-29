@@ -7,8 +7,9 @@ android {
         applicationId 'com.forholiday.galaxyreset'
         minSdk 30
         targetSdk 36
-        versionCode 21
-        versionName '1.1.17'
+        versionCode 24
+        versionName '1.1.20'
+        testInstrumentationRunner 'com.forholiday.galaxyreset.ProgressLayoutCheck'
         buildConfigField 'long', 'NMAP_VERSION_CODE', nmapBundle.versionCode.toString() + 'L'
         buildConfigField 'String[]', 'NMAP_APKS', 'new String[]{' + nmapBundle.apks.collect { '"' + it.file + '"' }.join(',') + '}'
     }
@@ -19,7 +20,7 @@ android {
     }
     sourceSets.main.assets.srcDir layout.buildDirectory.dir('generated/resetAssets')
 }
-def resetAssets = ['locale_changer.dex', 'account_remover.dex', 'esim_manager.dex',
+def resetAssets = ['locale_changer.dex', 'account_remover.dex', 'account_preparer.dex', 'esim_manager.dex',
                    'content_cleaner.dex', 'wallpaper_setter.dex', 'recent_tasks_cleaner.dex',
                    'S23.png', 'S24.png', 'S25.png', 'S26.png', 'filemanager.apk', 'nmap-bundle.json'] + nmapBundle.apks.collect { it.file }
 tasks.register('prepareResetAssets', Copy) {
