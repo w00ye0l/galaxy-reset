@@ -70,6 +70,19 @@ final class ResetPipeline {
         if(!version.find())throw new IOException("설치 버전 조회 실패: "+pkg);
         return Long.parseLong(version.group(1));
     }
+    void ensureEnabled(String pkg) throws Exception {
+        String query="pm list packages -e --user 0 "+quote(pkg);
+        if(Arrays.asList(required(query).output.split("\\R")).contains("package:"+pkg))return;
+        // Changing our own package state can kill the running reset service.
+        // Shizuku is also live infrastructure: only inspect it during a phone reset.
+        if(pkg.equals(SELF)||pkg.equals(SHIZUKU))
+            throw new IOException("실행 기반 앱 활성 상태 확인 필요: "+pkg);
+        Result enabled=raw("pm enable --user 0 "+quote(pkg),30);
+        if(enabled.code!=0||enabled.truncated||enabled.output.contains("Exception")||enabled.output.contains("Error:"))
+            throw new IOException("필수 앱 활성화 실패: "+pkg);
+        if(!Arrays.asList(required(query).output.split("\\R")).contains("package:"+pkg))
+            throw new IOException("필수 앱 활성 상태 확인 실패: "+pkg);
+    }
     void nmapInstallSuccess(Result result) throws IOException {
         if(result.code!=0||result.truncated||!result.output.contains("Success")||result.output.contains("Failure"))
             throw new IOException("네이버 지도 분할 APK 설치 실패: "+result.output.substring(0,Math.min(180,result.output.length())));
@@ -93,12 +106,7 @@ final class ResetPipeline {
             }
         }
         if(!installed(pkg)||packageVersion(pkg)<BuildConfig.NMAP_VERSION_CODE)throw new IOException("네이버 지도 설치 버전 확인 실패");
-        Result enabled=raw("pm enable --user 0 "+pkg,30);
-        if(enabled.code!=0||enabled.truncated||enabled.output.contains("Exception")||enabled.output.contains("Error:"))
-            throw new IOException("네이버 지도 활성화 실패");
-        Result active=required("pm list packages -e --user 0 "+quote(pkg));
-        if(!Arrays.asList(active.output.split("\\R")).contains("package:"+pkg))
-            throw new IOException("네이버 지도 활성 상태 확인 실패");
+        ensureEnabled(pkg);
         notes.add("네이버 지도 설치·버전·활성 상태 확인 완료");
     }
     void commands(String... commands) throws Exception { for (String c : commands) checked(c, 120); }
@@ -340,10 +348,7 @@ final class ResetPipeline {
                     checked("rm -f " + quote(TMP + asset), 30);
                 }
                 commands("pm grant --user 0 " + SELF + " android.permission.WRITE_SECURE_SETTINGS");
-                for(String pkg:List.of("com.alphainventor.filemanager",SELF,SHIZUKU))if(installed(pkg)) {
-                    Result enabled=raw("pm enable --user 0 "+quote(pkg),30);
-                    if(enabled.code!=0||enabled.truncated||!enabled.output.contains("new state: enabled"))warnings.add("필수 앱 활성화 실패: "+pkg);
-                }
+                for(String pkg:List.of("com.alphainventor.filemanager",SELF,SHIZUKU))if(installed(pkg))ensureEnabled(pkg);
             }
             case 18 -> success(dex("recent_tasks_cleaner.dex", "RecentTasksCleaner"), "SUCCESS", "최근 앱 삭제 확인 필요");
             default -> throw new IllegalArgumentException("잘못된 단계");

@@ -100,6 +100,10 @@ class PhoneSetupTest(unittest.TestCase):
         self.assertFalse(self.fake.disabled)
         self.assertFalse(any(c[3] in ['install','install-multiple'] for c in self.fake.calls))
 
+    def test_active_apps_are_verified_without_state_changes_or_restarts(self):
+        V6.ensure_essential_apps_installed('TEST')
+        self.assertFalse(any(c[3:6] == ['shell','pm','enable'] for c in self.fake.calls))
+
     def test_disabled_file_manager_activation_failure_blocks_completion(self):
         self.fake.disabled={'com.alphainventor.filemanager'}
         self.fake.reject_enable='com.alphainventor.filemanager'

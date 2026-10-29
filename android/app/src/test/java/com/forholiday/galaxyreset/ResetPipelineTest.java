@@ -154,4 +154,38 @@ public class ResetPipelineTest {
         assertFalse(fake.commands.stream().anyMatch(c->c.startsWith("pm install-commit")));
         assertEquals(BuildConfig.NMAP_APKS.length,fake.commands.stream().filter(c->c.startsWith("rm -f")).count());
     }
+    static class EssentialFake extends NmapFake {
+        final Set<String> disabledPackages=new HashSet<>();
+        EssentialFake(){version=BuildConfig.NMAP_VERSION_CODE;}
+        @Override public ResetPipeline.Result run(String command,int seconds) {
+            if(command.startsWith("pm list packages")) {
+                commands.add(command);
+                String pkg=command.substring(command.lastIndexOf(' ')+1).replace("'", "");
+                return new ResetPipeline.Result(0,command.contains(" -e ")&&disabledPackages.contains(pkg)?"":"package:"+pkg+"\n");
+            }
+            if(command.startsWith("pm enable")) {
+                String pkg=command.substring(command.lastIndexOf(' ')+1).replace("'", "");
+                if(pkg.equals(ResetPipeline.SELF)||pkg.equals(ResetPipeline.SHIZUKU))
+                    throw new AssertionError("Package state change kills live reset infrastructure");
+                disabledPackages.remove(pkg);
+            }
+            return super.run(command,seconds);
+        }
+    }
+    @Test public void essentialStepNeverChangesActiveSelfOrShizukuPackageState() throws Exception {
+        EssentialFake fake=new EssentialFake();
+        fake.disabledPackages.add("com.alphainventor.filemanager");
+        ResetPipeline pipeline=nmapPipeline(fake);pipeline.step(17,"ja-JP","SM-S938N");
+        assertTrue(pipeline.warnings.isEmpty());
+        assertTrue(fake.disabledPackages.isEmpty());
+        assertEquals(1,fake.commands.stream().filter(c->c.startsWith("pm enable")).count());
+        assertTrue(fake.commands.stream().anyMatch(c->c.startsWith("pm enable")&&c.contains("com.alphainventor.filemanager")));
+    }
+    @Test public void disabledInfrastructureIsReportedWithoutTryingToRestartIt() {
+        for(String pkg:List.of(ResetPipeline.SELF,ResetPipeline.SHIZUKU)) {
+            EssentialFake fake=new EssentialFake();fake.disabledPackages.add(pkg);
+            assertThrows(IOException.class,()->nmapPipeline(fake).step(17,"ja-JP","SM-S938N"));
+            assertFalse(fake.commands.stream().anyMatch(c->c.startsWith("pm enable")));
+        }
+    }
 }

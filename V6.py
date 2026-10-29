@@ -1618,7 +1618,7 @@ def prepare_wireless_reset(serial):
         raise RuntimeError('폰 앱 준비는 소유자(사용자 0) 화면에서 진행하세요.')
     sdk = int(sdk_text)
     for package in (PHONE_APP_PACKAGE, SHIZUKU_PACKAGE):
-        _pc_required(serial, ['shell', 'pm', 'enable', '--user', '0', package])
+        _ensure_package_enabled(serial, package)
         _pc_required(serial, ['shell', 'pm', 'grant', '--user', '0', package,
                               'android.permission.WRITE_SECURE_SETTINGS'])
         if sdk >= 33:
@@ -1681,9 +1681,19 @@ def ensure_essential_apps_installed(serial):
         if 'versionCode' in app and _package_version(serial, package) < app['versionCode']:
             raise RuntimeError('필수 앱 버전 확인 실패: ' + app['name'])
     for app in apps:
-        _pc_required(serial, ['shell', 'pm', 'enable', '--user', '0', app['package']])
+        _ensure_package_enabled(serial, app['package'])
     verify_nmap_ready(serial)
     prepare_wireless_reset(serial)
+
+
+def _ensure_package_enabled(serial, package):
+    # Avoid a package state change (and process restart) for already active apps.
+    query = ['shell', 'pm', 'list', 'packages', '-e', '--user', '0', package]
+    if 'package:' + package in _pc_required(serial, query).stdout.splitlines():
+        return
+    _pc_required(serial, ['shell', 'pm', 'enable', '--user', '0', package])
+    if 'package:' + package not in _pc_required(serial, query).stdout.splitlines():
+        raise RuntimeError('필수 앱 활성 상태 확인 실패: ' + package)
 
 
 def verify_nmap_ready(serial):
