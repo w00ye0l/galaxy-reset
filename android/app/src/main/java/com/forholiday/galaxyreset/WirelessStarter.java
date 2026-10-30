@@ -71,7 +71,22 @@ final class WirelessStarter {
                     if(!started)Thread.sleep(500);
                 }
                 if(!started)throw new IOException("Shizuku 시작을 확인하지 못했습니다.");
-                for(int i=0;i<40&&!Shizuku.pingBinder();i++)Thread.sleep(250);
+                for(int i=0;i<8&&!Shizuku.pingBinder();i++)Thread.sleep(250);
+                if(!Shizuku.pingBinder()) {
+                    // The server may miss the UID that was already foreground before it
+                    // started. A separate transparent activity produces a fresh process event.
+                    status="Shizuku 앱 권한 연결 중…";
+                    main.post(()->{
+                        try {
+                            // If the operator left the app, do not bring it to the foreground.
+                            if(context instanceof android.app.Activity activity && !activity.isFinishing()
+                                    && !activity.isDestroyed() && activity.hasWindowFocus())
+                                activity.startActivity(new Intent(activity,ConnectionRefreshActivity.class)
+                                    .addFlags(Intent.FLAG_ACTIVITY_NO_ANIMATION));
+                        } catch(Exception ignored) { /* The bounded binder wait below reports failure. */ }
+                    });
+                }
+                for(int i=0;i<32&&!Shizuku.pingBinder();i++)Thread.sleep(250);
                 if(!Shizuku.pingBinder())throw new IOException("Shizuku는 시작됐으나 앱 권한 연결을 확인하지 못했습니다. 연결 버튼을 눌러주세요.");
                 status="Shizuku 자동 시작 완료";retryAt=0;
             }catch(Exception failure){

@@ -180,6 +180,26 @@ final class ResetPipeline {
         return count;
     }
     void pause(long milliseconds) throws InterruptedException { Thread.sleep(milliseconds); }
+    void wipeInternalStorage() throws Exception {
+        for (int attempt = 0; attempt < 2; attempt++) {
+            // rm can report a directory recreated by a running system app. Verify files
+            // independently rather than retaining that command warning as a reset failure.
+            for (String command : List.of("rm -rf /storage/emulated/0/*",
+                    "rm -rf /storage/emulated/0/.[!.]* /storage/emulated/0/..?*")) {
+                Result deletion = raw(command, 300);
+                if (deletion.code == 124) throw new IOException("내부 저장소 삭제 시간 초과 · 재확인 필요");
+            }
+            Result listing = required("find /storage/emulated/0 -type f");
+            int remaining = remainingUserFiles(listing.output);
+            if (remaining == 0) {
+                notes.add(attempt == 0 ? "내부 저장소 잔여 파일 0개 확인" : "내부 저장소 자동 재시도 후 잔여 파일 0개 확인");
+                return;
+            }
+            if (attempt == 0) { pause(500); continue; }
+            manual = true;
+            warnings.add("내부 저장소 잔여 파일 " + remaining + "개 · 자동 재시도 후에도 남음 · 수동 확인 필요");
+        }
+    }
     void restartLauncher() throws Exception {
         commands("am force-stop com.sec.android.app.launcher"); pause(1000);
         commands("am start --user 0 -n " + LAUNCHER);
@@ -268,14 +288,7 @@ final class ResetPipeline {
                     if (!KEEP.contains(pkg)) attempt("앱 삭제 실패: " + pkg, () -> success(checked("pm uninstall --user 0 " + quote(pkg), 120), "Success", "앱 삭제 실패: " + pkg));
                 }
             }
-            case 4 -> {
-                checked("rm -rf /storage/emulated/0/*", 300);
-                checked("rm -rf /storage/emulated/0/.[!.]* /storage/emulated/0/..?*", 300);
-                // Scoped-storage restrictions can leave entries even when rm's reporting varies.
-                Result r = required("find /storage/emulated/0 -type f");
-                int remaining = remainingUserFiles(r.output);
-                if (remaining > 0) { manual = true; warnings.add("내부 저장소 잔여 파일 " + remaining + "개 · 수동 확인 필요"); }
-            }
+            case 4 -> wipeInternalStorage();
             case 5 -> {
                 Result result;
                 try { result = dex("content_cleaner.dex", "ContentCleaner"); }

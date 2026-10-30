@@ -306,6 +306,36 @@ class PipelineResilienceTest(unittest.TestCase):
         self.assertTrue(any('초기화 결과와 별도' in n for n in V6.POST_RUN_NOTICES))
 
 
+class StorageVerificationTest(unittest.TestCase):
+    def wipe(self, listings, deletion_code=0):
+        scans = iter(listings)
+        def run(command, **kwargs):
+            if 'find' in command:
+                value = next(scans)
+                if isinstance(value, Exception): raise value
+                return subprocess.CompletedProcess(command, 0, value, '')
+            return subprocess.CompletedProcess(command, deletion_code, '', 'Directory not empty' if deletion_code else '')
+        with patch.object(V6, 'run_command', side_effect=run) as execute, patch.object(V6.time, 'sleep'):
+            V6.wipe_internal_storage('TEST')
+            return execute.call_count
+
+    def test_rm_warning_does_not_override_verified_empty_storage(self):
+        self.assertEqual(self.wipe([''], 1), 3)
+
+    def test_remaining_file_gets_one_retry(self):
+        self.assertEqual(self.wipe(['/storage/emulated/0/Download/customer.pdf\n', '']), 6)
+
+    def test_persistent_file_stays_failure(self):
+        with self.assertRaisesRegex(RuntimeError, '자동 재시도 후에도 남음'):
+            self.wipe(['/storage/emulated/0/Download/customer.pdf\n'] * 2)
+
+    def test_unknown_inventory_and_timeout_never_count_as_success(self):
+        with self.assertRaisesRegex(RuntimeError, '조회 실패'):
+            self.wipe([RuntimeError('조회 실패')])
+        with self.assertRaisesRegex(RuntimeError, '시간 초과'):
+            self.wipe([], 124)
+
+
 class CommandFailureReportingTest(unittest.TestCase):
     def test_security_error_is_not_replaced_with_timeout_after_retries(self):
         result = subprocess.CompletedProcess([], 255, '', 'SecurityException: Shell cannot change component state')

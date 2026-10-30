@@ -8,8 +8,8 @@ android {
         applicationId 'com.forholiday.galaxyreset'
         minSdk 30
         targetSdk 36
-        versionCode 27
-        versionName '1.1.23'
+        versionCode 28
+        versionName '1.1.24'
         testInstrumentationRunner 'com.forholiday.galaxyreset.ProgressLayoutCheck'
         buildConfigField 'long', 'FILEMANAGER_VERSION_CODE', filemanagerBundle.versionCode.toString() + 'L'
         buildConfigField 'long', 'NMAP_VERSION_CODE', nmapBundle.versionCode.toString() + 'L'

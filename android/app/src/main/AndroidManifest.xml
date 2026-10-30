@@ -25,6 +25,10 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <!-- A brief foreground event lets Shizuku deliver its binder after an in-app server start. -->
+        <activity android:name=".ConnectionRefreshActivity" android:exported="false"
+            android:process=":connection_refresh" android:noHistory="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
         <service android:name=".ResetService" android:exported="false" android:foregroundServiceType="specialUse">
             <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Operator initiated rental phone data cleanup using Shizuku shell, including launcher and locale reset" />

@@ -94,6 +94,53 @@ public class ResetPipelineTest {
         assertEquals(1, ResetPipeline.remainingUserFiles(listing + "/storage/emulated/0/Pictures/.thumbnails/private.jpg\n"));
         assertEquals(1, ResetPipeline.remainingUserFiles(listing + "/storage/emulated/0/Download/document.pdf\n"));
     }
+    static class StorageFake extends Fake {
+        final Deque<ResetPipeline.Result> listings = new ArrayDeque<>();
+        int deletionCode;
+        boolean lost;
+        @Override public ResetPipeline.Result run(String command, int seconds) throws Exception {
+            commands.add(command);
+            if (lost) throw new ResetPipeline.ConnectionLost("offline");
+            return command.startsWith("find ") ? listings.removeFirst()
+                : new ResetPipeline.Result(deletionCode, deletionCode == 0 ? "" : "Directory not empty");
+        }
+    }
+    ResetPipeline storagePipeline(StorageFake fake) {
+        return new ResetPipeline(fake, p -> {}, Set.of());
+    }
+    @Test public void storageRmWarningDoesNotOverrideVerifiedEmptyInventory() throws Exception {
+        StorageFake fake = new StorageFake(); fake.deletionCode = 1;
+        fake.listings.add(new ResetPipeline.Result(0, ""));
+        ResetPipeline pipeline = storagePipeline(fake); pipeline.step(4, "ja-JP", "SM-S948N");
+        assertTrue(pipeline.warnings.isEmpty()); assertEquals(3, fake.commands.size());
+    }
+    @Test public void storageRetriesRemainingFileAndVerifiesAgain() throws Exception {
+        StorageFake fake = new StorageFake();
+        fake.listings.add(new ResetPipeline.Result(0, "/storage/emulated/0/Download/customer.pdf\n"));
+        fake.listings.add(new ResetPipeline.Result(0, ""));
+        ResetPipeline pipeline = storagePipeline(fake); pipeline.step(4, "ja-JP", "SM-S948N");
+        assertTrue(pipeline.warnings.isEmpty()); assertEquals(6, fake.commands.size());
+        assertTrue(pipeline.notes.get(0).contains("자동 재시도"));
+    }
+    @Test public void storagePersistentFilesStillRequireAttention() throws Exception {
+        StorageFake fake = new StorageFake();
+        for (int i = 0; i < 2; i++) fake.listings.add(new ResetPipeline.Result(0, "/storage/emulated/0/Download/customer.pdf\n"));
+        ResetPipeline pipeline = storagePipeline(fake); pipeline.step(4, "ja-JP", "SM-S948N");
+        assertTrue(pipeline.manual); assertFalse(pipeline.warnings.isEmpty());
+        assertEquals(6, fake.commands.size());
+    }
+    @Test public void storageFailedOrTruncatedInventoryCannotPass() {
+        for (ResetPipeline.Result result : List.of(new ResetPipeline.Result(1, "Permission denied"), new ResetPipeline.Result(0, "", true))) {
+            StorageFake fake = new StorageFake(); fake.listings.add(result);
+            assertThrows(IOException.class, () -> storagePipeline(fake).step(4, "ja-JP", "SM-S948N"));
+        }
+    }
+    @Test public void storageTimeoutAndDisconnectCannotPass() {
+        StorageFake timeout = new StorageFake(); timeout.deletionCode = 124;
+        assertThrows(IOException.class, () -> storagePipeline(timeout).step(4, "ja-JP", "SM-S948N"));
+        StorageFake lost = new StorageFake(); lost.lost = true;
+        assertThrows(ResetPipeline.ConnectionLost.class, () -> storagePipeline(lost).step(4, "ja-JP", "SM-S948N"));
+    }
     @Test public void widgetQueryReturnsOnlyActiveWidgetSection() throws Exception {
         Fake fake = new Fake() {
             @Override public ResetPipeline.Result run(String command, int seconds) {

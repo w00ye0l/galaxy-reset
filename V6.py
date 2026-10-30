@@ -1387,15 +1387,23 @@ def wipe_internal_storage(serial):
     logging.info('[%s] 내장 메모리 전체 삭제 시작', serial)
     # 수십 GB 삭제일 수 있어 넉넉한 타임아웃. '.*'는 '..'까지 잡아 비정상 종료를
     # 유발하므로 dotglob 안전 패턴('.[!.]*', '..?*')으로 숨김 파일만 지운다.
-    run_command(['adb', '-s', serial, 'shell', 'rm', '-rf', '/storage/emulated/0/*'], timeout=300)
-    run_command(['adb', '-s', serial, 'shell', 'rm', '-rf',
-                 '/storage/emulated/0/.[!.]*', '/storage/emulated/0/..?*'], timeout=300)
-    listing = _pc_required(serial, ['shell', 'find', '/storage/emulated/0', '-type', 'f'], timeout=120).stdout
-    remaining = [path for path in listing.splitlines() if path.strip() and not path.endswith('/.nomedia')
-                 and not ('/.thumbnails/' in path and path.endswith('/.database_uuid'))]
-    if remaining:
-        raise RuntimeError('내부 저장소 잔여 파일 %d개 · 삭제 완료로 처리하지 않습니다.' % len(remaining))
-    logging.info('[%s] 내장 메모리 전체 삭제 완료', serial)
+    for attempt in range(2):
+        for paths in (['/storage/emulated/0/*'],
+                      ['/storage/emulated/0/.[!.]*', '/storage/emulated/0/..?*']):
+            deletion = run_command(['adb', '-s', serial, 'shell', 'rm', '-rf', *paths], timeout=300)
+            if deletion.returncode in (-1, 124) or (deletion.stderr or '').strip() == 'TIMEOUT':
+                raise RuntimeError('내부 저장소 삭제 시간 초과 · 재확인 필요')
+        listing = _pc_required(serial, ['shell', 'find', '/storage/emulated/0', '-type', 'f'], timeout=120).stdout
+        remaining = [path for path in listing.splitlines() if path.strip() and not path.endswith('/.nomedia')
+                     and not ('/.thumbnails/' in path and path.endswith('/.database_uuid'))]
+        if not remaining:
+            logging.info('[%s] 내장 메모리 전체 삭제 완료 · 잔여 파일 0개 확인%s', serial,
+                         ' (자동 재시도 후)' if attempt else '')
+            return
+        if attempt == 0:
+            logging.warning('[%s] 내부 저장소 잔여 파일 %d개 · 해당 단계 자동 재시도', serial, len(remaining))
+            time.sleep(.5)
+    raise RuntimeError('내부 저장소 잔여 파일 %d개 · 자동 재시도 후에도 남음 · 삭제 완료로 처리하지 않습니다.' % len(remaining))
 
 
 def ensure_hotseat_apps(serial):
