@@ -306,6 +306,24 @@ class PipelineResilienceTest(unittest.TestCase):
         self.assertTrue(any('초기화 결과와 별도' in n for n in V6.POST_RUN_NOTICES))
 
 
+class FileManagerPreservationTest(unittest.TestCase):
+    def test_direct_clear_never_touches_smb_app_data(self):
+        with patch.object(V6, 'run_command') as execute:
+            V6.clear_app_data('TEST', V6.FILEMANAGER_PACKAGE, '파일 관리자')
+        execute.assert_not_called()
+
+    def test_maintained_apps_clear_preserves_filemanager_but_clears_map(self):
+        def run(command, **kwargs):
+            if command[3:6] == ['shell', 'pm', 'list']:
+                return subprocess.CompletedProcess(command, 0, 'package:' + command[-1] + '\n', '')
+            return subprocess.CompletedProcess(command, 0, 'Success', '')
+        with patch.object(V6, 'run_command', side_effect=run) as execute:
+            V6.clear_google_apps_history('TEST')
+        commands = [c.args[0] for c in execute.call_args_list]
+        self.assertFalse(any(V6.FILEMANAGER_PACKAGE in c for c in commands))
+        self.assertTrue(any(c[3:6] == ['shell', 'pm', 'clear'] and c[-1] == V6.NMAP_PACKAGE for c in commands))
+
+
 class StorageVerificationTest(unittest.TestCase):
     def wipe(self, listings, deletion_code=0):
         scans = iter(listings)

@@ -169,6 +169,32 @@ public class ResetPipelineTest {
         assertFalse(fake.commands.stream().anyMatch(c -> c.startsWith("cmd package install-existing") && c.contains("sbrowser")));
     }
 
+    @Test public void packageVersionUsesSmallQueryWhenFullDumpWouldBeTruncated() throws Exception {
+        Fake fake = new Fake() {
+            @Override public ResetPipeline.Result run(String cmd, int seconds) {
+                commands.add(cmd);
+                if(cmd.startsWith("dumpsys package"))return new ResetPipeline.Result(0,"x".repeat(64000),true);
+                return new ResetPipeline.Result(0,"package:com.alphainventor.filemanager versionCode:2103060\n");
+            }
+        };
+        ResetPipeline p=new ResetPipeline(fake,s->{},Set.of());
+        assertEquals(2103060L,p.packageVersion("com.alphainventor.filemanager"));
+        assertFalse(fake.commands.stream().anyMatch(c->c.startsWith("dumpsys package")));
+    }
+    @Test public void packageVersionRejectsOtherPackagesAndMissingVersion() {
+        for(String output:List.of("package:com.alphainventor.filemanager.clone versionCode:99999999\n",
+                "package:com.alphainventor.filemanager\n", "package:com.alphainventor.filemanager versionCode:-1\n")) {
+            Fake fake=new Fake(){@Override public ResetPipeline.Result run(String c,int s){return new ResetPipeline.Result(0,output);}};
+            assertThrows(IOException.class,()->new ResetPipeline(fake,s->{},Set.of()).packageVersion("com.alphainventor.filemanager"));
+        }
+    }
+    @Test public void packageVersionCannotAcceptFailedOrTruncatedQuery() {
+        String output="package:com.alphainventor.filemanager versionCode:2103060\n";
+        for(ResetPipeline.Result result:List.of(new ResetPipeline.Result(1,output),new ResetPipeline.Result(0,output,true))) {
+            Fake fake=new Fake(){@Override public ResetPipeline.Result run(String c,int s){return result;}};
+            assertThrows(IOException.class,()->new ResetPipeline(fake,s->{},Set.of()).packageVersion("com.alphainventor.filemanager"));
+        }
+    }
     static class NmapFake extends Fake {
         long version=BuildConfig.NMAP_VERSION_CODE-1;
         boolean failWrite, disabled, ignoreEnable;
@@ -176,8 +202,8 @@ public class ResetPipelineTest {
         @Override public void copy(String asset,String destination){copies.add(asset);}
         @Override public ResetPipeline.Result run(String command,int seconds){
             commands.add(command);
+            if(command.startsWith("pm list packages --show-versioncode"))return new ResetPipeline.Result(0,"package:com.nhn.android.nmap versionCode:"+version+"\n");
             if(command.startsWith("pm list packages"))return new ResetPipeline.Result(0,command.contains(" -e ")&&disabled?"":"package:com.nhn.android.nmap\n");
-            if(command.startsWith("dumpsys package"))return new ResetPipeline.Result(0,"versionCode="+version+" minSdk=26");
             if(command.startsWith("pm install-create"))return new ResetPipeline.Result(0,"Success: created install session [123]");
             if(command.startsWith("pm install-write")&&failWrite)return new ResetPipeline.Result(1,"Failure [INVALID_APK]");
             if(command.startsWith("pm install-commit"))version=BuildConfig.NMAP_VERSION_CODE;
@@ -223,6 +249,7 @@ public class ResetPipelineTest {
             if(command.startsWith("pm list packages")) {
                 commands.add(command);
                 String pkg=command.substring(command.lastIndexOf(' ')+1).replace("'", "");
+                if(command.contains(" --show-versioncode"))return new ResetPipeline.Result(0,"package:"+pkg+" versionCode:"+version+"\n");
                 return new ResetPipeline.Result(0,command.contains(" -e ")&&disabledPackages.contains(pkg)?"":"package:"+pkg+"\n");
             }
             if(command.startsWith("pm enable")) {
@@ -264,6 +291,28 @@ public class ResetPipelineTest {
         assertTrue(pipeline.advisories.stream().anyMatch(n->n.contains("딥 슬립")));
         assertFalse(fake.commands.stream().anyMatch(c->c.startsWith("pm uninstall")));
     }
+    @Test public void directClearPreservesFileManagerSmbSettings() throws Exception {
+        Fake fake = new Fake();
+        ResetPipeline pipeline = new ResetPipeline(fake, p -> {}, Set.of());
+        pipeline.clear("com.alphainventor.filemanager");
+        assertTrue(fake.commands.isEmpty());
+        assertTrue(pipeline.warnings.isEmpty());
+        assertFalse(pipeline.failedClears.contains("com.alphainventor.filemanager"));
+    }
+    @Test public void maintainedAppsClearSkipsFileManagerButStillClearsMap() throws Exception {
+        Fake fake = new Fake() {
+            @Override public ResetPipeline.Result run(String cmd, int seconds) {
+                commands.add(cmd);
+                if(cmd.startsWith("pm list packages"))return new ResetPipeline.Result(0,"package:"+cmd.substring(cmd.lastIndexOf(' ')+1).replace("'", ""));
+                return new ResetPipeline.Result(0, "Success");
+            }
+        };
+        ResetPipeline pipeline = new ResetPipeline(fake, p -> {}, Set.of());
+        pipeline.step(2,"ja-JP","SM-S918N");
+        assertFalse(fake.commands.stream().anyMatch(c -> c.contains("com.alphainventor.filemanager")));
+        assertTrue(fake.commands.stream().anyMatch(c -> c.startsWith("pm clear") && c.contains("com.nhn.android.nmap")));
+        assertTrue(pipeline.warnings.isEmpty());
+    }
     @Test public void dataClearContinuesAfterOneFailureAndCachesOnlySuccesses() throws Exception {
         Fake fake = new Fake() {
             @Override public ResetPipeline.Result run(String cmd, int seconds) {
@@ -285,8 +334,7 @@ public class ResetPipelineTest {
             commands.add(cmd);
             if(cmd.equals("dumpsys account"))return new ResetPipeline.Result(0,brokenAccounts?"Permission denied":remainingAccount?"Accounts: 1\nAccount {name=redacted, type=com.google}\n":"Accounts: 0\n");
             if(cmd.equals("pm list packages --user 0 -3"))return new ResetPipeline.Result(0,remainingApp?"package:customer.app\n":"");
-            if(cmd.startsWith("pm list packages"))return new ResetPipeline.Result(0,"package:"+cmd.substring(cmd.lastIndexOf(' ')+1).replace("'", "")+"\n");
-            if(cmd.startsWith("dumpsys package"))return new ResetPipeline.Result(0,"versionCode=999999999 minSdk=30");
+            if(cmd.startsWith("pm list packages"))return new ResetPipeline.Result(0,"package:"+cmd.substring(cmd.lastIndexOf(' ')+1).replace("'", "")+(cmd.contains(" --show-versioncode")?" versionCode:999999999":"")+"\n");
             if(cmd.startsWith("dumpsys wallpaper"))return new ResetPipeline.Result(0,"mName=WallpaperSetter");
             return new ResetPipeline.Result(0,"ko-KR");
         }

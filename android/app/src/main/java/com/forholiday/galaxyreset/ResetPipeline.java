@@ -76,7 +76,10 @@ final class ResetPipeline {
         return Arrays.asList(r.output.split("\\R")).contains("package:" + pkg);
     }
     long packageVersion(String pkg) throws Exception {
-        Matcher version=Pattern.compile("\\bversionCode=(\\d+)\\b").matcher(required("dumpsys package "+quote(pkg)).output);
+        // Full dumpsys output can exceed the Binder output cap (66 KB on a field S23).
+        // Query only installed package/version and require an exact package match.
+        String output=required("pm list packages --show-versioncode --user 0 "+quote(pkg)).output;
+        Matcher version=Pattern.compile("(?m)^package:"+Pattern.quote(pkg)+"[ \\t]+versionCode:(\\d+)[ \\t]*$").matcher(output);
         if(!version.find())throw new IOException("설치 버전 조회 실패: "+pkg);
         return Long.parseLong(version.group(1));
     }
@@ -122,6 +125,10 @@ final class ResetPipeline {
     void commands(String... commands) throws Exception { for (String c : commands) checked(c, 120); }
     void clear(String... packages) throws Exception {
         for (String pkg : packages) attempt("앱 데이터 초기화 실패: " + pkg, () -> {
+            if (pkg.equals("com.alphainventor.filemanager")) {
+                notes.add("파일 관리자 SMB 연결·앱 설정 보존 · 데이터 삭제 제외");
+                return;
+            }
             if (cleared.contains(pkg)) return;
             failedClears.add(pkg);
             if (!installed(pkg)) { failedClears.remove(pkg); return; }
@@ -275,9 +282,12 @@ final class ResetPipeline {
                     commands("am start -a android.telephony.euicc.action.MANAGE_EMBEDDED_SUBSCRIPTIONS");
                 }
             }
-            case 2 -> clear("com.google.android.googlequicksearchbox", "com.android.chrome", "com.google.android.youtube", "com.google.android.gm",
+            case 2 -> {
+                notes.add("파일 관리자 SMB 연결·앱 설정 보존 · 데이터 삭제 제외");
+                clear("com.google.android.googlequicksearchbox", "com.android.chrome", "com.google.android.youtube", "com.google.android.gm",
                 "com.google.android.apps.maps", "com.google.android.apps.docs", "com.google.android.calendar", "com.google.android.apps.photos", "com.sec.android.app.sbrowser", "com.nhn.android.nmap",
-                "com.alphainventor.filemanager", "com.sec.android.app.popupcalculator", "com.google.android.apps.tachyon");
+                "com.sec.android.app.popupcalculator", "com.google.android.apps.tachyon");
+            }
             case 0 -> {
                 Result r = required("pm list packages --user 0 -3");
                 for (String line : r.output.split("\\R")) {

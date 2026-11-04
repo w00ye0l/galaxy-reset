@@ -587,6 +587,9 @@ def detect_series(serial):
 
 def clear_app_data(serial, package, desc):
     """특정 앱의 데이터를 초기화합니다."""
+    if package == FILEMANAGER_PACKAGE:
+        logging.info('[%s] 파일 관리자 SMB 연결·앱 설정 보존 · 데이터 삭제 제외', serial)
+        return
     cleared = getattr(_TLS, 'cleared', None)
     if cleared is not None and package in cleared:
         return
@@ -1007,11 +1010,11 @@ def clear_google_apps_history(serial):
         'com.google.android.apps.photos': 'Google 포토',
         'com.sec.android.app.sbrowser': '삼성 인터넷 브라우저',
         'com.nhn.android.nmap': '네이버 지도',
-        'com.alphainventor.filemanager': '파일 관리자',
         'com.sec.android.app.popupcalculator': '계산기',
         'com.google.android.apps.tachyon': 'Google Meet',
     }
     logging.info('[%s] Google 앱 사용 기록 삭제 시작...', serial)
+    logging.info('[%s] 파일 관리자 SMB 연결·앱 설정 보존 · 데이터 삭제 제외', serial)
     failures = []
     for package, name in google_apps.items():
         try:
