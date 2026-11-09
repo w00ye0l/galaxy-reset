@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import shlex
 import zipfile
+import tempfile
 import phone_autostart
 import naver_account_cleanup
 from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
@@ -587,6 +588,9 @@ def detect_series(serial):
 
 def clear_app_data(serial, package, desc):
     """특정 앱의 데이터를 초기화합니다."""
+    if package == FILEMANAGER_PACKAGE:
+        logging.info('[%s] 파일 관리자 SMB 연결·앱 설정 보존 · 데이터 삭제 제외', serial)
+        return
     cleared = getattr(_TLS, 'cleared', None)
     if cleared is not None and package in cleared:
         return
@@ -959,15 +963,6 @@ def deep_clean_gallery_trash(serial):
 
 def delete_user_installed_apps(serial):
     """제외 목록을 제외한 사용자가 설치한 앱을 삭제합니다."""
-    exclude_apps = [
-        'com.sec.android.app.popupcalculator',
-        'com.nhn.android.nmap',
-        'com.alphainventor.filemanager',
-        'com.forholiday.galaxyreset',
-        'moe.shizuku.privileged.api',
-        'com.sec.android.app.sbrowser',
-        'com.sec.knox.kccagent',  # Knox Configure 관리 앱·등록 보존
-    ]
     result = run_command([
         'adb', '-s', serial, 'shell',
         'pm', 'list', 'packages', '--user', '0', '-3'
@@ -981,7 +976,7 @@ def delete_user_installed_apps(serial):
 
     failures = []
     for app in installed_apps:
-        if app not in exclude_apps:
+        if app not in KEEP_APPS:
             logging.info('[%s] 앱 삭제: %s', serial, app)
             removed = run_command(['adb', '-s', serial, 'shell', 'pm', 'uninstall', '--user', '0', app])
             if removed.returncode != 0 or (removed.stdout or '').strip() != 'Success':
@@ -1007,11 +1002,12 @@ def clear_google_apps_history(serial):
         'com.google.android.apps.photos': 'Google 포토',
         'com.sec.android.app.sbrowser': '삼성 인터넷 브라우저',
         'com.nhn.android.nmap': '네이버 지도',
-        'com.alphainventor.filemanager': '파일 관리자',
         'com.sec.android.app.popupcalculator': '계산기',
         'com.google.android.apps.tachyon': 'Google Meet',
+        LOCARORA_PACKAGE: 'LOCARORA',
     }
     logging.info('[%s] Google 앱 사용 기록 삭제 시작...', serial)
+    logging.info('[%s] 파일 관리자 SMB 연결·앱 설정 보존 · 데이터 삭제 제외', serial)
     failures = []
     for package, name in google_apps.items():
         try:
@@ -1279,6 +1275,27 @@ def clear_recent_tasks(serial):
         logging.warning('[%s] 최근 앱 제거 결과 불확실: %s %s', serial, stdout.strip(), stderr.strip())
 
 
+def place_home_apps(serial):
+    apk_paths = _pc_required(serial, ['shell', 'pm', 'path', '--user', '0', PHONE_APP_PACKAGE])
+    base_apk = next((line.removeprefix('package:') for line in apk_paths.stdout.splitlines()
+                     if line.startswith('package:/data/app/') and line.endswith('/base.apk')), None)
+    if base_apk is None:
+        raise RuntimeError('홈 배치 도구 경로를 확인할 수 없습니다.')
+    command = ('CLASSPATH=' + shlex.quote(base_apk)
+               + ' app_process /system/bin com.forholiday.galaxyreset.LanguageHomePlacement')
+    result = run_command(['adb', '-s', serial, 'shell', command], check=True, timeout=180)
+    lines = (result.stdout or '').splitlines()
+    failure = next((line[5:] for line in lines if line.startswith('FAIL:')), None)
+    if result.returncode != 0 or failure is not None or 'SUCCESS:MAIN_HOME_LAYOUT' not in lines:
+        raise RuntimeError('홈 배치 확인 필요 · ' + (failure or '메인 홈의 앱 4개 배치를 확인하세요.'))
+    logging.info('[%s] 메인 홈 1페이지 확인 · 갤러리 / Play 스토어 / LOCARORA / Language', serial)
+
+
+def finish_home_setup(serial):
+    clear_recent_tasks(serial)
+    place_home_apps(serial)
+
+
 def clear_media_store(serial):
     """MediaStore DB를 정리합니다 (이미지, 비디오, 오디오, 파일 전체)."""
     logging.info('[%s] MediaStore DB 정리 중...', serial)
@@ -1387,15 +1404,23 @@ def wipe_internal_storage(serial):
     logging.info('[%s] 내장 메모리 전체 삭제 시작', serial)
     # 수십 GB 삭제일 수 있어 넉넉한 타임아웃. '.*'는 '..'까지 잡아 비정상 종료를
     # 유발하므로 dotglob 안전 패턴('.[!.]*', '..?*')으로 숨김 파일만 지운다.
-    run_command(['adb', '-s', serial, 'shell', 'rm', '-rf', '/storage/emulated/0/*'], timeout=300)
-    run_command(['adb', '-s', serial, 'shell', 'rm', '-rf',
-                 '/storage/emulated/0/.[!.]*', '/storage/emulated/0/..?*'], timeout=300)
-    listing = _pc_required(serial, ['shell', 'find', '/storage/emulated/0', '-type', 'f'], timeout=120).stdout
-    remaining = [path for path in listing.splitlines() if path.strip() and not path.endswith('/.nomedia')
-                 and not ('/.thumbnails/' in path and path.endswith('/.database_uuid'))]
-    if remaining:
-        raise RuntimeError('내부 저장소 잔여 파일 %d개 · 삭제 완료로 처리하지 않습니다.' % len(remaining))
-    logging.info('[%s] 내장 메모리 전체 삭제 완료', serial)
+    for attempt in range(2):
+        for paths in (['/storage/emulated/0/*'],
+                      ['/storage/emulated/0/.[!.]*', '/storage/emulated/0/..?*']):
+            deletion = run_command(['adb', '-s', serial, 'shell', 'rm', '-rf', *paths], timeout=300)
+            if deletion.returncode in (-1, 124) or (deletion.stderr or '').strip() == 'TIMEOUT':
+                raise RuntimeError('내부 저장소 삭제 시간 초과 · 재확인 필요')
+        listing = _pc_required(serial, ['shell', 'find', '/storage/emulated/0', '-type', 'f'], timeout=120).stdout
+        remaining = [path for path in listing.splitlines() if path.strip() and not path.endswith('/.nomedia')
+                     and not ('/.thumbnails/' in path and path.endswith('/.database_uuid'))]
+        if not remaining:
+            logging.info('[%s] 내장 메모리 전체 삭제 완료 · 잔여 파일 0개 확인%s', serial,
+                         ' (자동 재시도 후)' if attempt else '')
+            return
+        if attempt == 0:
+            logging.warning('[%s] 내부 저장소 잔여 파일 %d개 · 해당 단계 자동 재시도', serial, len(remaining))
+            time.sleep(.5)
+    raise RuntimeError('내부 저장소 잔여 파일 %d개 · 자동 재시도 후에도 남음 · 삭제 완료로 처리하지 않습니다.' % len(remaining))
 
 
 def ensure_hotseat_apps(serial):
@@ -1598,9 +1623,13 @@ def reset_launcher_with_clean_home(serial):
 PHONE_APP_PACKAGE = 'com.forholiday.galaxyreset'
 SHIZUKU_PACKAGE = 'moe.shizuku.privileged.api'
 PHONE_APK_FILES = {PHONE_APP_PACKAGE: 'galaxy-reset.apk', SHIZUKU_PACKAGE: 'shizuku.apk'}
+LANGUAGE_PACKAGE = 'com.forholiday.language'
+LOCARORA_PACKAGE = 'com.locarora.app'
+HOME_APK_FILES = {LANGUAGE_PACKAGE: 'language.apk', LOCARORA_PACKAGE: 'locarora.apk'}
 NMAP_PACKAGE = 'com.nhn.android.nmap'
 FILEMANAGER_PACKAGE = 'com.alphainventor.filemanager'
 KEEP_APPS = frozenset({PHONE_APP_PACKAGE, SHIZUKU_PACKAGE, NMAP_PACKAGE, FILEMANAGER_PACKAGE,
+    LANGUAGE_PACKAGE, LOCARORA_PACKAGE,
     'com.sec.android.app.popupcalculator', 'com.sec.android.app.sbrowser', 'com.sec.knox.kccagent'})
 
 
@@ -1672,6 +1701,17 @@ def load_phone_bundle(verify_hash=False):
                 if digest.hexdigest() != app['sha256']:
                     raise ValueError('APK 해시 불일치: ' + filename)
             app['apk_path'] = apk
+        reset_apk = apps[PHONE_APP_PACKAGE]['apk_path']
+        with zipfile.ZipFile(reset_apk) as archive:
+            home_apps = json.loads(archive.read('assets/home-apps.json'))
+            if len(home_apps) != len(HOME_APK_FILES) or {app['package']: app['file'] for app in home_apps} != HOME_APK_FILES:
+                raise ValueError('홈 앱 목록 불일치')
+            for app in home_apps:
+                if type(app['versionCode']) is not int or app['versionCode'] < 1:
+                    raise ValueError('홈 앱 버전 정보 오류')
+                asset = 'assets/' + app['file']
+                archive.getinfo(asset)
+                apps[app['package']] = dict(app, archive_path=reset_apk, asset=asset)
         return apps
     except (OSError, ValueError, KeyError, TypeError, zipfile.BadZipFile) as error:
         raise RuntimeError('폰 앱 동봉 파일 검증 실패: %s — tools/prepare_phone_bundle.py를 실행하고 EXE를 다시 빌드하세요.' % error) from error
@@ -1769,6 +1809,8 @@ def ensure_essential_apps_installed(serial):
         dict(load_filemanager_bundle(), name='File Manager'),
         dict(bundled[PHONE_APP_PACKAGE], name='갤럭시 초기화'),
         dict(bundled[SHIZUKU_PACKAGE], name='Shizuku'),
+        dict(bundled[LANGUAGE_PACKAGE], name='Language'),
+        dict(bundled[LOCARORA_PACKAGE], name='LOCARORA'),
     ]
     listed = _pc_required(serial, ['shell', 'pm', 'list', 'packages', '--user', '0'], timeout=120)
     installed = {line[8:].strip() for line in listed.stdout.splitlines() if line.startswith('package:')}
@@ -1780,13 +1822,8 @@ def ensure_essential_apps_installed(serial):
                 if 'versionCode' not in app or _package_version(serial, package) >= app['versionCode']:
                     logging.info('[%s] %s 설치됨 (같거나 최신 버전 유지)', serial, app['name'])
                     continue
-            apk = app['apk_path']
-            if not os.path.isfile(apk):
-                raise RuntimeError('필수 APK 없음: ' + apk)
             logging.info('[%s] %s 설치/업데이트 중...', serial, app['name'])
-            paths = app.get('apk_paths', [apk])
-            command = 'install-multiple' if len(paths) > 1 else 'install'
-            result = run_command(['adb', '-s', serial, command, '-r', '--user', '0'] + paths, check=True, timeout=600)
+            result = install_bundled_apk(serial, app)
             downgrade = 'INSTALL_FAILED_VERSION_DOWNGRADE' in ((result.stdout or '') + (result.stderr or ''))
             if not downgrade and (result.returncode != 0 or 'Success' not in (result.stdout or '')):
                 raise RuntimeError('필수 앱 설치 확인 실패: ' + app['name'] + ' · ' + ((result.stdout or '') + (result.stderr or '')).strip()[:180])
@@ -1804,6 +1841,8 @@ def ensure_essential_apps_installed(serial):
             continue
         try:
             _ensure_package_enabled(serial, app['package'])
+            if app['package'] == LANGUAGE_PACKAGE:
+                configure_language_app(serial)
         except DeviceLostError:
             raise
         except Exception as e:
@@ -1823,6 +1862,31 @@ def ensure_essential_apps_installed(serial):
         failures.append(str(e))
     if failures:
         raise RuntimeError('; '.join(failures))
+
+
+def install_bundled_apk(serial, app):
+    if 'asset' in app:
+        with tempfile.TemporaryDirectory(prefix='galaxy-reset-apk-') as directory:
+            path = os.path.join(directory, app['file'])
+            with zipfile.ZipFile(app['archive_path']) as archive, archive.open(app['asset']) as source, open(path, 'wb') as target:
+                shutil.copyfileobj(source, target)
+            return run_command(['adb', '-s', serial, 'install', '-r', '--user', '0', path], check=True, timeout=600)
+    apk = app['apk_path']
+    if not os.path.isfile(apk):
+        raise RuntimeError('필수 APK 없음: ' + apk)
+    paths = app.get('apk_paths', [apk])
+    command = 'install-multiple' if len(paths) > 1 else 'install'
+    return run_command(['adb', '-s', serial, command, '-r', '--user', '0'] + paths, check=True, timeout=600)
+
+
+def configure_language_app(serial):
+    permission = 'android.permission.CHANGE_CONFIGURATION'
+    _pc_required(serial, ['shell', 'pm', 'grant', '--user', '0', LANGUAGE_PACKAGE, permission])
+    _pc_required(serial, ['shell', 'cmd', 'appops', 'set', '--user', '0', LANGUAGE_PACKAGE, 'WRITE_SETTINGS', 'allow'])
+    granted = _pc_required(serial, ['shell', 'dumpsys', 'package', LANGUAGE_PACKAGE])
+    appop = _pc_required(serial, ['shell', 'cmd', 'appops', 'get', '--user', '0', LANGUAGE_PACKAGE, 'WRITE_SETTINGS'])
+    if permission + ': granted=true' not in granted.stdout or 'WRITE_SETTINGS: allow' not in appop.stdout:
+        raise RuntimeError('Language 기기 언어 변경 권한 확인 실패')
 
 
 def _ensure_package_enabled(serial, package):
@@ -1933,7 +1997,7 @@ def build_pipeline(serial, locale, wallpaper, series):
         ('런처 초기화', lambda: reset_launcher_with_clean_home(serial)),
         ('배경화면 적용', lambda: push_default_wallpaper(serial, wallpaper, series)),
         ('최종 검증', lambda: verify_final_reset(serial)),
-        ('최근 앱 목록 제거', lambda: clear_recent_tasks(serial)),
+        ('최근 앱 목록 제거', lambda: finish_home_setup(serial)),
     ]
 
 

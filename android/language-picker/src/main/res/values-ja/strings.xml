@@ -1,0 +1,8 @@
+<resources>
+    <string name="choose_language">端末の言語を選択してください</string>
+    <string name="current_language">現在の言語</string>
+    <string name="available_languages">利用できる言語</string>
+    <string name="apply_language">変更する</string>
+    <string name="change_failed">言語を変更できませんでした。レンタルスタッフにお問い合わせください。</string>
+    <string name="setup_needed">言語の変更については、レンタルスタッフにお問い合わせください。</string>
+</resources>

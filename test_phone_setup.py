@@ -13,9 +13,11 @@ import V6
 
 class FakeDevice:
     def __init__(self):
+        self.bundle = V6.load_phone_bundle()
         self.installed = {'com.nhn.android.nmap', 'com.alphainventor.filemanager',
-                          V6.PHONE_APP_PACKAGE, V6.SHIZUKU_PACKAGE}
+                          *self.bundle}
         self.versions = {V6.PHONE_APP_PACKAGE: 7, V6.SHIZUKU_PACKAGE: 1086, V6.NMAP_PACKAGE: V6.load_nmap_bundle()['versionCode'], V6.FILEMANAGER_PACKAGE: V6.load_filemanager_bundle()['versionCode']}
+        self.versions.update({pkg: self.bundle[pkg]['versionCode'] for pkg in V6.HOME_APK_FILES})
         self.calls = []
         self.sdk = '37'
         self.user = '0'
@@ -39,16 +41,18 @@ class FakeDevice:
         elif a[:3] == ['shell', 'dumpsys', 'package']:
             out = ('codePath=/data/app/~~ABC=/moe.shizuku.privileged.api-XYZ==\n'
                    'primaryCpuAbi=arm64-v8a\nversionCode=%d minSdk=24\n' % self.versions[a[-1]])
+            if a[-1] == V6.LANGUAGE_PACKAGE:
+                out += 'android.permission.CHANGE_CONFIGURATION: granted=true\n'
         elif a[:1] in (['install'], ['install-multiple']):
             if self.install_failure:
                 code, out = 1, 'Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE]'
             else:
-                pkg = V6.NMAP_PACKAGE if a[0] == 'install-multiple' else {'galaxy-reset.apk': V6.PHONE_APP_PACKAGE, 'shizuku.apk': V6.SHIZUKU_PACKAGE,
+                pkg = V6.NMAP_PACKAGE if a[0] == 'install-multiple' else {**{app['file']: pkg for pkg, app in self.bundle.items()},
                        'nmap.apk': 'com.nhn.android.nmap', 'filemanager.apk': 'com.alphainventor.filemanager'}[Path(a[-1]).name]
                 self.installed.add(pkg)
                 if pkg == V6.FILEMANAGER_PACKAGE: self.versions[pkg] = V6.load_filemanager_bundle()['versionCode']
                 elif pkg == V6.NMAP_PACKAGE: self.versions[pkg] = V6.load_nmap_bundle()['versionCode']
-                elif pkg in (V6.PHONE_APP_PACKAGE, V6.SHIZUKU_PACKAGE): self.versions[pkg] = V6.load_phone_bundle()[pkg]['versionCode']
+                else: self.versions[pkg] = self.bundle[pkg]['versionCode']
                 out = 'Success\n'
         elif a[:3] == ['shell', 'pm', 'path']:
             out = 'package:/data/app/%s/base.apk\n' % a[-1] if a[-1] in self.installed else ''
@@ -74,6 +78,10 @@ class FakeDevice:
                 out='Package '+a[-1]+' new state: enabled\n'
         elif a[:3] == ['shell', 'pm', 'grant'] and self.grant_failure:
             code, err = 1, 'SecurityException: permission denied'
+        elif a[:4] == ['shell', 'cmd', 'appops', 'get']:
+            out = 'WRITE_SETTINGS: allow\n'
+        elif len(a) == 2 and 'LanguageHomePlacement' in a[1]:
+            out = 'SUCCESS:MAIN_HOME_LAYOUT\n'
         return subprocess.CompletedProcess(command, code, out, err)
 
 
@@ -96,6 +104,28 @@ class PhoneSetupTest(unittest.TestCase):
         self.assertEqual(files, ['galaxy-reset.apk', 'shizuku.apk'])
         self.assertTrue({V6.PHONE_APP_PACKAGE, V6.SHIZUKU_PACKAGE} <= self.fake.installed)
         self.assertFalse(any('uninstall' in c for c in self.fake.calls))
+
+    def test_installs_missing_and_upgrades_old_embedded_home_apps(self):
+        self.fake.installed.remove(V6.LANGUAGE_PACKAGE)
+        self.fake.versions[V6.LOCARORA_PACKAGE] -= 1
+        V6.ensure_essential_apps_installed('TEST')
+        V6.ensure_essential_apps_installed('TEST')
+        self.assertEqual([Path(c[-1]).name for c in self.fake.calls if c[3] == 'install'],
+                         ['language.apk', 'locarora.apk'])
+        self.assertTrue(any(V6.LANGUAGE_PACKAGE in c and 'android.permission.CHANGE_CONFIGURATION' in c
+                            for c in self.fake.calls))
+
+    def test_home_placement_uses_installed_phone_helper_and_requires_both_icons(self):
+        V6.place_home_apps('TEST')
+        self.assertTrue(self.fake.calls[-1][-1].endswith('LanguageHomePlacement'))
+        self.assertIn('/data/app/' + V6.PHONE_APP_PACKAGE + '/base.apk', self.fake.calls[-1][-1])
+        def incomplete(command, **kwargs):
+            if 'LanguageHomePlacement' in command[-1]:
+                return subprocess.CompletedProcess(command, 0, 'SUCCESS:LANGUAGE_ON_HOME\n', '')
+            return self.fake.run(command, **kwargs)
+        with patch.object(V6, 'run_command', side_effect=incomplete):
+            with self.assertRaisesRegex(RuntimeError, '홈 배치 확인 필요'):
+                V6.place_home_apps('TEST')
 
     def test_all_installed_essential_apps_are_enabled_even_without_updates(self):
         self.fake.disabled=set(self.fake.installed)
@@ -174,6 +204,7 @@ class PhoneSetupTest(unittest.TestCase):
         removed = [c[-1] for c in self.fake.calls if 'uninstall' in c]
         self.assertEqual(removed, ['com.customer.app'])
         self.assertIn('com.sec.knox.kccagent',self.fake.installed)
+        self.assertTrue(set(V6.HOME_APK_FILES) <= self.fake.installed)
 
     def test_knox_exception_is_exact_and_other_uninstall_failure_cannot_pass(self):
         self.fake.installed |= {'com.sec.knox.kccagent','com.sec.knox.kccagent.extra'}
@@ -304,6 +335,54 @@ class PipelineResilienceTest(unittest.TestCase):
             self.run_pipeline([('최근 앱 목록 제거', lambda: completed.append(True))])
         self.assertEqual(completed, [True])
         self.assertTrue(any('초기화 결과와 별도' in n for n in V6.POST_RUN_NOTICES))
+
+
+class FileManagerPreservationTest(unittest.TestCase):
+    def test_direct_clear_never_touches_smb_app_data(self):
+        with patch.object(V6, 'run_command') as execute:
+            V6.clear_app_data('TEST', V6.FILEMANAGER_PACKAGE, '파일 관리자')
+        execute.assert_not_called()
+
+    def test_maintained_apps_clear_preserves_filemanager_but_clears_map(self):
+        def run(command, **kwargs):
+            if command[3:6] == ['shell', 'pm', 'list']:
+                return subprocess.CompletedProcess(command, 0, 'package:' + command[-1] + '\n', '')
+            return subprocess.CompletedProcess(command, 0, 'Success', '')
+        with patch.object(V6, 'run_command', side_effect=run) as execute:
+            V6.clear_google_apps_history('TEST')
+        commands = [c.args[0] for c in execute.call_args_list]
+        self.assertFalse(any(V6.FILEMANAGER_PACKAGE in c for c in commands))
+        self.assertTrue(any(c[3:6] == ['shell', 'pm', 'clear'] and c[-1] == V6.NMAP_PACKAGE for c in commands))
+
+
+class StorageVerificationTest(unittest.TestCase):
+    def wipe(self, listings, deletion_code=0):
+        scans = iter(listings)
+        def run(command, **kwargs):
+            if 'find' in command:
+                value = next(scans)
+                if isinstance(value, Exception): raise value
+                return subprocess.CompletedProcess(command, 0, value, '')
+            return subprocess.CompletedProcess(command, deletion_code, '', 'Directory not empty' if deletion_code else '')
+        with patch.object(V6, 'run_command', side_effect=run) as execute, patch.object(V6.time, 'sleep'):
+            V6.wipe_internal_storage('TEST')
+            return execute.call_count
+
+    def test_rm_warning_does_not_override_verified_empty_storage(self):
+        self.assertEqual(self.wipe([''], 1), 3)
+
+    def test_remaining_file_gets_one_retry(self):
+        self.assertEqual(self.wipe(['/storage/emulated/0/Download/customer.pdf\n', '']), 6)
+
+    def test_persistent_file_stays_failure(self):
+        with self.assertRaisesRegex(RuntimeError, '자동 재시도 후에도 남음'):
+            self.wipe(['/storage/emulated/0/Download/customer.pdf\n'] * 2)
+
+    def test_unknown_inventory_and_timeout_never_count_as_success(self):
+        with self.assertRaisesRegex(RuntimeError, '조회 실패'):
+            self.wipe([RuntimeError('조회 실패')])
+        with self.assertRaisesRegex(RuntimeError, '시간 초과'):
+            self.wipe([], 124)
 
 
 class CommandFailureReportingTest(unittest.TestCase):

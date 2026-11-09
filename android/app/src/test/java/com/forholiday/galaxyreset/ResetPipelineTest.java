@@ -94,6 +94,53 @@ public class ResetPipelineTest {
         assertEquals(1, ResetPipeline.remainingUserFiles(listing + "/storage/emulated/0/Pictures/.thumbnails/private.jpg\n"));
         assertEquals(1, ResetPipeline.remainingUserFiles(listing + "/storage/emulated/0/Download/document.pdf\n"));
     }
+    static class StorageFake extends Fake {
+        final Deque<ResetPipeline.Result> listings = new ArrayDeque<>();
+        int deletionCode;
+        boolean lost;
+        @Override public ResetPipeline.Result run(String command, int seconds) throws Exception {
+            commands.add(command);
+            if (lost) throw new ResetPipeline.ConnectionLost("offline");
+            return command.startsWith("find ") ? listings.removeFirst()
+                : new ResetPipeline.Result(deletionCode, deletionCode == 0 ? "" : "Directory not empty");
+        }
+    }
+    ResetPipeline storagePipeline(StorageFake fake) {
+        return new ResetPipeline(fake, p -> {}, Set.of());
+    }
+    @Test public void storageRmWarningDoesNotOverrideVerifiedEmptyInventory() throws Exception {
+        StorageFake fake = new StorageFake(); fake.deletionCode = 1;
+        fake.listings.add(new ResetPipeline.Result(0, ""));
+        ResetPipeline pipeline = storagePipeline(fake); pipeline.step(4, "ja-JP", "SM-S948N");
+        assertTrue(pipeline.warnings.isEmpty()); assertEquals(3, fake.commands.size());
+    }
+    @Test public void storageRetriesRemainingFileAndVerifiesAgain() throws Exception {
+        StorageFake fake = new StorageFake();
+        fake.listings.add(new ResetPipeline.Result(0, "/storage/emulated/0/Download/customer.pdf\n"));
+        fake.listings.add(new ResetPipeline.Result(0, ""));
+        ResetPipeline pipeline = storagePipeline(fake); pipeline.step(4, "ja-JP", "SM-S948N");
+        assertTrue(pipeline.warnings.isEmpty()); assertEquals(6, fake.commands.size());
+        assertTrue(pipeline.notes.get(0).contains("자동 재시도"));
+    }
+    @Test public void storagePersistentFilesStillRequireAttention() throws Exception {
+        StorageFake fake = new StorageFake();
+        for (int i = 0; i < 2; i++) fake.listings.add(new ResetPipeline.Result(0, "/storage/emulated/0/Download/customer.pdf\n"));
+        ResetPipeline pipeline = storagePipeline(fake); pipeline.step(4, "ja-JP", "SM-S948N");
+        assertTrue(pipeline.manual); assertFalse(pipeline.warnings.isEmpty());
+        assertEquals(6, fake.commands.size());
+    }
+    @Test public void storageFailedOrTruncatedInventoryCannotPass() {
+        for (ResetPipeline.Result result : List.of(new ResetPipeline.Result(1, "Permission denied"), new ResetPipeline.Result(0, "", true))) {
+            StorageFake fake = new StorageFake(); fake.listings.add(result);
+            assertThrows(IOException.class, () -> storagePipeline(fake).step(4, "ja-JP", "SM-S948N"));
+        }
+    }
+    @Test public void storageTimeoutAndDisconnectCannotPass() {
+        StorageFake timeout = new StorageFake(); timeout.deletionCode = 124;
+        assertThrows(IOException.class, () -> storagePipeline(timeout).step(4, "ja-JP", "SM-S948N"));
+        StorageFake lost = new StorageFake(); lost.lost = true;
+        assertThrows(ResetPipeline.ConnectionLost.class, () -> storagePipeline(lost).step(4, "ja-JP", "SM-S948N"));
+    }
     @Test public void widgetQueryReturnsOnlyActiveWidgetSection() throws Exception {
         Fake fake = new Fake() {
             @Override public ResetPipeline.Result run(String command, int seconds) {
@@ -122,6 +169,32 @@ public class ResetPipelineTest {
         assertFalse(fake.commands.stream().anyMatch(c -> c.startsWith("cmd package install-existing") && c.contains("sbrowser")));
     }
 
+    @Test public void packageVersionUsesSmallQueryWhenFullDumpWouldBeTruncated() throws Exception {
+        Fake fake = new Fake() {
+            @Override public ResetPipeline.Result run(String cmd, int seconds) {
+                commands.add(cmd);
+                if(cmd.startsWith("dumpsys package"))return new ResetPipeline.Result(0,"x".repeat(64000),true);
+                return new ResetPipeline.Result(0,"package:com.alphainventor.filemanager versionCode:2103060\n");
+            }
+        };
+        ResetPipeline p=new ResetPipeline(fake,s->{},Set.of());
+        assertEquals(2103060L,p.packageVersion("com.alphainventor.filemanager"));
+        assertFalse(fake.commands.stream().anyMatch(c->c.startsWith("dumpsys package")));
+    }
+    @Test public void packageVersionRejectsOtherPackagesAndMissingVersion() {
+        for(String output:List.of("package:com.alphainventor.filemanager.clone versionCode:99999999\n",
+                "package:com.alphainventor.filemanager\n", "package:com.alphainventor.filemanager versionCode:-1\n")) {
+            Fake fake=new Fake(){@Override public ResetPipeline.Result run(String c,int s){return new ResetPipeline.Result(0,output);}};
+            assertThrows(IOException.class,()->new ResetPipeline(fake,s->{},Set.of()).packageVersion("com.alphainventor.filemanager"));
+        }
+    }
+    @Test public void packageVersionCannotAcceptFailedOrTruncatedQuery() {
+        String output="package:com.alphainventor.filemanager versionCode:2103060\n";
+        for(ResetPipeline.Result result:List.of(new ResetPipeline.Result(1,output),new ResetPipeline.Result(0,output,true))) {
+            Fake fake=new Fake(){@Override public ResetPipeline.Result run(String c,int s){return result;}};
+            assertThrows(IOException.class,()->new ResetPipeline(fake,s->{},Set.of()).packageVersion("com.alphainventor.filemanager"));
+        }
+    }
     static class NmapFake extends Fake {
         long version=BuildConfig.NMAP_VERSION_CODE-1;
         boolean failWrite, disabled, ignoreEnable;
@@ -129,8 +202,8 @@ public class ResetPipelineTest {
         @Override public void copy(String asset,String destination){copies.add(asset);}
         @Override public ResetPipeline.Result run(String command,int seconds){
             commands.add(command);
+            if(command.startsWith("pm list packages --show-versioncode"))return new ResetPipeline.Result(0,"package:com.nhn.android.nmap versionCode:"+version+"\n");
             if(command.startsWith("pm list packages"))return new ResetPipeline.Result(0,command.contains(" -e ")&&disabled?"":"package:com.nhn.android.nmap\n");
-            if(command.startsWith("dumpsys package"))return new ResetPipeline.Result(0,"versionCode="+version+" minSdk=26");
             if(command.startsWith("pm install-create"))return new ResetPipeline.Result(0,"Success: created install session [123]");
             if(command.startsWith("pm install-write")&&failWrite)return new ResetPipeline.Result(1,"Failure [INVALID_APK]");
             if(command.startsWith("pm install-commit"))version=BuildConfig.NMAP_VERSION_CODE;
@@ -173,9 +246,14 @@ public class ResetPipelineTest {
         final Set<String> disabledPackages=new HashSet<>();
         EssentialFake(){version=BuildConfig.NMAP_VERSION_CODE;}
         @Override public ResetPipeline.Result run(String command,int seconds) {
+            if (command.startsWith("dumpsys package " + ResetPipeline.LANGUAGE))
+                return new ResetPipeline.Result(0, "android.permission.CHANGE_CONFIGURATION: granted=true");
+            if (command.startsWith("cmd appops get --user 0 " + ResetPipeline.LANGUAGE))
+                return new ResetPipeline.Result(0, "WRITE_SETTINGS: allow");
             if(command.startsWith("pm list packages")) {
                 commands.add(command);
                 String pkg=command.substring(command.lastIndexOf(' ')+1).replace("'", "");
+                if(command.contains(" --show-versioncode"))return new ResetPipeline.Result(0,"package:"+pkg+" versionCode:"+version+"\n");
                 return new ResetPipeline.Result(0,command.contains(" -e ")&&disabledPackages.contains(pkg)?"":"package:"+pkg+"\n");
             }
             if(command.startsWith("pm enable")) {
@@ -217,6 +295,29 @@ public class ResetPipelineTest {
         assertTrue(pipeline.advisories.stream().anyMatch(n->n.contains("딥 슬립")));
         assertFalse(fake.commands.stream().anyMatch(c->c.startsWith("pm uninstall")));
     }
+    @Test public void directClearPreservesFileManagerSmbSettings() throws Exception {
+        Fake fake = new Fake();
+        ResetPipeline pipeline = new ResetPipeline(fake, p -> {}, Set.of());
+        pipeline.clear("com.alphainventor.filemanager");
+        assertTrue(fake.commands.isEmpty());
+        assertTrue(pipeline.warnings.isEmpty());
+        assertFalse(pipeline.failedClears.contains("com.alphainventor.filemanager"));
+    }
+    @Test public void maintainedAppsClearSkipsFileManagerButStillClearsMap() throws Exception {
+        Fake fake = new Fake() {
+            @Override public ResetPipeline.Result run(String cmd, int seconds) {
+                commands.add(cmd);
+                if(cmd.startsWith("pm list packages"))return new ResetPipeline.Result(0,"package:"+cmd.substring(cmd.lastIndexOf(' ')+1).replace("'", ""));
+                return new ResetPipeline.Result(0, "Success");
+            }
+        };
+        ResetPipeline pipeline = new ResetPipeline(fake, p -> {}, Set.of());
+        pipeline.step(2,"ja-JP","SM-S918N");
+        assertFalse(fake.commands.stream().anyMatch(c -> c.contains("com.alphainventor.filemanager")));
+        assertTrue(fake.commands.stream().anyMatch(c -> c.startsWith("pm clear") && c.contains("com.nhn.android.nmap")));
+        assertTrue(fake.commands.stream().anyMatch(c -> c.startsWith("pm clear") && c.contains(ResetPipeline.LOCARORA)));
+        assertTrue(pipeline.warnings.isEmpty());
+    }
     @Test public void dataClearContinuesAfterOneFailureAndCachesOnlySuccesses() throws Exception {
         Fake fake = new Fake() {
             @Override public ResetPipeline.Result run(String cmd, int seconds) {
@@ -238,9 +339,10 @@ public class ResetPipelineTest {
             commands.add(cmd);
             if(cmd.equals("dumpsys account"))return new ResetPipeline.Result(0,brokenAccounts?"Permission denied":remainingAccount?"Accounts: 1\nAccount {name=redacted, type=com.google}\n":"Accounts: 0\n");
             if(cmd.equals("pm list packages --user 0 -3"))return new ResetPipeline.Result(0,remainingApp?"package:customer.app\n":"");
-            if(cmd.startsWith("pm list packages"))return new ResetPipeline.Result(0,"package:"+cmd.substring(cmd.lastIndexOf(' ')+1).replace("'", "")+"\n");
-            if(cmd.startsWith("dumpsys package"))return new ResetPipeline.Result(0,"versionCode=999999999 minSdk=30");
+            if(cmd.startsWith("pm list packages"))return new ResetPipeline.Result(0,"package:"+cmd.substring(cmd.lastIndexOf(' ')+1).replace("'", "")+(cmd.contains(" --show-versioncode")?" versionCode:999999999":"")+"\n");
             if(cmd.startsWith("dumpsys wallpaper"))return new ResetPipeline.Result(0,"mName=WallpaperSetter");
+            if(cmd.startsWith("dumpsys package " + ResetPipeline.LANGUAGE))return new ResetPipeline.Result(0,"android.permission.CHANGE_CONFIGURATION: granted=true");
+            if(cmd.startsWith("cmd appops get --user 0 " + ResetPipeline.LANGUAGE))return new ResetPipeline.Result(0,"WRITE_SETTINGS: allow");
             return new ResetPipeline.Result(0,"ko-KR");
         }
     }
@@ -255,6 +357,75 @@ public class ResetPipelineTest {
         ResetPipeline p=new ResetPipeline(fake,x->{},Set.of());p.step(17,"ko-KR","SM-S938N");
         assertEquals(-1,p.finalAccountCount);assertFalse(p.warnings.isEmpty());
         assertFalse(p.summaryText.contains("남은 비삼성 계정: 0개"));
+    }
+
+    @Test public void languageInstallProvisionsPermissionsAndDoesNotReinstallCurrentVersion() throws Exception {
+        FinalFake fake = new FinalFake() {
+            boolean installed;
+            @Override public ResetPipeline.Result run(String command, int seconds) {
+                if (command.startsWith("pm install -r --user 0 ") && command.contains("language.apk")) {
+                    commands.add(command);
+                    installed = true;
+                    return new ResetPipeline.Result(0, "Success");
+                }
+                if (!installed && command.startsWith("pm list packages") && command.contains(ResetPipeline.LANGUAGE)) {
+                    commands.add(command);
+                    return new ResetPipeline.Result(0, "");
+                }
+                return super.run(command, seconds);
+            }
+        };
+        ResetPipeline pipeline = new ResetPipeline(fake, p -> {}, Set.of());
+        pipeline.prepareLanguageApp();
+        pipeline.prepareLanguageApp();
+        assertEquals(1, fake.commands.stream().filter(c -> c.startsWith("pm install -r")).count());
+        assertTrue(fake.commands.contains("pm grant --user 0 " + ResetPipeline.LANGUAGE + " android.permission.CHANGE_CONFIGURATION"));
+        assertTrue(fake.commands.contains("cmd appops set --user 0 " + ResetPipeline.LANGUAGE + " WRITE_SETTINGS allow"));
+        assertTrue(ResetPipeline.KEEP.contains(ResetPipeline.LANGUAGE));
+    }
+
+    @Test public void locaroraUpdatesOldVersionAndKeepsCurrentVersion() throws Exception {
+        FinalFake fake = new FinalFake() {
+            long version = BuildConfig.LOCARORA_VERSION_CODE - 1;
+            @Override public ResetPipeline.Result run(String command, int seconds) {
+                if (command.startsWith("pm install -r --user 0 ") && command.contains("locarora.apk")) {
+                    commands.add(command);
+                    version = BuildConfig.LOCARORA_VERSION_CODE;
+                    return new ResetPipeline.Result(0, "Success");
+                }
+                if (command.startsWith("pm list packages --show-versioncode") && command.contains(ResetPipeline.LOCARORA)) {
+                    commands.add(command);
+                    return new ResetPipeline.Result(0, "package:" + ResetPipeline.LOCARORA + " versionCode:" + version);
+                }
+                return super.run(command, seconds);
+            }
+        };
+        ResetPipeline pipeline = new ResetPipeline(fake, p -> {}, Set.of());
+        pipeline.prepareLocaroraApp();
+        pipeline.prepareLocaroraApp();
+        assertEquals(1, fake.commands.stream().filter(c -> c.startsWith("pm install -r")).count());
+        assertTrue(ResetPipeline.KEEP.contains(ResetPipeline.LOCARORA));
+    }
+
+    @Test public void failedHomePlacementIsReportedAfterRecentTaskCleanup() throws Exception {
+        FinalFake fake = new FinalFake() {
+            @Override public ResetPipeline.Result run(String command, int seconds) {
+                if (command.contains("RecentTasksCleaner") || command.contains("LanguageHomePlacement")
+                        || command.startsWith("pm path")) {
+                    commands.add(command);
+                    if (command.contains("RecentTasksCleaner")) return new ResetPipeline.Result(0, "SUCCESS:RECENTS");
+                    if (command.startsWith("pm path")) return new ResetPipeline.Result(0, "package:/data/app/test/base.apk");
+                    return new ResetPipeline.Result(1, "FAIL:목표 칸이 사용 중입니다.");
+                }
+                return super.run(command, seconds);
+            }
+        };
+        ResetPipeline pipeline = new ResetPipeline(fake, p -> {}, Set.of());
+        pipeline.step(18, "ja-JP", "SM-S918N");
+        assertTrue(fake.commands.get(0).contains("RecentTasksCleaner"));
+        assertTrue(fake.commands.get(fake.commands.size() - 1).contains("LanguageHomePlacement"));
+        assertTrue(pipeline.manual);
+        assertTrue(pipeline.warnings.stream().anyMatch(warning -> warning.contains("목표 칸")));
     }
 
 }

@@ -5,4 +5,5 @@ dependencyResolutionManagement {
 }
 rootProject.name = 'GalaxyReset'
 include ':app'
+include ':language-picker'
 if (providers.gradleProperty('validationFixture').isPresent()) include ':disabled-auth-fixture'
