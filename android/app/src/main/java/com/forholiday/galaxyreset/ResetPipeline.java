@@ -445,7 +445,7 @@ final class ResetPipeline {
                     .map(line -> line.substring(5)).findFirst().orElse("삼성 런처 상태와 홈 화면 잠금 여부를 확인하세요.");
                 throw new IOException(reason);
             }
-            notes.add("메인 홈 맨 아래 줄 확인 · 갤러리 / Play 스토어 / LOCARORA / Language");
+            notes.add("메인 홈 1페이지 확인 · 갤러리 / Play 스토어 / LOCARORA / Language");
         } catch (ConnectionLost e) {
             throw e;
         } catch (Exception e) {

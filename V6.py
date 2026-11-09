@@ -1288,7 +1288,7 @@ def place_home_apps(serial):
     failure = next((line[5:] for line in lines if line.startswith('FAIL:')), None)
     if result.returncode != 0 or failure is not None or 'SUCCESS:MAIN_HOME_LAYOUT' not in lines:
         raise RuntimeError('홈 배치 확인 필요 · ' + (failure or '메인 홈의 앱 4개 배치를 확인하세요.'))
-    logging.info('[%s] 메인 홈 배치 확인 · 갤러리 / Play 스토어 / LOCARORA / Language', serial)
+    logging.info('[%s] 메인 홈 1페이지 확인 · 갤러리 / Play 스토어 / LOCARORA / Language', serial)
 
 
 def finish_home_setup(serial):

@@ -13,6 +13,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Pattern;
 
 /** Runs as a short-lived shell process. Uses Samsung's normal home-screen controls. */
 public final class LanguageHomePlacement {
@@ -27,11 +28,16 @@ public final class LanguageHomePlacement {
     private static final Set<String> REMOVE_LABELS = Set.of("Remove", "Remove from Home", "Remove from Home screen",
         "삭제", "홈에서 삭제", "홈 화면에서 삭제", "홈에서 제거", "홈 화면에서 제거",
         "削除", "ホームから削除", "ホーム画面から削除", "移除", "从主屏幕移除", "從主畫面移除");
+    private static final Pattern PAGE_NUMBERS = Pattern.compile("\\p{Nd}+[^\\p{Nd}]+\\p{Nd}+");
+    private static final Pattern PAGE_MESSAGE = Pattern.compile("page|페이지|ページ|页面|頁面|主屏幕|主畫面", Pattern.CASE_INSENSITIVE);
+    private static final Set<String> DELETE_PAGE_LABELS = Set.of("Delete", "Remove", "삭제", "제거", "削除", "删除", "刪除", "移除");
     private final UiAutomation ui;
 
     private record Page(AccessibilityNodeInfo grid, int index, int count) {}
+    private record HomeIcon(Page page, Rect bounds) {}
     private record HomeApp(String name, Set<String> labels) {}
     private record Shortcut(String label, Rect bounds, boolean folder) {}
+    private record EditPages(List<AccessibilityNodeInfo> dots, int selected) {}
     private record Grid(Rect area, int columns, int rows) {
         Rect cell(int column, int row) {
             return new Rect(area.left + area.width() * column / columns, area.top + area.height() * row / rows,
@@ -81,6 +87,7 @@ public final class LanguageHomePlacement {
         Grid layout = gridLayout(main.grid());
         removeOtherShortcuts(main);
         for (int i = 0; i < APPS.size(); i++) place(APPS.get(i), layout, layout.destination(i));
+        keepOnlyMainPage(layout);
 
         AccessibilityNodeInfo grid = mainPage().grid();
         if (shortcuts(grid).size() != APPS.size()) throw new IOException("메인 홈에 다른 바로가기가 남아 있습니다.");
@@ -89,6 +96,72 @@ public final class LanguageHomePlacement {
             if (icon == null || !layout.destination(i).contains(icon.centerX(), icon.centerY()))
                 throw new IOException(APPS.get(i).name() + "의 메인 홈 위치 확인 필요");
         }
+    }
+
+    private void keepOnlyMainPage(Grid layout) throws IOException {
+        Page main = mainPage();
+        if (main.count() == 1) return;
+
+        openShortcutMenu(freeCell(main.grid(), layout));
+        if (await("page_edit_panel") == null) throw new IOException("삼성 홈 페이지 편집 화면 확인 필요");
+        EditPages pages = editPages();
+        int keep = pages.selected();
+        if (keep < 0 || pages.dots().size() > 7) throw new IOException("보존할 메인 홈 페이지 확인 필요");
+
+        while (pages.dots().size() > 1) {
+            int before = pages.dots().size();
+            // Remove from the end first so the main page's index normally stays the same.
+            int extra = before - 1 == keep ? 0 : before - 1;
+            tap(bounds(pages.dots().get(extra)));
+            SystemClock.sleep(700);
+            EditPages current = editPages();
+            if (current.dots().size() != before || current.selected() != extra)
+                throw new IOException("제거할 홈 페이지 선택 확인 필요");
+            AccessibilityNodeInfo delete = await("delete_page_layout");
+            if (delete == null || !delete.isClickable()) throw new IOException("홈 페이지 제거 버튼 확인 필요");
+            tap(bounds(delete));
+            SystemClock.sleep(600);
+            confirmPageDeletion();
+            pages = editPages();
+            if (pages.dots().size() != before - 1) throw new IOException("홈 페이지 제거 결과 확인 필요");
+            if (extra < keep) keep--;
+        }
+        home();
+        SystemClock.sleep(550);
+    }
+
+    private EditPages editPages() throws IOException {
+        AccessibilityNodeInfo indicator = await("workspace_page_indicator");
+        AccessibilityNodeInfo group = indicator == null ? null : indicator.getChild(0);
+        if (group == null) throw new IOException("편집 화면의 홈 페이지 수 확인 필요");
+        List<AccessibilityNodeInfo> dots = new ArrayList<>();
+        int selected = -1;
+        for (int i = 0; i < group.getChildCount(); i++) {
+            AccessibilityNodeInfo dot = group.getChild(i);
+            CharSequence label = dot == null ? null : dot.getContentDescription();
+            // Discover and Add Page are also in the indicator, but have no page number pair.
+            if (label == null || !PAGE_NUMBERS.matcher(label).find()) continue;
+            if (dot.isSelected()) selected = dots.size();
+            dots.add(dot);
+        }
+        if (dots.isEmpty()) throw new IOException("편집 화면의 홈 페이지 수 확인 필요");
+        return new EditPages(dots, selected);
+    }
+
+    private void confirmPageDeletion() throws IOException {
+        AccessibilityNodeInfo root = ui.getRootInActiveWindow();
+        AccessibilityNodeInfo confirm = visible(root, "android:id/button1");
+        if (confirm == null) return;
+        AccessibilityNodeInfo message = visible(root, "android:id/message");
+        if (message == null || !PAGE_MESSAGE.matcher(text(message)).find() || !DELETE_PAGE_LABELS.contains(text(confirm)))
+            throw new IOException("삼성 홈 페이지 제거 확인창 확인 필요");
+        tap(bounds(confirm));
+        SystemClock.sleep(600);
+    }
+
+    private static void tap(Rect target) throws IOException {
+        if (target.isEmpty()) throw new IOException("삼성 런처 버튼 위치 확인 필요");
+        input("tap", "" + target.centerX(), "" + target.centerY());
     }
 
     private void place(HomeApp app, Grid layout, Rect destination) throws IOException {
@@ -104,34 +177,39 @@ public final class LanguageHomePlacement {
         }
         if (!empty(main.grid(), destination)) throw new IOException(app.name() + "의 목표 칸이 이미 사용 중입니다.");
 
-        Page source = main;
-        if (icon == null) {
-            // A retry can find the icon on the page opened by Samsung's Add to Home action.
-            // Keep the search bounded and stop on layouts with too many pages to verify.
-            if (main.count() > 7) throw new IOException("홈 페이지가 너무 많아 자동 배치 위치를 확인할 수 없습니다.");
-            for (int i = main.index() + 1; i < main.count(); i++) {
-                Rect grid = bounds(source.grid());
-                swipe(grid.right - grid.width() / 8, grid.centerY(), grid.left + grid.width() / 8, grid.centerY());
-                source = awaitPage();
-                if (source.index() != i) throw new IOException("홈 페이지 이동 확인 필요");
-                icon = appIcon(source.grid(), app);
-                if (icon != null) break;
-            }
-            if (icon == null) {
-                main = mainPage();
-                addFromDrawer(bounds(main.grid()), app);
-                source = awaitPage();
-                icon = appIcon(source.grid(), app);
-                if (icon == null) throw new IOException("홈에 추가된 " + app.name() + " 아이콘을 찾을 수 없습니다.");
-            }
+        HomeIcon source = findHomeIcon(main, app);
+        if (source == null) {
+            main = mainPage();
+            addFromDrawer(bounds(main.grid()), app);
+            // One UI may add to another page while keeping the currently visible page.
+            main = mainPage();
+            source = findHomeIcon(main, app);
+            if (source == null) throw new IOException("홈에 추가된 " + app.name() + " 아이콘을 찾을 수 없습니다.");
         }
-        int pagesLeft = source.index() - main.index();
+        icon = source.bounds();
+        int pagesLeft = source.page().index() - main.index();
         if (pagesLeft < 0 || pagesLeft > 5) throw new IOException("홈 페이지 이동 확인 필요");
         if (pagesLeft != 0 || !destination.contains(icon.centerX(), icon.centerY()))
-            dragToMain(icon, destination, pagesLeft, bounds(source.grid()));
+            dragToMain(icon, destination, pagesLeft, bounds(source.page().grid()));
         Rect placed = appIcon(mainPage().grid(), app);
         if (placed == null || !destination.contains(placed.centerX(), placed.centerY()))
             throw new IOException(app.name() + " 아이콘의 메인 홈 배치를 확인해 주세요.");
+    }
+
+    private HomeIcon findHomeIcon(Page main, HomeApp app) throws IOException {
+        Rect icon = appIcon(main.grid(), app);
+        if (icon != null) return new HomeIcon(main, icon);
+        if (main.count() > 7) throw new IOException("홈 페이지가 너무 많아 자동 배치 위치를 확인할 수 없습니다.");
+        Page page = main;
+        for (int index = main.index() + 1; index < main.count(); index++) {
+            Rect area = bounds(page.grid());
+            swipe(area.right - area.width() / 8, area.centerY(), area.left + area.width() / 8, area.centerY());
+            page = awaitPage();
+            if (page.index() != index) throw new IOException("홈 페이지 이동 확인 필요");
+            icon = appIcon(page.grid(), app);
+            if (icon != null) return new HomeIcon(page, icon);
+        }
+        return null;
     }
 
     private void addFromDrawer(Rect grid, HomeApp app) throws IOException {
@@ -139,13 +217,44 @@ public final class LanguageHomePlacement {
         AccessibilityNodeInfo drawer = await("app_search_edit_text");
         AccessibilityNodeInfo root = ui.getRootInActiveWindow();
         if (drawer == null || root == null) throw new IOException("삼성 앱 목록 열기 확인 필요");
-        Rect icon = appIcon(root, app);
+        Rect icon = drawerIcon(root, app);
         if (icon == null) throw new IOException("삼성 앱 목록에서 " + app.name() + " 앱을 찾아 홈 화면에 추가해 주세요.");
         openShortcutMenu(icon);
         AccessibilityNodeInfo title = await("quickoption_title_text");
         if (title == null || !app.labels().contains(text(title))) throw new IOException(app.name() + " 앱 메뉴 확인 필요");
         tapMenuAction(ADD_LABELS, app.name() + " 홈에 추가 메뉴 확인 필요");
         SystemClock.sleep(900);
+    }
+
+    private Rect drawerIcon(AccessibilityNodeInfo root, HomeApp app) throws IOException {
+        Rect icon = appIcon(root, app);
+        if (icon != null) return icon;
+        AccessibilityNodeInfo pages = drawerPages(root);
+        if (pages == null) return null;
+        int count = pages.getChildCount();
+        if (count > 12) throw new IOException("삼성 앱 목록의 페이지가 너무 많아 자동으로 확인할 수 없습니다.");
+
+        for (int index = 0; index < count; index++) {
+            AccessibilityNodeInfo dot = pages.getChild(index);
+            if (dot == null || !dot.isVisibleToUser() || !dot.isClickable() || dot.isSelected()) continue;
+            tap(bounds(dot));
+            SystemClock.sleep(650);
+            root = ui.getRootInActiveWindow();
+            pages = drawerPages(root);
+            AccessibilityNodeInfo current = pages == null ? null : pages.getChild(index);
+            if (current == null || !current.isSelected()) throw new IOException("삼성 앱 목록 페이지 이동 확인 필요");
+            icon = appIcon(root, app);
+            if (icon != null) {
+                android.util.Log.i("GalaxyResetHome", app.name() + " found on app drawer page " + (index + 1));
+                return icon;
+            }
+        }
+        return null;
+    }
+
+    private static AccessibilityNodeInfo drawerPages(AccessibilityNodeInfo root) {
+        AccessibilityNodeInfo indicator = visible(root, "applist_page_indicator");
+        return indicator == null ? null : indicator.getChild(0);
     }
 
     private void removeOtherShortcuts(Page main) throws IOException {
@@ -212,12 +321,29 @@ public final class LanguageHomePlacement {
         AccessibilityNodeInfo root = ui.getRootInActiveWindow();
         AccessibilityNodeInfo indicator = visible(root, "workspace_page_indicator");
         AccessibilityNodeInfo pages = indicator == null ? null : indicator.getChild(0);
-        if (pages == null) return new Page(grid, 0, 1);
+        if (pages == null) return pageFromWorkspace(root, grid);
         for (int i = 0; i < pages.getChildCount(); i++) {
             AccessibilityNodeInfo page = pages.getChild(i);
             if (page != null && page.isSelected()) return new Page(grid, i, pages.getChildCount());
         }
-        throw new IOException("현재 홈 페이지 확인 필요");
+        return pageFromWorkspace(root, grid);
+    }
+
+    private static Page pageFromWorkspace(AccessibilityNodeInfo root, AccessibilityNodeInfo grid) throws IOException {
+        AccessibilityNodeInfo workspace = visible(root, "workspace_fast_recycler_view");
+        if (workspace == null) return new Page(grid, 0, 1);
+        // One UI can hide the page indicator or omit its selected dot on a single-page home.
+        // The workspace exposes page containers in order even when their grids are off-screen.
+        AccessibilityNodeInfo current = grid.getParent();
+        int index = -1, count = 0;
+        for (int i = 0; i < workspace.getChildCount(); i++) {
+            AccessibilityNodeInfo page = workspace.getChild(i);
+            if (page == null || page.findAccessibilityNodeInfosByViewId(id("wsCellLayout")).isEmpty()) continue;
+            if (page.equals(current)) index = count;
+            count++;
+        }
+        if (index < 0) throw new IOException("현재 홈 페이지 확인 필요");
+        return new Page(grid, index, count);
     }
 
     private AccessibilityNodeInfo await(String... names) {
@@ -236,7 +362,8 @@ public final class LanguageHomePlacement {
         if (root == null) return null;
         CharSequence owner = root.getPackageName();
         if (owner == null || !LAUNCHER.contentEquals(owner)) return null;
-        for (AccessibilityNodeInfo node : root.findAccessibilityNodeInfosByViewId(id(name)))
+        String resource = name.startsWith("android:") ? name : id(name);
+        for (AccessibilityNodeInfo node : root.findAccessibilityNodeInfosByViewId(resource))
             if (node.isVisibleToUser()) return node;
         return null;
     }
