@@ -12,6 +12,7 @@ import android.os.*;
 import android.provider.Settings;
 import android.view.*;
 import android.widget.*;
+import java.io.InputStream;
 import java.util.*;
 import rikka.shizuku.Shizuku;
 
@@ -20,13 +21,15 @@ public class MainActivity extends Activity {
         TEAL=0xff007c70, PALE=0xffdff2ec, BORDER=0xffd8e1de, RED=0xffcf2926, AMBER=0xff96631e;
     private static final String[] NAMES={"日本語 (일본어)","English (영어)","한국어","中文简体 (중국어 간체)","中文繁體 (중국어 번체)"};
     private static final String[] SCREENS={"연결","시작","삭제 확인","진행 중","완료","일부 실패"};
+    private static final String WALLPAPER_PREFS = "wallpaper";
+    private static final String GALAXY_WALLPAPER_ID = "galaxy_wallpaper_id";
     private final Handler handler=new Handler(Looper.getMainLooper());
     private RunState state;
     private LinearLayout frame, body, footer, rows;
     private ScrollView contentScroll, records;
     private TextView percent, progressLabel, countLabel;
     private ProgressBar progressBar;
-    private Button startButton;
+    private Button startButton, shutdownButton, wallpaperButton;
     private TextView updateStatus,updateCheck;
     private AppUpdater.Release pendingUpdate;
     private boolean awaitingInstallPermission;
@@ -37,6 +40,7 @@ public class MainActivity extends Activity {
     private Dialog activeDialog;
     private long backPressedAt;
     private boolean shuttingDown;
+    private boolean wallpaperBusy;
     private final Shizuku.OnBinderReceivedListener received=()->{ShellConnection.INSTANCE.connect(false); refresh();};
     private final Shizuku.OnBinderDeadListener dead=()->{ShellConnection.INSTANCE.lost(); refresh();};
     private final Shizuku.OnRequestPermissionResultListener permission=(request,result)->{ShellConnection.INSTANCE.connect(false); refresh();};
@@ -50,7 +54,11 @@ public class MainActivity extends Activity {
         selected=saved==null?state.locale():saved.getString("selected",state.locale());
         if(saved!=null){override=saved.getInt("override",-1);}
         if(state.homeOnNextLaunch()&&!running()){preview=-1;override=1;}
-        try { wallpaper=BitmapFactory.decodeStream(getAssets().open(ResetPipeline.series(Build.MODEL)+".png")); } catch(Exception ignored) {}
+        try (InputStream image = getAssets().open(ResetPipeline.series(Build.MODEL) + ".png")) {
+            BitmapFactory.Options options = new BitmapFactory.Options();
+            options.inSampleSize = 4;
+            wallpaper = BitmapFactory.decodeStream(image, null, options);
+        } catch (java.io.IOException ignored) {}
         Shizuku.addBinderReceivedListenerSticky(received); Shizuku.addBinderDeadListener(dead); Shizuku.addRequestPermissionResultListener(permission);
         render();
         if(Build.VERSION.SDK_INT>=33&&checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)!=PackageManager.PERMISSION_GRANTED)
@@ -100,7 +108,7 @@ public class MainActivity extends Activity {
         renderUpdateStatus();
     }
     void render(){
-        startButton=null;updateStatus=null;updateCheck=null;
+        startButton=null;shutdownButton=null;wallpaperButton=null;updateStatus=null;updateCheck=null;
         rows=null;records=null;percent=null;
         int current=screen();frame=column();frame.setBackgroundColor(BG);frame.setTag(current==3?"progress:"+preview:"screen:"+current);setContentView(frame);
         frame.setOnApplyWindowInsetsListener((view,insets)->{Insets bars=insets.getInsets(WindowInsets.Type.systemBars());view.setPadding(bars.left,bars.top,bars.right,bars.bottom);return insets;});frame.requestApplyInsets();
@@ -112,6 +120,169 @@ public class MainActivity extends Activity {
         switch(current){case 0->connectionScreen();case 1,2->startScreen();case 3->progressScreen();case 4->doneScreen();case 5->failureScreen();}
         renderUpdateStatus();
         if(current==2)handler.post(()->confirmRun(0,false,true));
+    }
+    private void showWallpaperPicker() {
+        if (wallpaperBusy || running() || shuttingDown || AppUpdater.INSTANCE.active()) return;
+        LinearLayout content = column();
+        card(content, WHITE);
+        text(content, "적용 배경", 20, INK, true);
+        space(content, 8);
+        text(content, "홈 화면과 잠금 화면에 적용할 배경을 선택하세요.", 14, MUTED, false);
+        space(content, 16);
+
+        int previewHeight = Math.min(250, Math.max(120, getResources().getConfiguration().screenHeightDp / 3));
+        Drawable brandedImage = wallpaper == null ? null : new BitmapDrawable(getResources(), wallpaper);
+        Drawable galaxyImage = galaxyWallpaperPreview(previewHeight * 6 / 13, previewHeight);
+        RadioButton branded = new RadioButton(this);
+        RadioButton galaxy = new RadioButton(this);
+        branded.setEnabled(brandedImage != null);
+        LinearLayout brandedOption = wallpaperOption(branded, "우리 배경", brandedImage, previewHeight);
+        LinearLayout galaxyOption = wallpaperOption(galaxy, "갤럭시 기본 배경", galaxyImage, previewHeight);
+        LinearLayout options = row();
+        options.addView(brandedOption, new LinearLayout.LayoutParams(0, -1, 1));
+        LinearLayout.LayoutParams second = new LinearLayout.LayoutParams(0, -1, 1);
+        second.setMarginStart(dp(8));
+        options.addView(galaxyOption, second);
+        content.addView(options, new LinearLayout.LayoutParams(-1, -2));
+
+        space(content, 12);
+        Button apply = action(content, "적용", UiIcon.CHECK, TEAL, WHITE, () -> {
+            dismissDialog();
+            applyWallpaper(galaxy.isChecked());
+        });
+        apply.setEnabled(false);
+        apply.setAlpha(0.45f);
+        View.OnClickListener select = choice -> {
+            branded.setChecked(choice == branded);
+            galaxy.setChecked(choice == galaxy);
+            brandedOption.setBackground(shape(branded.isChecked() ? PALE : BG, 12, branded.isChecked() ? TEAL : BORDER));
+            galaxyOption.setBackground(shape(galaxy.isChecked() ? PALE : BG, 12, galaxy.isChecked() ? TEAL : BORDER));
+            apply.setEnabled(true);
+            apply.setAlpha(1f);
+        };
+        branded.setOnClickListener(select);
+        galaxy.setOnClickListener(select);
+        showDialog(content);
+    }
+
+    private LinearLayout wallpaperOption(RadioButton radio, String title, Drawable image, int previewHeight) {
+        LinearLayout option = column();
+        option.setBackground(shape(BG, 12, BORDER));
+        option.setPadding(dp(6), dp(10), dp(6), dp(2));
+        if (image != null) {
+            ImageView preview = new ImageView(this);
+            preview.setImageDrawable(image);
+            preview.setScaleType(ImageView.ScaleType.FIT_CENTER);
+            preview.setContentDescription(title + " 미리보기");
+            preview.setOnClickListener(v -> radio.performClick());
+            option.addView(preview, new LinearLayout.LayoutParams(-1, dp(previewHeight)));
+        } else {
+            TextView unavailable = label("미리보기 없음", 12, MUTED, false);
+            unavailable.setGravity(Gravity.CENTER);
+            option.addView(unavailable, new LinearLayout.LayoutParams(-1, dp(previewHeight)));
+        }
+        space(option, 6);
+        radio.setText(title);
+        radio.setTextSize(13);
+        radio.setTextColor(INK);
+        radio.setButtonTintList(ColorStateList.valueOf(TEAL));
+        radio.setBackground(ripple(Color.TRANSPARENT, 10, 0));
+        radio.setMinHeight(dp(48));
+        option.addView(radio, new LinearLayout.LayoutParams(-1, -2));
+        return option;
+    }
+
+    private void addButtonPair(LinearLayout parent, Button left, Button right) {
+        LinearLayout actions = row();
+        for (Button button : new Button[]{left, right}) {
+            button.setTextSize(14);
+            button.setPadding(dp(12), 0, dp(12), 0);
+            LinearLayout.LayoutParams size = new LinearLayout.LayoutParams(0, dp(52), 1);
+            if (button == right) size.setMarginStart(dp(10));
+            actions.addView(button, size);
+        }
+        parent.addView(actions);
+    }
+
+    private Drawable galaxyWallpaperPreview(int width, int height) {
+        try {
+            return WallpaperManager.getInstance(this).getBuiltInDrawable(
+                dp(width), dp(height), true, 0.5f, 0.5f, WallpaperManager.FLAG_SYSTEM);
+        } catch (RuntimeException e) {
+            android.util.Log.w("GalaxyReset", "Cannot preview built-in wallpaper", e);
+            return null;
+        }
+    }
+
+    private void updateWallpaperButton() {
+        if (wallpaperButton == null) return;
+        int galaxyId = getSharedPreferences(WALLPAPER_PREFS, MODE_PRIVATE).getInt(GALAXY_WALLPAPER_ID, 0);
+        // Applying a new wallpaper, including through the reset pipeline, invalidates the old ID.
+        boolean galaxy = galaxyId != 0
+            && galaxyId == homeWallpaperId(WallpaperManager.getInstance(this));
+        Drawable thumbnail = galaxy ? galaxyWallpaperPreview(30, 65) : null;
+        if (!galaxy && wallpaper != null) thumbnail = new BitmapDrawable(getResources(), wallpaper);
+        if (thumbnail == null) {
+            thumbnail = UiIcon.create(this, UiIcon.PHONE, TEAL, dp(26));
+        } else {
+            thumbnail.setBounds(0, 0, dp(30), dp(65));
+        }
+        wallpaperButton.setCompoundDrawables(null, thumbnail, null, null);
+        wallpaperButton.setContentDescription("적용 배경 · " + (galaxy ? "갤럭시 기본 배경" : "우리 배경"));
+    }
+
+    private static int homeWallpaperId(WallpaperManager manager) {
+        try {
+            return manager.getWallpaperId(WallpaperManager.FLAG_SYSTEM);
+        } catch (RuntimeException e) {
+            android.util.Log.w("GalaxyReset", "Cannot read home wallpaper ID", e);
+            return 0;
+        }
+    }
+
+    private void applyWallpaper(boolean useGalaxyDefault) {
+        String title = useGalaxyDefault ? "갤럭시 기본 배경" : "우리 배경";
+        if (demo()) { previewNotice(title); return; }
+        if (wallpaperBusy || running() || shuttingDown || AppUpdater.INSTANCE.active()) return;
+        wallpaperBusy = true;
+        renderUpdateStatus();
+        String file = ResetPipeline.series(Build.MODEL) + ".png";
+        Context context = getApplicationContext();
+        new Thread(() -> {
+            boolean applied = false;
+            try {
+                WallpaperManager manager = WallpaperManager.getInstance(context);
+                if (manager.isWallpaperSupported() && manager.isSetWallpaperAllowed()) {
+                    int screens = WallpaperManager.FLAG_SYSTEM | WallpaperManager.FLAG_LOCK;
+                    if (useGalaxyDefault) {
+                        manager.clear(screens);
+                        applied = true;
+                        context.getSharedPreferences(WALLPAPER_PREFS, MODE_PRIVATE).edit()
+                            .putInt(GALAXY_WALLPAPER_ID, homeWallpaperId(manager)).apply();
+                    } else {
+                        try (InputStream image = context.getAssets().open(file)) {
+                            applied = manager.setStream(image, null, false, screens) > 0;
+                        }
+                        if (applied) {
+                            context.getSharedPreferences(WALLPAPER_PREFS, MODE_PRIVATE).edit()
+                                .remove(GALAXY_WALLPAPER_ID).apply();
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                android.util.Log.w("GalaxyReset", "Wallpaper change failed", e);
+            }
+            final boolean success = applied;
+            handler.post(() -> {
+                wallpaperBusy = false;
+                if (!isDestroyed() && !isFinishing()) {
+                    if (success) updateWallpaperButton();
+                    renderUpdateStatus();
+                    Toast.makeText(this, success ? title + "을 적용했습니다." : "배경화면을 적용하지 못했습니다.",
+                        Toast.LENGTH_SHORT).show();
+                }
+            });
+        }, "apply-wallpaper").start();
     }
     void connectionScreen(){
         space(body,18);text(body,"권한 연결 확인",28,INK,true);space(body,10);text(body,"Shizuku가 실행 중이면 자동으로 연결합니다.",14,MUTED,false);space(body,24);
@@ -136,8 +307,21 @@ public class MainActivity extends Activity {
         TextView model=text(info,Build.MODEL+" · "+ResetPipeline.series(Build.MODEL)+" 시리즈",11,MUTED,false);model.setSingleLine(true);model.setEllipsize(android.text.TextUtils.TruncateAt.END);space(info,8);
         LinearLayout chips=row();if(getResources().getConfiguration().fontScale>1.15f)chips.setOrientation(LinearLayout.VERTICAL);
         chip(chips,demo()||wifiConnected()?"Wi-Fi 연결됨":"Wi-Fi 끊김",UiIcon.WIFI);chip(chips,connectionTitle(),UiIcon.SHIELD);info.addView(chips);
-        LinearLayout image=column();image.setGravity(Gravity.CENTER);image.addView(wallpaperImage(40,76));space(image,4);text(image,"적용 배경",10,MUTED,false);
-        LinearLayout.LayoutParams imageParams=new LinearLayout.LayoutParams(-2,-2);imageParams.setMargins(dp(12),0,0,0);device.addView(image,imageParams);body.addView(device);
+        wallpaperButton = new Button(this);
+        wallpaperButton.setTextSize(11);
+        wallpaperButton.setTextColor(TEAL);
+        wallpaperButton.setAllCaps(false);
+        wallpaperButton.setGravity(Gravity.CENTER);
+        wallpaperButton.setStateListAnimator(null);
+        wallpaperButton.setBackground(ripple(PALE, 10, BORDER));
+        wallpaperButton.setPadding(dp(8), dp(6), dp(8), dp(6));
+        wallpaperButton.setCompoundDrawablePadding(dp(4));
+        updateWallpaperButton();
+        wallpaperButton.setOnClickListener(v -> showWallpaperPicker());
+        LinearLayout.LayoutParams imageParams = new LinearLayout.LayoutParams(-2, -2);
+        imageParams.setMarginStart(dp(8));
+        device.addView(wallpaperButton, imageParams);
+        body.addView(device);
         if(!demo()&&!ShellConnection.INSTANCE.ready()){
             space(body,12);LinearLayout connection=column();card(connection,WHITE);body.addView(connection);
             text(connection,connectionTitle(),16,INK,true);space(connection,6);text(connection,connectionDetail(),13,MUTED,false);space(connection,12);
@@ -153,7 +337,9 @@ public class MainActivity extends Activity {
         if(state.completed()>0){space(body,12);TextView history=text(body,"지난 초기화 결과 보기",12,TEAL,true);history.setPadding(0,dp(8),0,dp(8));history.setOnClickListener(v->{override=state.phase().equals("done")?4:5;render();});}
         text(footer,"직원 전용 · 고객님은 실행하지 마세요",12,RED,true);space(footer,6);
         TextView hint=text(footer,"19단계 진행 · 끝날 때까지 화면을 만지지 마세요",11,MUTED,false);hint.setCompoundDrawables(UiIcon.create(this,UiIcon.INFO,MUTED,dp(14)),null,null,null);hint.setCompoundDrawablePadding(dp(6));space(footer,10);
-        startButton=action(footer,"초기화 시작",UiIcon.REFRESH,TEAL,WHITE,()->confirmRun(0,false,true));startButton.setEnabled(demo()||ShellConnection.INSTANCE.ready());
+        shutdownButton = button("기기 종료", UiIcon.POWER, WHITE, INK, this::confirmShutdown);
+        startButton = button("초기화 시작", UiIcon.REFRESH, TEAL, WHITE, () -> confirmRun(0,false,true));
+        addButtonPair(footer, shutdownButton, startButton);
     }
     void chip(LinearLayout parent,String title,int kind){TextView chip=label(title,10,TEAL,true);chip.setPadding(dp(7),dp(5),dp(7),dp(5));chip.setCompoundDrawables(UiIcon.create(this,kind,TEAL,dp(12)),null,null,null);chip.setCompoundDrawablePadding(dp(4));chip.setBackground(shape(PALE,20,0));LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(-2,-2);p.setMargins(0,0,dp(5),0);parent.addView(chip,p);}
     void progressScreen(){
@@ -184,17 +370,13 @@ public class MainActivity extends Activity {
     void doneScreen(){hero("초기화 완료",deviceName()+" · "+(demo()?19:state.completed())+" / 19단계",UiIcon.CHECK,TEAL);LinearLayout results=column();card(results,WHITE);String summary=state.prefs.getString("summary","");
         resultRow(results,"남은 계정",demo()?"삼성 계정 보존 · 비삼성 계정 0개":summary.contains("남은 비삼성 계정: 0개")?"비삼성 계정 0개 · 삼성 계정 보존":"계정 확인 결과를 상세 기록에서 확인",false);divider(results);
         resultRow(results,"언어",languageText(demo()?selected:state.locale()),false);divider(results);
-        resultRow(results,"필수 앱",demo()||!summary.contains(": 없음")?"네이버 지도 · File Manager · 갤럭시 초기화":"필수 앱 설치 결과 확인 필요",false);divider(results);
-        resultRow(results,"배경화면",ResetPipeline.series(Build.MODEL)+" 기본 배경 · 단계 처리 완료",true);body.addView(results);space(body,16);
+        resultRow(results,"필수 앱",demo()||!summary.contains(": 없음")?"네이버 지도 · File Manager · Language · LOCARORA · 갤럭시 초기화":"필수 앱 설치 결과 확인 필요",false);divider(results);
+        resultRow(results,"배경화면","우리 배경 · 단계 처리 완료",true);body.addView(results);space(body,16);
         if(summary.contains("주의:")){text(body,summary.substring(summary.indexOf("주의:")),12,AMBER,false);space(body,12);}
         action(body,"19단계 결과 상세 보기",UiIcon.INFO,WHITE,INK,()->{if(demo())preview=3;else override=3;render();});
-        LinearLayout actions=row();
         Button home=button("시작 화면으로",UiIcon.HOME,WHITE,INK,()->{goHome();render();});
-        Button shutdown=button("전원 끄기",UiIcon.POWER,INK,WHITE,this::confirmShutdown);
-        home.setTextSize(14);shutdown.setTextSize(14);
-        actions.addView(home,new LinearLayout.LayoutParams(0,dp(52),1));
-        LinearLayout.LayoutParams shutdownLayout=new LinearLayout.LayoutParams(0,dp(52),1);
-        shutdownLayout.setMargins(dp(10),0,0,0);actions.addView(shutdown,shutdownLayout);footer.addView(actions);
+        shutdownButton=button("기기 종료",UiIcon.POWER,INK,WHITE,this::confirmShutdown);
+        addButtonPair(footer, home, shutdownButton);
     }
     void resultRow(LinearLayout parent,String title,String value,boolean image){LinearLayout row=row();LinearLayout copy=column();row.addView(copy,new LinearLayout.LayoutParams(0,-2,1));text(copy,title,11,MUTED,false);space(copy,5);text(copy,value,14,INK,true);if(image)row.addView(wallpaperImage(35,64));else row.addView(icon(UiIcon.CHECK,TEAL,20));parent.addView(row);}
     void failureScreen(){int failed=0,manual=0;for(int i=0;i<19;i++){if(state.status(i).equals("실패"))failed++;if(state.status(i).equals("수동 확인"))manual++;}hero("확인이 필요해요",deviceName()+" · 실패 "+(demo()?1:failed)+" · 수동 확인 "+(demo()?1:manual),UiIcon.ALERT,AMBER);
@@ -210,6 +392,7 @@ public class MainActivity extends Activity {
     void showDialog(LinearLayout content){dismissDialog();activeDialog=new Dialog(this);ScrollView scroll=new ScrollView(this);scroll.addView(content);activeDialog.setContentView(scroll);Window window=activeDialog.getWindow();if(window!=null){window.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));window.setLayout(getResources().getDisplayMetrics().widthPixels-dp(40),-2);}activeDialog.show();if(window!=null)window.setLayout(getResources().getDisplayMetrics().widthPixels-dp(40),-2);}
     void dismissDialog(){if(activeDialog!=null){activeDialog.dismiss();activeDialog=null;}}
     void confirmRun(int from,boolean single,boolean fresh){
+        if(wallpaperBusy){Toast.makeText(this,"배경화면 적용이 끝난 뒤 초기화하세요.",Toast.LENGTH_SHORT).show();return;}
         if(WirelessStarter.INSTANCE.busy.get()){Toast.makeText(this,"연결 설정이 끝난 뒤 초기화하세요.",Toast.LENGTH_SHORT).show();return;}
         if(AppUpdater.INSTANCE.active()){Toast.makeText(this,"앱 업데이트가 끝난 뒤 초기화하세요.",Toast.LENGTH_SHORT).show();return;}
         if(!demo()&&(running()||!ShellConnection.INSTANCE.ready()))return;
@@ -225,7 +408,7 @@ public class MainActivity extends Activity {
         LinearLayout actions=row();
         Button cancel=button("취소",UiIcon.CLOSE,WHITE,INK,()->{dismissDialog();if(preview==2){preview=1;render();}});
         Button erase=button(single?"이 단계 실행":"삭제 실행",UiIcon.DELETE,RED,WHITE,()->{
-            if(!demo()&&(running()||!ShellConnection.INSTANCE.ready())){Toast.makeText(this,"Shizuku 연결 상태를 확인하세요.",Toast.LENGTH_SHORT).show();return;}
+            if(!demo()&&(wallpaperBusy||running()||!ShellConnection.INSTANCE.ready())){Toast.makeText(this,"Shizuku 연결 상태를 확인하세요.",Toast.LENGTH_SHORT).show();return;}
             dismissDialog();
             if(demo()){preview=3;render();return;}
             state.homeOnNextLaunch(false);override=-1;
@@ -236,12 +419,13 @@ public class MainActivity extends Activity {
     }
     void previewNotice(String title){new AlertDialog.Builder(this).setTitle(title+" · 미리보기").setMessage("디자인 미리보기에서는 실제 명령을 실행하지 않습니다.").setPositiveButton("확인",null).show();}
     void confirmShutdown(){
+        if(demo()){previewNotice("기기 종료");return;}
         if(WirelessStarter.INSTANCE.busy.get()){Toast.makeText(this,"연결 설정이 끝난 뒤 전원을 꺼주세요.",Toast.LENGTH_SHORT).show();return;}
         if(AppUpdater.INSTANCE.active()){Toast.makeText(this,"앱 업데이트가 끝난 뒤 전원을 꺼주세요.",Toast.LENGTH_SHORT).show();return;}
-        if(shuttingDown||running())return;
-        new AlertDialog.Builder(this).setTitle("전원을 끌까요?")
+        if(shuttingDown||running()||wallpaperBusy)return;
+        new AlertDialog.Builder(this).setTitle("기기를 종료할까요?")
             .setMessage((state.issues()?"확인할 항목이 남아있습니다.\n\n":"")+"초기화 앱의 진행·결과 기록, 완료 알림과 최근 앱 항목을 지운 뒤 전원을 끕니다. Shizuku 연결 권한은 유지됩니다.")
-            .setNegativeButton("취소",null).setPositiveButton("전원 끄기",(d,w)->shutdown()).show();
+            .setNegativeButton("취소",null).setPositiveButton("기기 종료",(d,w)->shutdown()).show();
     }
     void shutdown(){
         if(shuttingDown||running())return;shuttingDown=true;
@@ -342,7 +526,12 @@ public class MainActivity extends Activity {
         boolean active=AppUpdater.INSTANCE.active();
         if(updateStatus!=null){updateStatus.setText(AppUpdater.INSTANCE.status);updateStatus.setVisibility(AppUpdater.INSTANCE.status.isEmpty()?View.GONE:View.VISIBLE);}
         if(updateCheck!=null){updateCheck.setEnabled(!active&&!running()&&!WirelessStarter.INSTANCE.busy.get());updateCheck.setAlpha(active?0.4f:1f);}
-        if(startButton!=null)startButton.setEnabled((demo()||ShellConnection.INSTANCE.ready())&&!active&&!WirelessStarter.INSTANCE.busy.get());
+        if(startButton!=null)startButton.setEnabled((demo()||ShellConnection.INSTANCE.ready())&&!active&&!wallpaperBusy&&!shuttingDown&&!WirelessStarter.INSTANCE.busy.get());
+        if(shutdownButton!=null)shutdownButton.setEnabled(!wallpaperBusy&&!shuttingDown);
+        if(wallpaperButton!=null){
+            wallpaperButton.setEnabled(!active&&!wallpaperBusy&&!running()&&!shuttingDown);
+            wallpaperButton.setText(wallpaperBusy?"적용 중…":"적용 배경");
+        }
     }
     boolean updateVisible(){return resumed&&!isFinishing()&&!isDestroyed();}
     void updateError(String message){if(updateVisible()){renderUpdateStatus();new AlertDialog.Builder(this).setTitle("앱 업데이트").setMessage(message).setPositiveButton("확인",null).show();}}
@@ -383,6 +572,7 @@ public class MainActivity extends Activity {
     }
     @Override protected void onResume(){
         super.onResume();resumed=true;handler.post(tick);ShellConnection.INSTANCE.connect(false);
+        updateWallpaperButton();
         String result=getSharedPreferences("updates",MODE_PRIVATE).getString("install_result","");
         if(!result.isEmpty()){getSharedPreferences("updates",MODE_PRIVATE).edit().remove("install_result").apply();Toast.makeText(this,result,Toast.LENGTH_LONG).show();}
         if(awaitingInstallPermission){awaitingInstallPermission=false;if(getPackageManager().canRequestPackageInstalls())requestUpdateInstall();else{pendingUpdate=null;updateError("업데이트 설치 권한이 허용되지 않았습니다.");}}

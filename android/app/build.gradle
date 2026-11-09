@@ -1,4 +1,11 @@
 plugins { id 'com.android.application' }
+evaluationDependsOn(':language-picker')
+def languageProject = project(':language-picker')
+def languageApk = languageProject.layout.buildDirectory.file('outputs/apk/debug/language-picker-debug.apk')
+def homeApps = [
+    [package: 'com.forholiday.language', file: 'language.apk', versionCode: languageProject.android.defaultConfig.versionCode],
+    [package: 'com.locarora.app', file: 'locarora.apk', versionCode: 12]
+]
 def nmapBundle = new groovy.json.JsonSlurper().parse(rootProject.file('../nmap-bundle.json'))
 def filemanagerBundle = new groovy.json.JsonSlurper().parse(rootProject.file('../filemanager-bundle.json'))
 android {
@@ -8,10 +15,12 @@ android {
         applicationId 'com.forholiday.galaxyreset'
         minSdk 30
         targetSdk 36
-        versionCode 29
-        versionName '1.1.25'
+        versionCode 30
+        versionName '1.1.26'
         testInstrumentationRunner 'com.forholiday.galaxyreset.ProgressLayoutCheck'
         buildConfigField 'long', 'FILEMANAGER_VERSION_CODE', filemanagerBundle.versionCode.toString() + 'L'
+        buildConfigField 'long', 'LANGUAGE_VERSION_CODE', homeApps[0].versionCode.toString() + 'L'
+        buildConfigField 'long', 'LOCARORA_VERSION_CODE', homeApps[1].versionCode.toString() + 'L'
         buildConfigField 'long', 'NMAP_VERSION_CODE', nmapBundle.versionCode.toString() + 'L'
         buildConfigField 'String[]', 'NMAP_APKS', 'new String[]{' + nmapBundle.apks.collect { '"' + it.file + '"' }.join(',') + '}'
     }
@@ -24,10 +33,12 @@ android {
 }
 def resetAssets = ['locale_changer.dex', 'account_remover.dex', 'account_preparer.dex', 'esim_manager.dex',
                    'content_cleaner.dex', 'wallpaper_setter.dex', 'recent_tasks_cleaner.dex',
-                   'S23.png', 'S24.png', 'S25.png', 'S26.png', 'filemanager.apk', 'nmap-bundle.json'] + nmapBundle.apks.collect { it.file }
+                   'S23.png', 'S24.png', 'S25.png', 'S26.png', 'filemanager.apk', 'locarora.apk', 'nmap-bundle.json'] + nmapBundle.apks.collect { it.file }
 tasks.register('prepareResetAssets', Copy) {
-    from rootProject.file('..')
-    include resetAssets
+    dependsOn ':language-picker:assembleDebug'
+    inputs.property('homeApps', groovy.json.JsonOutput.toJson(homeApps))
+    from(languageApk) { rename { 'language.apk' } }
+    from(rootProject.file('..')) { include resetAssets }
     into layout.buildDirectory.dir('generated/resetAssets')
     doFirst {
         resetAssets.each { name ->
@@ -39,6 +50,9 @@ tasks.register('prepareResetAssets', Copy) {
                 }
             }
         }
+    }
+    doLast {
+        new File(destinationDir, 'home-apps.json').setText(groovy.json.JsonOutput.toJson(homeApps), 'UTF-8')
     }
 }
 tasks.named('preBuild').configure { dependsOn 'prepareResetAssets' }

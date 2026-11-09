@@ -102,7 +102,8 @@ class FakeFleet:
             return _cp(cmd, 0, 'Success\n')
         if cmd[3] == 'install':
             pkg = {'nmap.apk': 'com.nhn.android.nmap', 'filemanager.apk': 'com.alphainventor.filemanager',
-                   'galaxy-reset.apk': 'com.forholiday.galaxyreset', 'shizuku.apk': 'moe.shizuku.privileged.api'}.get(cmd[-1].replace('\\', '/').rsplit('/', 1)[-1])
+                   **{filename: pkg for pkg, filename in {**V6.PHONE_APK_FILES, **V6.HOME_APK_FILES}.items()}
+                   }.get(cmd[-1].replace('\\', '/').rsplit('/', 1)[-1])
             if pkg:
                 self.installed[serial].add(pkg)
             return _cp(cmd, 0, 'Success\n')
@@ -112,7 +113,12 @@ class FakeFleet:
             return _cp(cmd, 0, 'Status: ok\n')
         if 'dumpsys' in cmd and 'package' in cmd:
             version = V6.load_nmap_bundle()['versionCode'] if cmd[-1] == V6.NMAP_PACKAGE else V6.load_filemanager_bundle()['versionCode'] if cmd[-1] == V6.FILEMANAGER_PACKAGE else V6.load_phone_bundle()[cmd[-1]]['versionCode']
-            return _cp(cmd, 0, 'versionCode=%s minSdk=30\n' % version)
+            permission = 'android.permission.CHANGE_CONFIGURATION: granted=true\n' if cmd[-1] == V6.LANGUAGE_PACKAGE else ''
+            return _cp(cmd, 0, 'versionCode=%s minSdk=30\n' % version + permission)
+        if cmd[3:7] == ['shell', 'cmd', 'appops', 'get']:
+            return _cp(cmd, 0, 'WRITE_SETTINGS: allow\n')
+        if 'LanguageHomePlacement' in cmd[-1]:
+            return _cp(cmd, 0, 'SUCCESS:MAIN_HOME_LAYOUT\n')
         if 'find' in cmd:
             return _cp(cmd, 0, '')
         if 'settings' in cmd and 'screen_off_timeout' in cmd and 'get' in cmd:

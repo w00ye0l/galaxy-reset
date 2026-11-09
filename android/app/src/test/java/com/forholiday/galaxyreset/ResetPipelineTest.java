@@ -246,6 +246,10 @@ public class ResetPipelineTest {
         final Set<String> disabledPackages=new HashSet<>();
         EssentialFake(){version=BuildConfig.NMAP_VERSION_CODE;}
         @Override public ResetPipeline.Result run(String command,int seconds) {
+            if (command.startsWith("dumpsys package " + ResetPipeline.LANGUAGE))
+                return new ResetPipeline.Result(0, "android.permission.CHANGE_CONFIGURATION: granted=true");
+            if (command.startsWith("cmd appops get --user 0 " + ResetPipeline.LANGUAGE))
+                return new ResetPipeline.Result(0, "WRITE_SETTINGS: allow");
             if(command.startsWith("pm list packages")) {
                 commands.add(command);
                 String pkg=command.substring(command.lastIndexOf(' ')+1).replace("'", "");
@@ -311,6 +315,7 @@ public class ResetPipelineTest {
         pipeline.step(2,"ja-JP","SM-S918N");
         assertFalse(fake.commands.stream().anyMatch(c -> c.contains("com.alphainventor.filemanager")));
         assertTrue(fake.commands.stream().anyMatch(c -> c.startsWith("pm clear") && c.contains("com.nhn.android.nmap")));
+        assertTrue(fake.commands.stream().anyMatch(c -> c.startsWith("pm clear") && c.contains(ResetPipeline.LOCARORA)));
         assertTrue(pipeline.warnings.isEmpty());
     }
     @Test public void dataClearContinuesAfterOneFailureAndCachesOnlySuccesses() throws Exception {
@@ -336,6 +341,8 @@ public class ResetPipelineTest {
             if(cmd.equals("pm list packages --user 0 -3"))return new ResetPipeline.Result(0,remainingApp?"package:customer.app\n":"");
             if(cmd.startsWith("pm list packages"))return new ResetPipeline.Result(0,"package:"+cmd.substring(cmd.lastIndexOf(' ')+1).replace("'", "")+(cmd.contains(" --show-versioncode")?" versionCode:999999999":"")+"\n");
             if(cmd.startsWith("dumpsys wallpaper"))return new ResetPipeline.Result(0,"mName=WallpaperSetter");
+            if(cmd.startsWith("dumpsys package " + ResetPipeline.LANGUAGE))return new ResetPipeline.Result(0,"android.permission.CHANGE_CONFIGURATION: granted=true");
+            if(cmd.startsWith("cmd appops get --user 0 " + ResetPipeline.LANGUAGE))return new ResetPipeline.Result(0,"WRITE_SETTINGS: allow");
             return new ResetPipeline.Result(0,"ko-KR");
         }
     }
@@ -350,6 +357,75 @@ public class ResetPipelineTest {
         ResetPipeline p=new ResetPipeline(fake,x->{},Set.of());p.step(17,"ko-KR","SM-S938N");
         assertEquals(-1,p.finalAccountCount);assertFalse(p.warnings.isEmpty());
         assertFalse(p.summaryText.contains("남은 비삼성 계정: 0개"));
+    }
+
+    @Test public void languageInstallProvisionsPermissionsAndDoesNotReinstallCurrentVersion() throws Exception {
+        FinalFake fake = new FinalFake() {
+            boolean installed;
+            @Override public ResetPipeline.Result run(String command, int seconds) {
+                if (command.startsWith("pm install -r --user 0 ") && command.contains("language.apk")) {
+                    commands.add(command);
+                    installed = true;
+                    return new ResetPipeline.Result(0, "Success");
+                }
+                if (!installed && command.startsWith("pm list packages") && command.contains(ResetPipeline.LANGUAGE)) {
+                    commands.add(command);
+                    return new ResetPipeline.Result(0, "");
+                }
+                return super.run(command, seconds);
+            }
+        };
+        ResetPipeline pipeline = new ResetPipeline(fake, p -> {}, Set.of());
+        pipeline.prepareLanguageApp();
+        pipeline.prepareLanguageApp();
+        assertEquals(1, fake.commands.stream().filter(c -> c.startsWith("pm install -r")).count());
+        assertTrue(fake.commands.contains("pm grant --user 0 " + ResetPipeline.LANGUAGE + " android.permission.CHANGE_CONFIGURATION"));
+        assertTrue(fake.commands.contains("cmd appops set --user 0 " + ResetPipeline.LANGUAGE + " WRITE_SETTINGS allow"));
+        assertTrue(ResetPipeline.KEEP.contains(ResetPipeline.LANGUAGE));
+    }
+
+    @Test public void locaroraUpdatesOldVersionAndKeepsCurrentVersion() throws Exception {
+        FinalFake fake = new FinalFake() {
+            long version = BuildConfig.LOCARORA_VERSION_CODE - 1;
+            @Override public ResetPipeline.Result run(String command, int seconds) {
+                if (command.startsWith("pm install -r --user 0 ") && command.contains("locarora.apk")) {
+                    commands.add(command);
+                    version = BuildConfig.LOCARORA_VERSION_CODE;
+                    return new ResetPipeline.Result(0, "Success");
+                }
+                if (command.startsWith("pm list packages --show-versioncode") && command.contains(ResetPipeline.LOCARORA)) {
+                    commands.add(command);
+                    return new ResetPipeline.Result(0, "package:" + ResetPipeline.LOCARORA + " versionCode:" + version);
+                }
+                return super.run(command, seconds);
+            }
+        };
+        ResetPipeline pipeline = new ResetPipeline(fake, p -> {}, Set.of());
+        pipeline.prepareLocaroraApp();
+        pipeline.prepareLocaroraApp();
+        assertEquals(1, fake.commands.stream().filter(c -> c.startsWith("pm install -r")).count());
+        assertTrue(ResetPipeline.KEEP.contains(ResetPipeline.LOCARORA));
+    }
+
+    @Test public void failedHomePlacementIsReportedAfterRecentTaskCleanup() throws Exception {
+        FinalFake fake = new FinalFake() {
+            @Override public ResetPipeline.Result run(String command, int seconds) {
+                if (command.contains("RecentTasksCleaner") || command.contains("LanguageHomePlacement")
+                        || command.startsWith("pm path")) {
+                    commands.add(command);
+                    if (command.contains("RecentTasksCleaner")) return new ResetPipeline.Result(0, "SUCCESS:RECENTS");
+                    if (command.startsWith("pm path")) return new ResetPipeline.Result(0, "package:/data/app/test/base.apk");
+                    return new ResetPipeline.Result(1, "FAIL:목표 칸이 사용 중입니다.");
+                }
+                return super.run(command, seconds);
+            }
+        };
+        ResetPipeline pipeline = new ResetPipeline(fake, p -> {}, Set.of());
+        pipeline.step(18, "ja-JP", "SM-S918N");
+        assertTrue(fake.commands.get(0).contains("RecentTasksCleaner"));
+        assertTrue(fake.commands.get(fake.commands.size() - 1).contains("LanguageHomePlacement"));
+        assertTrue(pipeline.manual);
+        assertTrue(pipeline.warnings.stream().anyMatch(warning -> warning.contains("목표 칸")));
     }
 
 }

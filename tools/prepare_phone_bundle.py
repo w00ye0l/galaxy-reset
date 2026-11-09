@@ -10,6 +10,7 @@ import re
 import shutil
 import urllib.request
 import zipfile
+from io import BytesIO
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -31,6 +32,22 @@ def validate_apk(path):
     with zipfile.ZipFile(path) as archive:
         if not {'AndroidManifest.xml', 'classes.dex'} <= set(archive.namelist()):
             raise ValueError('Invalid APK: %s (run git lfs pull if this is a pointer)' % path)
+
+
+def check_home_apps(archive):
+    expected = {'com.forholiday.language': 'language.apk', 'com.locarora.app': 'locarora.apk'}
+    apps = json.loads(archive.read('assets/home-apps.json'))
+    if len(apps) != len(expected) or {app['package']: app['file'] for app in apps} != expected:
+        raise ValueError('Incorrect home app list in the Android APK')
+    for app in apps:
+        if type(app['versionCode']) is not int or app['versionCode'] < 1:
+            raise ValueError('Invalid embedded home app version')
+        payload = archive.read('assets/' + app['file'])
+        with zipfile.ZipFile(BytesIO(payload)) as embedded:
+            if not {'AndroidManifest.xml', 'classes.dex'} <= set(embedded.namelist()):
+                raise ValueError('Invalid embedded home APK: ' + app['file'])
+        if app['file'] == 'locarora.apk' and hashlib.sha256(payload).hexdigest() != sha256(ROOT / app['file']):
+            raise ValueError('Android APK contains a stale LOCARORA APK; rebuild Android and refresh phone-app')
 
 
 def check():
@@ -57,6 +74,7 @@ def check():
     if reset['versionCode'] != version:
         raise ValueError('Rebuild Android and rerun tools/prepare_phone_bundle.py before building the EXE')
     with zipfile.ZipFile(DEST / reset['file']) as archive:
+        check_home_apps(archive)
         if hashlib.sha256(archive.read('assets/filemanager.apk')).hexdigest() != filemanager['sha256']:
             raise ValueError('Android APK contains an old File Manager APK; rebuild Android and refresh phone-app')
         embedded_nmap = json.loads(archive.read('assets/nmap-bundle.json'))

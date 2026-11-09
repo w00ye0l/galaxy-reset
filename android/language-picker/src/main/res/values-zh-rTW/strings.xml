@@ -1,0 +1,8 @@
+<resources>
+    <string name="choose_language">請選擇手機語言</string>
+    <string name="current_language">目前語言</string>
+    <string name="available_languages">可選語言</string>
+    <string name="apply_language">變更語言</string>
+    <string name="change_failed">無法變更語言，請聯絡租借服務人員。</string>
+    <string name="setup_needed">請聯絡租借服務人員開啟此手機的語言變更功能。</string>
+</resources>

@@ -1,0 +1,10 @@
+<resources>
+    <string name="app_name" translatable="false">Language</string>
+    <string name="language_option" translatable="false">%1$s  %2$s</string>
+    <string name="choose_language">Choose your phone’s language</string>
+    <string name="current_language">Current language</string>
+    <string name="available_languages">Available languages</string>
+    <string name="apply_language">Apply language</string>
+    <string name="change_failed">Couldn’t change the language. Please ask the rental staff for help.</string>
+    <string name="setup_needed">Please ask the rental staff to enable language changes on this phone.</string>
+</resources>

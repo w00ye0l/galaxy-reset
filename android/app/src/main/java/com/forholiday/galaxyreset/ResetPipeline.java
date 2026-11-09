@@ -9,10 +9,12 @@ final class ResetPipeline {
     static final String SELF = "com.forholiday.galaxyreset";
     static final String KNOX_CONFIGURE = "com.sec.knox.kccagent";
     static final String SHIZUKU = "moe.shizuku.privileged.api";
+    static final String LANGUAGE = "com.forholiday.language";
+    static final String LOCARORA = "com.locarora.app";
     static final String TMP = "/data/local/tmp/galaxy-reset/";
     static final String LAUNCHER = "com.sec.android.app.launcher/.activities.LauncherActivity";
     static final String[] LABELS = {"사용자 설치 앱 삭제", "계정 삭제", "유지 앱 데이터 초기화", "e-SIM 프로필 삭제", "내부 저장소 초기화", "로그·캐시 정리", "갤러리 휴지통 정리", "미디어 스토어 갱신", "썸네일 잔여물 제거", "언어 설정", "카메라 설정 초기화", "내비게이션 바 초기화", "글자 크기 초기화", "필수 앱 설치·버전 확인", "홈 독 앱 배치", "런처 초기화", "배경화면 적용", "최종 검증", "최근 앱 목록 제거"};
-    static final Set<String> KEEP = Set.of(SELF, SHIZUKU, KNOX_CONFIGURE, "com.sec.android.app.popupcalculator", "com.nhn.android.nmap", "com.alphainventor.filemanager", "com.sec.android.app.sbrowser");
+    static final Set<String> KEEP = Set.of(SELF, SHIZUKU, LANGUAGE, LOCARORA, KNOX_CONFIGURE, "com.sec.android.app.popupcalculator", "com.nhn.android.nmap", "com.alphainventor.filemanager", "com.sec.android.app.sbrowser");
     static final String[] LIVE = {"com.samsung.android.wallpaper.live", "com.samsung.android.dynamiclock", "com.samsung.android.app.dressroom"};
     static final String[] FOLDERS = {"DCIM", "Pictures", "Music", "Movies", "Download"};
     static final String[] LOCALES = {"ja-JP", "en-US", "ko-KR", "zh-CN", "zh-TW"};
@@ -286,7 +288,7 @@ final class ResetPipeline {
                 notes.add("파일 관리자 SMB 연결·앱 설정 보존 · 데이터 삭제 제외");
                 clear("com.google.android.googlequicksearchbox", "com.android.chrome", "com.google.android.youtube", "com.google.android.gm",
                 "com.google.android.apps.maps", "com.google.android.apps.docs", "com.google.android.calendar", "com.google.android.apps.photos", "com.sec.android.app.sbrowser", "com.nhn.android.nmap",
-                "com.sec.android.app.popupcalculator", "com.google.android.apps.tachyon");
+                "com.sec.android.app.popupcalculator", "com.google.android.apps.tachyon", LOCARORA);
             }
             case 0 -> {
                 Result r = required("pm list packages --user 0 -3");
@@ -371,14 +373,84 @@ final class ResetPipeline {
             case 13 -> {
                 attempt("네이버 지도 준비 실패", this::prepareNmap);
                 attempt("파일 관리자 설치·버전 확인 실패", this::prepareFileManager);
+                attempt("언어 앱 설치·권한 설정 실패", this::prepareLanguageApp);
+                attempt("LOCARORA 설치·버전 확인 실패", this::prepareLocaroraApp);
                 attempt("초기화 앱 설정 권한 확인 실패", () -> commands("pm grant --user 0 " + SELF + " android.permission.WRITE_SECURE_SETTINGS"));
                 for (String pkg : List.of(SELF, SHIZUKU)) attempt("실행 기반 앱 확인 실패: " + pkg, () -> {
                     if (!installed(pkg)) throw new IOException("필수 앱 없음");
                     ensureEnabled(pkg);
                 });
             }
-            case 18 -> success(dex("recent_tasks_cleaner.dex", "RecentTasksCleaner"), "SUCCESS", "최근 앱 삭제 확인 필요");
+            case 18 -> {
+                success(dex("recent_tasks_cleaner.dex", "RecentTasksCleaner"), "SUCCESS", "최근 앱 삭제 확인 필요");
+                placeHomeIcons();
+            }
             default -> throw new IllegalArgumentException("잘못된 단계");
+        }
+    }
+    void prepareLanguageApp() throws Exception {
+        prepareBundledApp(LANGUAGE, "language.apk", BuildConfig.LANGUAGE_VERSION_CODE);
+        required("pm grant --user 0 " + LANGUAGE + " android.permission.CHANGE_CONFIGURATION");
+        required("cmd appops set --user 0 " + LANGUAGE + " WRITE_SETTINGS allow");
+        verifyLanguagePermission();
+        notes.add("Language 설치·언어 변경 권한 확인 완료");
+    }
+
+    void prepareLocaroraApp() throws Exception {
+        prepareBundledApp(LOCARORA, "locarora.apk", BuildConfig.LOCARORA_VERSION_CODE);
+        notes.add("LOCARORA 설치·버전·활성 상태 확인 완료");
+    }
+
+    private void prepareBundledApp(String pkg, String asset, long minimumVersion) throws Exception {
+        if (!installed(pkg) || packageVersion(pkg) < minimumVersion) {
+            String path = TMP + asset;
+            try {
+                bridge.copy(asset, path);
+                Result result = raw("pm install -r --user 0 " + quote(path), 120);
+                if (result.truncated || (!result.output.contains("INSTALL_FAILED_VERSION_DOWNGRADE")
+                        && (result.code != 0 || !result.output.trim().equals("Success")))) {
+                    String reason = result.output.strip();
+                    throw new IOException(reason.isEmpty() ? "앱 설치 결과 확인 필요" : reason.substring(0, Math.min(160, reason.length())));
+                }
+            } finally {
+                try { raw("rm -f " + quote(path), 15); } catch (Exception ignored) {}
+            }
+        }
+        if (!installed(pkg) || packageVersion(pkg) < minimumVersion) throw new IOException("앱 설치·버전 확인 필요: " + pkg);
+        ensureEnabled(pkg);
+    }
+
+    private void verifyLanguagePermission() throws Exception {
+        String permission = required("dumpsys package " + LANGUAGE
+            + " | grep -F 'android.permission.CHANGE_CONFIGURATION: granted=true'").output;
+        String appOp = required("cmd appops get --user 0 " + LANGUAGE + " WRITE_SETTINGS").output;
+        if (!permission.contains("granted=true") || !appOp.contains("WRITE_SETTINGS: allow"))
+            throw new IOException("언어 변경 권한 확인 필요");
+    }
+
+    private void placeHomeIcons() throws Exception {
+        try {
+            if (!installed(LANGUAGE)) throw new IOException("Language 설치 후 다시 시도하세요.");
+            if (!installed(LOCARORA)) throw new IOException("LOCARORA 설치 후 다시 시도하세요.");
+            String apk = Arrays.stream(required("pm path --user 0 " + SELF).output.split("\\R"))
+                .filter(line -> line.startsWith("package:/data/app/") && line.endsWith("/base.apk"))
+                .map(line -> line.substring("package:".length())).findFirst()
+                .orElseThrow(() -> new IOException("배치 도구 경로 확인 필요"));
+            Result result = raw("CLASSPATH=" + quote(apk)
+                + " app_process /system/bin com.forholiday.galaxyreset.LanguageHomePlacement", 180);
+            List<String> output = Arrays.asList(result.output.split("\\R"));
+            if (result.code != 0 || result.truncated || result.output.contains("FAIL:")
+                    || !output.contains("SUCCESS:MAIN_HOME_LAYOUT")) {
+                String reason = output.stream().filter(line -> line.startsWith("FAIL:"))
+                    .map(line -> line.substring(5)).findFirst().orElse("삼성 런처 상태와 홈 화면 잠금 여부를 확인하세요.");
+                throw new IOException(reason);
+            }
+            notes.add("메인 홈 맨 아래 줄 확인 · 갤러리 / Play 스토어 / LOCARORA / Language");
+        } catch (ConnectionLost e) {
+            throw e;
+        } catch (Exception e) {
+            manual = true;
+            warnings.add("앱 홈 화면 배치 확인 필요 · " + e.getMessage());
         }
     }
     void clearAccountSessions() throws Exception {
@@ -429,10 +501,16 @@ final class ResetPipeline {
             if (!finalUserAppsClear) throw new IOException("삭제 대상 앱 잔존: " + String.join(", ", remaining));
         });
         attempt("최종 언어 조회 실패", () -> result.append("실제 언어 목록: ").append(required("settings get system system_locales").output.trim()).append('\n'));
-        for (String pkg : List.of("com.nhn.android.nmap", "com.alphainventor.filemanager", SELF, SHIZUKU)) {
+        for (String pkg : List.of("com.nhn.android.nmap", "com.alphainventor.filemanager", SELF, SHIZUKU, LOCARORA)) {
             attempt("필수 앱 최종 확인 실패: " + pkg, () -> {
                 if (!installed(pkg)) { result.append(pkg).append(": 없음\n"); throw new IOException("필수 앱 없음"); }
-                long minimum = pkg.equals("com.nhn.android.nmap") ? BuildConfig.NMAP_VERSION_CODE : pkg.equals("com.alphainventor.filemanager") ? BuildConfig.FILEMANAGER_VERSION_CODE : pkg.equals(SELF) ? BuildConfig.VERSION_CODE : 1086;
+                long minimum = switch (pkg) {
+                    case "com.nhn.android.nmap" -> BuildConfig.NMAP_VERSION_CODE;
+                    case "com.alphainventor.filemanager" -> BuildConfig.FILEMANAGER_VERSION_CODE;
+                    case SELF -> BuildConfig.VERSION_CODE;
+                    case LOCARORA -> BuildConfig.LOCARORA_VERSION_CODE;
+                    default -> 1086;
+                };
                 if (packageVersion(pkg) < minimum) throw new IOException("필수 앱 버전 부족");
                 result.append(pkg).append(": 설치됨\n");
                 if (!pkg.equals("com.alphainventor.filemanager")) {
@@ -441,6 +519,12 @@ final class ResetPipeline {
                 }
             });
         }
+        attempt("언어 앱 최종 확인 실패", () -> {
+            if (!installed(LANGUAGE) || packageVersion(LANGUAGE) < BuildConfig.LANGUAGE_VERSION_CODE)
+                throw new IOException("Language 설치·버전 확인 필요");
+            verifyLanguagePermission();
+            result.append(LANGUAGE).append(": 설치됨\n");
+        });
         attempt("최종 배경 확인 실패", () -> {
             boolean live = liveOverride(required("dumpsys wallpaper").output);
             result.append("배경: ").append(series(model)).append(live ? " · 라이브 배경 확인 필요" : " · 라이브 오버레이 미탐지 (이미지는 화면 확인)");
