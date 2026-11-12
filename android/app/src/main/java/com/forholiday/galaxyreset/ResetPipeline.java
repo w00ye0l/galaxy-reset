@@ -172,6 +172,24 @@ final class ResetPipeline {
     static List<String> accountTypes(String dump) {
         return AccountPreparationPolicy.accountList(dump);
     }
+    // Keep account validation below the Binder output cap and omit account names.
+    static final String ACCOUNT_QUERY = "set -o pipefail; dumpsys account | awk '"
+        + "BEGIN { owner = 1 } "
+        + "/^[[:space:]]*Account event dump:/ { events = 1 } events { next } "
+        + "/^[[:space:]]*(Permission Denial|SecurityException|DUMP TIMEOUT|Error:)/ { exit 1 } "
+        + "/^[[:space:]]*User UserInfo\\{[0-9]+:/ { "
+        + "users = 1; owner = ($0 ~ /^[[:space:]]*User UserInfo\\{0:/); "
+        + "if (owner) { found = 1; print \"User UserInfo{0:\" } next } "
+        + "owner && /^[[:space:]]*Accounts:[[:space:]]*[0-9]+[[:space:]]*$/ { print; next } "
+        + "owner && /^[[:space:]]*Account \\{/ { "
+        + "if (!match($0, /,[[:space:]]*type=[A-Za-z0-9_.-]+[[:space:]]*\\}[[:space:]]*$/)) exit 1; "
+        + "print \"Account {name=redacted\" substr($0, RSTART) } "
+        + "END { if (users && !found) exit 1 }'";
+    String accountInventory() throws Exception {
+        try { return required(ACCOUNT_QUERY).output; }
+        catch (ConnectionLost e) { throw e; }
+        catch (IOException e) { throw new IOException("조회 실패: dumpsys account", e); }
+    }
     static final String WIDGET_QUERY = "dump=$(dumpsys appwidget) || exit $?; printf '%s\\n' \"$dump\" | sed -n '/^[[:space:]]*Widgets:/,/^[[:space:]]*Hosts:/p'";
     Set<String> queryWidgetProviders() throws Exception {
         Result result = required(WIDGET_QUERY);
@@ -247,7 +265,7 @@ final class ResetPipeline {
         switch (index) {
             case 9 -> success(dex("locale_changer.dex", "LocaleChanger", locales(locale).toArray(new String[0])), "SUCCESS", "언어 변경 확인 필요");
             case 1 -> {
-                String before = required("dumpsys account").output;
+                String before = accountInventory();
                 if (nonSamsungAccounts(before) == 0) { clearAccountSessions(); notes.add("비삼성 계정 없음 · 제거 생략"); break; }
                 if (nonSamsungAccounts(before)>0) {
                     attempt("계정 인증 서비스 준비 실패 · 제거 계속", () -> {
@@ -260,7 +278,7 @@ final class ResetPipeline {
                 try { dex("account_remover.dex", "AccountRemover"); }
                 catch (ConnectionLost e) { throw e; }
                 catch (Exception ignored) { notes.add("백그라운드 계정 제거 재확인"); }
-                if (naverAccounts(required("dumpsys account").output) > 0) {
+                if (naverAccounts(accountInventory()) > 0) {
                     try {
                         new NaverAccountCleanup(this).remove();
                         notes.add("네이버 계정·인증 정보 기기에서 제거 확인 · 계정 탈퇴 아님");
@@ -268,7 +286,7 @@ final class ResetPipeline {
                     catch (Exception e) { warnings.add("네이버 계정 제거 확인 필요 · 화면을 켜고 잠금 해제 후 재시도하세요."); }
                 }
                 clearAccountSessions();
-                int remaining = nonSamsungAccounts(required("dumpsys account").output);
+                int remaining = nonSamsungAccounts(accountInventory());
                 if (remaining == 0) {
                     // The final inventory, including NAVER, proves successful fallback removal.
                     warnings.clear(); notes.add("비삼성 계정 0개 확인 · 삼성 계정 보존");
@@ -485,7 +503,7 @@ final class ResetPipeline {
         finalAccountCount = -1; finalUserAppsClear = false;
         StringBuilder result = new StringBuilder();
         attempt("최종 계정 조회 실패", () -> {
-            finalAccountCount = nonSamsungAccounts(required("dumpsys account").output);
+            finalAccountCount = nonSamsungAccounts(accountInventory());
             result.append("남은 비삼성 계정: ").append(finalAccountCount).append("개\n");
             if (finalAccountCount > 0) throw new IOException("비삼성 계정 " + finalAccountCount + "개 남음");
         });

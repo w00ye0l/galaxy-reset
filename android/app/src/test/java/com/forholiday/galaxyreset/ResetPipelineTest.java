@@ -337,7 +337,7 @@ public class ResetPipelineTest {
         boolean remainingAccount, remainingApp, brokenAccounts;
         @Override public ResetPipeline.Result run(String cmd,int seconds) {
             commands.add(cmd);
-            if(cmd.equals("dumpsys account"))return new ResetPipeline.Result(0,brokenAccounts?"Permission denied":remainingAccount?"Accounts: 1\nAccount {name=redacted, type=com.google}\n":"Accounts: 0\n");
+            if(cmd.equals(ResetPipeline.ACCOUNT_QUERY))return new ResetPipeline.Result(0,brokenAccounts?"Permission denied":remainingAccount?"Accounts: 1\nAccount {name=redacted, type=com.google}\n":"Accounts: 0\n");
             if(cmd.equals("pm list packages --user 0 -3"))return new ResetPipeline.Result(0,remainingApp?"package:customer.app\n":"");
             if(cmd.startsWith("pm list packages"))return new ResetPipeline.Result(0,"package:"+cmd.substring(cmd.lastIndexOf(' ')+1).replace("'", "")+(cmd.contains(" --show-versioncode")?" versionCode:999999999":"")+"\n");
             if(cmd.startsWith("dumpsys wallpaper"))return new ResetPipeline.Result(0,"mName=WallpaperSetter");

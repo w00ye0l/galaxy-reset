@@ -80,7 +80,7 @@ final class NaverAccountCleanup {
         run("input tap " + point[0] + " " + point[1], 10);
         pipeline.pause(350);
     }
-    int remaining() throws Exception { return ResetPipeline.naverAccounts(pipeline.required("dumpsys account").output()); }
+    int remaining() throws Exception { return ResetPipeline.naverAccounts(pipeline.accountInventory()); }
     void remove() throws Exception {
         int count = remaining();
         if (count == 0) return;

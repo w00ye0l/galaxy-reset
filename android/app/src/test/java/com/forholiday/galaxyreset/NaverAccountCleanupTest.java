@@ -24,7 +24,7 @@ public class NaverAccountCleanupTest {
         boolean session = true, clearFailure;
         @Override public ResetPipeline.Result run(String cmd, int seconds) {
             commands.add(cmd);
-            if (cmd.equals("dumpsys account")) return new ResetPipeline.Result(0,
+            if (cmd.equals(ResetPipeline.ACCOUNT_QUERY)) return new ResetPipeline.Result(0,
                 "Accounts: " + (1 + naver + (google ? 1 : 0)) + "\nAccount {name=redacted, type=com.osp.app.signin}\n"
                 + "Account {name=redacted, type=com.nhn.android.naveraccount}\n".repeat(naver)
                 + (google ? "Account {name=redacted, type=com.google}\n" : ""));
@@ -72,7 +72,7 @@ public class NaverAccountCleanupTest {
     @Test public void zeroNaverDoesNotOpenSettings() throws Exception {
         Fake fake = new Fake(); fake.naver = 0;
         new NaverAccountCleanup(pipeline(fake)).remove();
-        assertEquals(List.of("dumpsys account"), fake.commands);
+        assertEquals(List.of(ResetPipeline.ACCOUNT_QUERY), fake.commands);
     }
     @Test public void zeroSystemAccountsStillClearsMapSession() throws Exception {
         Fake fake = new Fake(); fake.naver = 0;
@@ -91,7 +91,7 @@ public class NaverAccountCleanupTest {
         boolean enabled, meetSession = true, failEnable, failClear;
         MeetFake() { naver = 0; }
         @Override public ResetPipeline.Result run(String cmd, int seconds) {
-            if (cmd.equals("dumpsys account")) {
+            if (cmd.equals(ResetPipeline.ACCOUNT_QUERY)) {
                 commands.add(cmd);
                 return new ResetPipeline.Result(0, "Accounts: " + (1 + meet)
                     + "\nAccount {name=redacted, type=com.osp.app.signin}\n"
