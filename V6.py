@@ -1232,7 +1232,9 @@ def run_home_tool(serial, expected, argument=''):
     lines = (result.stdout or '').splitlines()
     failure = next((line[5:] for line in lines if line.startswith('FAIL:')), None)
     if result.returncode != 0 or failure is not None or expected not in lines:
-        raise RuntimeError('삼성 홈 확인 필요 · ' + (failure or '런처 상태를 확인하세요.'))
+        if argument == '--clear-search-bar':
+            raise RuntimeError('삼성 홈 검색 바 설정 확인 필요 · ' + (failure or '런처 상태를 확인하세요.'))
+        raise RuntimeError('홈 배치 확인 필요 · ' + (failure or '메인 홈의 앱 4개 배치를 확인하세요.'))
 
 
 def finish_home_setup(serial):
