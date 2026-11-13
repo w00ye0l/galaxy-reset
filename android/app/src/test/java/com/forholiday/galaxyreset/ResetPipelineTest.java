@@ -205,6 +205,8 @@ public class ResetPipelineTest {
                     return new ResetPipeline.Result(0, "package:com.sec.android.app.launcher\n");
                 if (command.startsWith("am start -W"))
                     return new ResetPipeline.Result(0, ++starts == 1 ? "Status: ok" : "Status: timeout");
+                if (command.startsWith("pm path")) return new ResetPipeline.Result(0, "package:/data/app/test/base.apk");
+                if (command.endsWith("--clear-search-bar")) return new ResetPipeline.Result(0, "SUCCESS:HOME_SEARCH_CHECKED");
                 if (command.equals(ResetPipeline.WIDGET_QUERY))
                     return new ResetPipeline.Result(0, "Widgets:\n provider=ProviderId{cmp:ComponentInfo{com.widget/.Widget}}\nHosts:\n");
                 return new ResetPipeline.Result(0, "Success");

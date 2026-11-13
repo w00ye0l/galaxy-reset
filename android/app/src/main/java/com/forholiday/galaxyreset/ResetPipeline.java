@@ -354,14 +354,18 @@ final class ResetPipeline {
             throw new IOException("삼성 런처 시작 확인 필요");
     }
     private Set<String> awaitWidgets(boolean removing) throws Exception {
-        long deadline = System.nanoTime() + (removing ? 12_000_000_000L : 4_000_000_000L);
+        long started = System.nanoTime();
+        long deadline = started + (removing ? 12_000_000_000L : 4_000_000_000L);
         Set<String> previous = null;
         long stableSince = 0;
         while (true) {
             Set<String> current = queryWidgetProviders();
             long now = System.nanoTime();
             if (!current.equals(previous)) stableSince = now;
-            if (current.isEmpty() == removing && now - stableSince >= 1_000_000_000L) return current;
+            // A disabled provider disappears from dumpsys before Samsung Home has
+            // removed its saved widget slot. Keep providers disabled during that cleanup.
+            if (current.isEmpty() == removing && now - stableSince >= 1_000_000_000L
+                    && (!removing || now - started >= 8_000_000_000L)) return current;
             if (now >= deadline) {
                 // An empty list just after launch can precede delayed default widget registration.
                 if (!removing) return current;
@@ -373,19 +377,47 @@ final class ResetPipeline {
     }
     private void resetLauncher() throws Exception {
         clear("com.sec.android.app.launcher");
+        if (!cleared.contains("com.sec.android.app.launcher"))
+            throw new IOException("삼성 런처 데이터 초기화 확인 필요");
         startLauncher();
+        clearLauncherSearchBar();
         Set<String> providers = awaitWidgets(false);
         if (providers.isEmpty()) return;
-        try {
-            disableTemporarily(providers);
-            required("am force-stop com.sec.android.app.launcher", 15);
-            startLauncher();
-            required("input keyevent KEYCODE_HOME", 10);
-            awaitWidgets(true);
-        } finally {
-            restorePending();
+        for (int attempt = 0; attempt < 2; attempt++) {
+            try {
+                disableTemporarily(providers);
+                if (attempt == 1) {
+                    // Rebuild the default layout while the rebound widget is unavailable.
+                    cleared.remove("com.sec.android.app.launcher");
+                    clear("com.sec.android.app.launcher");
+                    if (!cleared.contains("com.sec.android.app.launcher"))
+                        throw new IOException("삼성 런처 데이터 재초기화 확인 필요");
+                } else {
+                    required("am force-stop com.sec.android.app.launcher", 15);
+                }
+                startLauncher();
+                required("input keyevent KEYCODE_HOME", 10);
+                awaitWidgets(true);
+            } finally {
+                restorePending();
+            }
+            if (attempt == 1) clearLauncherSearchBar();
+            providers = queryWidgetProviders();
+            if (providers.isEmpty()) return;
         }
-        if (!queryWidgetProviders().isEmpty()) throw new IOException("위젯 앱 복구 후 홈 위젯이 남아 있습니다.");
+        throw new IOException("위젯 앱 복구 후 홈 위젯이 남아 있습니다.");
+    }
+    private void clearLauncherSearchBar() throws Exception {
+        String failure = "삼성 홈 검색 바 설정 확인 필요";
+        for (int attempt = 0; attempt < 2; attempt++) {
+            Result result = runHomeTool(" --clear-search-bar", 30);
+            List<String> lines = Arrays.asList(result.output.split("\\R"));
+            if (result.code == 0 && !result.truncated && lines.contains("SUCCESS:HOME_SEARCH_CHECKED")) return;
+            failure = lines.stream().filter(line -> line.startsWith("FAIL:"))
+                .map(line -> line.substring(5)).findFirst().orElse(failure);
+            if (attempt == 0) pause(500);
+        }
+        throw new IOException(failure);
     }
     void disableTemporarily(Collection<String> packages) throws Exception {
         for (String pkg : packages) {
@@ -610,12 +642,7 @@ final class ResetPipeline {
         try {
             if (!installed(LANGUAGE)) throw new IOException("Language 설치 후 다시 시도하세요.");
             if (!installed(LOCARORA)) throw new IOException("LOCARORA 설치 후 다시 시도하세요.");
-            String apk = Arrays.stream(required("pm path --user 0 " + SELF).output.split("\\R"))
-                .filter(line -> line.startsWith("package:/data/app/") && line.endsWith("/base.apk"))
-                .map(line -> line.substring("package:".length())).findFirst()
-                .orElseThrow(() -> new IOException("배치 도구 경로 확인 필요"));
-            Result result = raw("CLASSPATH=" + quote(apk)
-                + " app_process /system/bin com.forholiday.galaxyreset.LanguageHomePlacement", 180);
+            Result result = runHomeTool("", 180);
             List<String> output = Arrays.asList(result.output.split("\\R"));
             if (result.code != 0 || result.truncated || result.output.contains("FAIL:")
                     || !output.contains("SUCCESS:MAIN_HOME_LAYOUT")) {
@@ -630,6 +657,14 @@ final class ResetPipeline {
             manual = true;
             warnings.add("앱 홈 화면 배치 확인 필요 · " + e.getMessage());
         }
+    }
+    private Result runHomeTool(String arguments, int timeout) throws Exception {
+        String apk = Arrays.stream(required("pm path --user 0 " + SELF).output.split("\\R"))
+            .filter(line -> line.startsWith("package:/data/app/") && line.endsWith("/base.apk"))
+            .map(line -> line.substring("package:".length())).findFirst()
+            .orElseThrow(() -> new IOException("배치 도구 경로 확인 필요"));
+        return raw("CLASSPATH=" + quote(apk)
+            + " app_process /system/bin com.forholiday.galaxyreset.LanguageHomePlacement" + arguments, timeout);
     }
     void clearAccountSessions() throws Exception {
         int failures = warnings.size();

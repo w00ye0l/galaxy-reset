@@ -58,8 +58,15 @@ public class ResetService extends Service {
             String screenTimeout = pipeline.configureScreenTimeout();
             state.prefs.edit().putString("summary", screenTimeout).commit();
             pipeline.restorePending();
-            for (int i = from; i < (single ? from + 1 : 19); i++) {
+            // Retrying the launcher also rebuilds and verifies the layout it invalidates.
+            int end = single && from != 15 ? from + 1 : 19;
+            for (int i = from; i < end; i++) {
                 current = i;
+                if (i == 15) state.step(18, "대기", "");
+                if (i == 18 && !state.status(15).equals("완료")) {
+                    state.step(i, "수동 확인", "16단계 런처 초기화를 먼저 다시 실행해 주세요.");
+                    continue;
+                }
                 state.phase("running", i, ResetPipeline.LABELS[i]); state.step(i, "진행 중", "");
                 notifyProgress((i + 1) + "/19 · " + ResetPipeline.LABELS[i]);
                 try {

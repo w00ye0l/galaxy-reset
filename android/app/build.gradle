@@ -15,8 +15,8 @@ android {
         applicationId 'com.forholiday.galaxyreset'
         minSdk 30
         targetSdk 36
-        versionCode 33
-        versionName '1.1.29'
+        versionCode 34
+        versionName '1.1.30'
         testInstrumentationRunner 'com.forholiday.galaxyreset.ProgressLayoutCheck'
         buildConfigField 'long', 'FILEMANAGER_VERSION_CODE', filemanagerBundle.versionCode.toString() + 'L'
         buildConfigField 'long', 'LANGUAGE_VERSION_CODE', homeApps[0].versionCode.toString() + 'L'

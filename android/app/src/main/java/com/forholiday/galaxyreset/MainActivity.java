@@ -401,7 +401,7 @@ public class MainActivity extends Activity {
         text(warning,"직원 전용 · 고객 실행 금지",21,RED,true);space(warning,8);
         text(warning,"고객님은 이 작업을 실행하지 마세요.\n대여 중인 기기에서는 실행하면 안 됩니다.",15,RED,true);
         content.addView(warning);space(content,16);
-        text(content,single?"선택한 초기화 단계를 다시 실행합니다.":"이 기기의 사용자 데이터를 삭제합니다.",17,INK,true);space(content,8);
+        text(content,single?(from==15?"런처 초기화부터 홈 배치까지 다시 실행합니다.":"선택한 초기화 단계를 다시 실행합니다."):"이 기기의 사용자 데이터를 삭제합니다.",17,INK,true);space(content,8);
         text(content,"사진·동영상·파일·설치한 앱·비삼성 계정·e-SIM 등이 삭제될 수 있으며, 이 앱으로 되돌릴 수 없습니다.",14,RED,true);space(content,12);
         text(content,"대상 기기: "+deviceName()+" · "+Build.MODEL,13,INK,true);space(content,6);
         text(content,single?"실행 단계: "+ResetPipeline.LABELS[from]:fresh?"전체 19단계 · 삼성 계정·초기화 앱·Shizuku·필수 앱 보존":(from+1)+"단계부터 다시 실행",12,MUTED,false);space(content,14);

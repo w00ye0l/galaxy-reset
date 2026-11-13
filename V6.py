@@ -1215,19 +1215,24 @@ def clear_recent_tasks(serial):
 
 
 def place_home_apps(serial):
+    run_home_tool(serial, 'SUCCESS:MAIN_HOME_LAYOUT')
+    logging.info('[%s] 메인 홈 1페이지 확인 · 갤러리 / Play 스토어 / LOCARORA / Language', serial)
+
+
+def run_home_tool(serial, expected, argument=''):
     apk_paths = _pc_required(serial, ['shell', 'pm', 'path', '--user', '0', PHONE_APP_PACKAGE])
     base_apk = next((line.removeprefix('package:') for line in apk_paths.stdout.splitlines()
                      if line.startswith('package:/data/app/') and line.endswith('/base.apk')), None)
     if base_apk is None:
         raise RuntimeError('홈 배치 도구 경로를 확인할 수 없습니다.')
     command = ('CLASSPATH=' + shlex.quote(base_apk)
-               + ' app_process /system/bin com.forholiday.galaxyreset.LanguageHomePlacement')
+               + ' app_process /system/bin com.forholiday.galaxyreset.LanguageHomePlacement'
+               + (' ' + shlex.quote(argument) if argument else ''))
     result = run_command(['adb', '-s', serial, 'shell', command], check=True, timeout=180)
     lines = (result.stdout or '').splitlines()
     failure = next((line[5:] for line in lines if line.startswith('FAIL:')), None)
-    if result.returncode != 0 or failure is not None or 'SUCCESS:MAIN_HOME_LAYOUT' not in lines:
-        raise RuntimeError('홈 배치 확인 필요 · ' + (failure or '메인 홈의 앱 4개 배치를 확인하세요.'))
-    logging.info('[%s] 메인 홈 1페이지 확인 · 갤러리 / Play 스토어 / LOCARORA / Language', serial)
+    if result.returncode != 0 or failure is not None or expected not in lines:
+        raise RuntimeError('삼성 홈 확인 필요 · ' + (failure or '런처 상태를 확인하세요.'))
 
 
 def finish_home_setup(serial):
@@ -1504,37 +1509,26 @@ def reset_launcher_with_clean_home(serial):
     모든 변종에서 자동으로 작동합니다.
     """
     logging.info('[%s] 런처 초기화 1차 — 기본 레이아웃 적용 및 위젯 탐지', serial)
-    run_command(['adb', '-s', serial, 'shell', 'pm', 'clear', 'com.sec.android.app.launcher'])
+    cleared = _pc_required(serial, ['shell', 'pm', 'clear', 'com.sec.android.app.launcher'])
+    if cleared.stdout.strip() != 'Success':
+        raise RuntimeError('삼성 런처 데이터 초기화 확인 필요')
     time.sleep(1)  # 런처 프로세스 종료 + 재시작 대기
     # Samsung 런처는 activity가 실제로 표시될 때 default layout을 적용하고 위젯을 바인딩.
     # pm clear 직후엔 layout이 메모리에 없으므로, am start로 launcher activity를 강제 기동해야 함.
     run_command(['adb', '-s', serial, 'shell', 'am', 'start', '-n',
                  'com.sec.android.app.launcher/.activities.LauncherActivity'])
     time.sleep(4)  # default layout 적용 + 위젯 바인딩 완료 대기
+    run_home_tool(serial, 'SUCCESS:HOME_SEARCH_CHECKED', '--clear-search-bar')
 
     # 런처 호스트에 바인딩된 위젯의 provider 패키지 추출
-    result = run_command(['adb', '-s', serial, 'shell', 'dumpsys', 'appwidget'])
-    if result.returncode != 0 or not (hasattr(result, 'stdout') and result.stdout):
-        # 타임아웃/오류로 빈 결과가 오면 '위젯 없음'으로 오판하지 않는다
-        logging.warning('[%s] 위젯 탐지 실패(dumpsys 오류) — 위젯이 남아있을 수 있음', serial)
-        return
-    dump = result.stdout
+    def query_providers():
+        dump = _pc_required(serial, ['shell', 'dumpsys', 'appwidget']).stdout
+        widgets = re.search(r'(?ms)^\s*Widgets:\s*\n(.*?)^\s*Hosts:', dump)
+        if widgets is None:
+            raise RuntimeError('위젯 영역 조회 실패')
+        return set(re.findall(r'provider=ProviderId[^\n]*cmp:ComponentInfo\{([A-Za-z0-9_.]+)/', widgets[1])) - KEEP_APPS
 
-    providers = set()
-    in_widgets_section = False
-    for line in dump.split('\n'):
-        stripped = line.strip()
-        if stripped.startswith('Widgets:'):
-            in_widgets_section = True
-            continue
-        if stripped.startswith('Hosts:') or stripped.startswith('Grants:'):
-            in_widgets_section = False
-            continue
-        if in_widgets_section and 'provider=ProviderId' in line:
-            match = re.search(r'cmp:ComponentInfo\{([^/]+)/', line)
-            if match:
-                if match.group(1) not in KEEP_APPS:
-                    providers.add(match.group(1))
+    providers = query_providers()
 
     if not providers:
         logging.info('[%s] 바인딩된 위젯 없음 — 2차 clear 생략', serial)
@@ -1567,6 +1561,8 @@ def reset_launcher_with_clean_home(serial):
         # Provider 재활성화 (앱 기능 복원) — 중간 실패 시에도 반드시 실행
         _reenable_packages(serial, providers)
 
+    if query_providers():
+        raise RuntimeError('위젯 앱 복구 후 홈 위젯이 남아 있습니다.')
     logging.info('[%s] 런처 초기화 완료 — 위젯 제거됨, provider 재활성화됨', serial)
 
 
@@ -2006,6 +2002,8 @@ def process_device(serial, locale=None):
             if label == '최근 앱 목록 제거':
                 prepare_wireless_separately(serial)
             try:
+                if label == '최근 앱 목록 제거' and '런처 초기화' in errors:
+                    raise RuntimeError('16단계 런처 초기화를 먼저 완료해야 합니다.')
                 action()
             except (DeviceLostError, RestorationError):
                 raise

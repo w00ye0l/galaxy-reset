@@ -75,6 +75,8 @@ class FakeFleet:
         if 'pm' in cmd and 'uninstall' in cmd:
             self.installed[serial].discard(cmd[-1])
             return _cp(cmd, 0, 'Success\n')
+        if 'pm' in cmd and 'clear' in cmd:
+            return _cp(cmd, 0, 'Success\n')
         if 'pm' in cmd and 'path' in cmd:
             return _cp(cmd, 0, 'package:/data/app/%s/base.apk\n' % cmd[-1])
         if 'pidof' in cmd:
@@ -118,6 +120,8 @@ class FakeFleet:
         if cmd[3:7] == ['shell', 'cmd', 'appops', 'get']:
             return _cp(cmd, 0, 'WRITE_SETTINGS: allow\n')
         if 'LanguageHomePlacement' in cmd[-1]:
+            if cmd[-1].endswith('--clear-search-bar'):
+                return _cp(cmd, 0, 'SUCCESS:HOME_SEARCH_CHECKED\n')
             return _cp(cmd, 0, 'SUCCESS:MAIN_HOME_LAYOUT\n')
         if cmd[-2:] == ['EsimManager', 'delete-all']:
             return _cp(cmd, 0, 'SUCCESS:NO_ESIM:No eSIM profiles found\n')

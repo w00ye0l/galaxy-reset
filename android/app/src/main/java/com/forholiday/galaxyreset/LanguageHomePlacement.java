@@ -69,8 +69,14 @@ public final class LanguageHomePlacement {
             AccessibilityServiceInfo info = automation.getServiceInfo();
             info.flags |= AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS;
             automation.setServiceInfo(info);
-            new LanguageHomePlacement(automation).placeHomeApps();
-            System.out.println("SUCCESS:MAIN_HOME_LAYOUT");
+            LanguageHomePlacement placement = new LanguageHomePlacement(automation);
+            if (args.length == 1 && args[0].equals("--clear-search-bar")) {
+                placement.clearSearchBar();
+                System.out.println("SUCCESS:HOME_SEARCH_CHECKED");
+            } else {
+                placement.placeHomeApps();
+                System.out.println("SUCCESS:MAIN_HOME_LAYOUT");
+            }
             status = 0;
         } catch (IOException e) {
             System.out.println("FAIL:" + e.getMessage());
@@ -103,6 +109,50 @@ public final class LanguageHomePlacement {
             if (icon == null || !layout.destination(i).contains(icon.centerX(), icon.centerY()))
                 throw new IOException(APPS.get(i).name() + "의 메인 홈 위치 확인 필요");
         }
+    }
+
+    private void clearSearchBar() throws IOException {
+        Page main = mainPage();
+        AccessibilityNodeInfo root = ui.getRootInActiveWindow();
+        if (visible(root, "qsb_container") == null) return;
+        openShortcutMenu(freeCell(main.grid(), gridLayout(main.grid())));
+        AccessibilityNodeInfo settings = await("home_setting_button");
+        if (settings == null) throw new IOException("삼성 홈 설정 열기 확인 필요");
+        tap(bounds(settings));
+        try {
+            for (int scroll = 0; scroll < 5; scroll++) {
+                AccessibilityNodeInfo list = await("recycler_view");
+                if (list == null) break;
+                for (AccessibilityNodeInfo title : list.findAccessibilityNodeInfosByViewId("android:id/title")) {
+                    if (!title.isVisibleToUser() || !Set.of("Show search on Home screen", "홈 화면에 검색 표시",
+                            "ホーム画面に検索を表示", "在主屏幕上显示搜索", "在主螢幕上顯示搜尋").contains(text(title))) continue;
+                    tap(bounds(title));
+                    turnOffSearchSwitch("search_google_switch");
+                    turnOffSearchSwitch("search_finder_switch");
+                    mainPage();
+                    if (visible(ui.getRootInActiveWindow(), "qsb_container") != null)
+                        throw new IOException("홈 검색 바 제거 확인 필요");
+                    return;
+                }
+                Rect area = bounds(list);
+                swipe(area.centerX(), area.bottom - area.height() / 5,
+                    area.centerX(), area.top + area.height() / 4);
+            }
+            throw new IOException("홈 화면 검색 표시 설정을 찾을 수 없습니다.");
+        } catch (IOException e) {
+            home();
+            throw e;
+        }
+    }
+
+    private void turnOffSearchSwitch(String name) throws IOException {
+        AccessibilityNodeInfo toggle = await(name);
+        if (toggle == null || !toggle.isCheckable()) throw new IOException("홈 검색 바 스위치 확인 필요");
+        if (!toggle.isChecked()) return;
+        tap(bounds(toggle));
+        SystemClock.sleep(350);
+        toggle = await(name);
+        if (toggle == null || toggle.isChecked()) throw new IOException("홈 검색 바 끄기 확인 필요");
     }
 
     private Page keepOnlyMainPage(Page main, Grid layout) throws IOException {
