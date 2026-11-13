@@ -119,6 +119,10 @@ class FakeFleet:
             return _cp(cmd, 0, 'WRITE_SETTINGS: allow\n')
         if 'LanguageHomePlacement' in cmd[-1]:
             return _cp(cmd, 0, 'SUCCESS:MAIN_HOME_LAYOUT\n')
+        if cmd[-2:] == ['EsimManager', 'delete-all']:
+            return _cp(cmd, 0, 'SUCCESS:NO_ESIM:No eSIM profiles found\n')
+        if cmd[-1] == 'RecentTasksCleaner':
+            return _cp(cmd, 0, 'SUCCESS:RECENTS_EMPTY\n')
         if 'find' in cmd:
             return _cp(cmd, 0, '')
         if 'settings' in cmd and 'screen_off_timeout' in cmd and 'get' in cmd:
