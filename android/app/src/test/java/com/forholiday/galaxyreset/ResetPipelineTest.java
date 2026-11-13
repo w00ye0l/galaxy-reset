@@ -20,6 +20,52 @@ public class ResetPipelineTest {
         }
         @Override public void copy(String asset, String destination) {}
     }
+    @Test public void cleanupBatchKeepsPartialFailuresVisibleAndDoesNotClearGalleryTwice() throws Exception {
+        String gallery = "com.sec.android.gallery3d";
+        String messaging = "com.samsung.android.messaging";
+        String myFiles = "com.sec.android.app.myfiles";
+        Fake fake = new Fake() {
+            @Override public ResetPipeline.Result run(String command, int seconds) {
+                commands.add(command);
+                if (command.contains("ContentCleaner")) return new ResetPipeline.Result(0, "SUCCESS:ALL");
+                if (command.endsWith("pm list packages --user 0"))
+                    return new ResetPipeline.Result(0, "package:" + gallery + "\npackage:" + messaging + "\npackage:" + myFiles + "\n");
+                if (command.startsWith("for pkg in ")) {
+                    return new ResetPipeline.Result(0, command.contains(gallery)
+                        ? "CLEAR_FAILED:" + messaging + "\nCLEARED:" + gallery + "\n"
+                        : "CLEARED:" + myFiles + "\n");
+                }
+                if (command.startsWith("content query ")) return new ResetPipeline.Result(0, "No result found.");
+                return new ResetPipeline.Result(0, "Success");
+            }
+        };
+        ResetPipeline pipeline = new ResetPipeline(fake, p -> {}, Set.of());
+        pipeline.step(5, "ja-JP", "SM-S918N");
+        assertEquals(Set.of(gallery), pipeline.cleared);
+        assertEquals(Set.of(messaging), pipeline.failedClears);
+        assertTrue(pipeline.warnings.stream().anyMatch(w -> w.contains(messaging)));
+        fake.commands.clear();
+        pipeline.step(6, "ja-JP", "SM-S918N");
+        assertEquals(1L, fake.commands.stream().filter(c -> c.startsWith("rm -rf -- ")).count());
+        assertEquals(1L, fake.commands.stream().filter(c -> c.endsWith("pm list packages --user 0")).count());
+        assertTrue(fake.commands.stream().anyMatch(c -> c.startsWith("for pkg in '" + myFiles + "';")));
+        assertTrue(pipeline.warnings.isEmpty());
+        assertEquals(Set.of(gallery, myFiles), pipeline.cleared);
+    }
+    @Test public void mediaBatchReportsFailedAndUnconfirmedEndpoints() throws Exception {
+        Fake fake = new Fake() {
+            @Override public ResetPipeline.Result run(String command, int seconds) {
+                commands.add(command);
+                assertTrue(command.contains("images/media video/media audio/media file"));
+                return new ResetPipeline.Result(0, "images/media:0\nvideo/media:1\nfile:0\n");
+            }
+        };
+        ResetPipeline pipeline = new ResetPipeline(fake, p -> {}, Set.of());
+        pipeline.step(7, "ja-JP", "SM-S918N");
+        assertEquals(1, fake.commands.size());
+        assertEquals(List.of("미디어 스토어 삭제 결과 확인 필요: video/media",
+            "미디어 스토어 삭제 결과 확인 필요: audio/media"), pipeline.warnings);
+    }
     @Test public void protectsResetAndShizukuDuringUninstall() throws Exception {
         Fake fake = new Fake();
         fake.packages = "package:" + ResetPipeline.SELF + "\npackage:" + ResetPipeline.SHIZUKU + "\npackage:com.nhn.android.nmap\npackage:com.sec.android.app.sbrowser\npackage:com.sec.knox.kccagent\npackage:com.customer.app\n";
@@ -149,6 +195,40 @@ public class ResetPipelineTest {
             }
         };
         assertEquals(Set.of("com.widget"), new ResetPipeline(fake, p -> {}, Set.of()).queryWidgetProviders());
+    }
+    @Test public void launcherRestoresDisabledProvidersWhenRestartFails() {
+        Fake fake = new Fake() {
+            int starts;
+            @Override public ResetPipeline.Result run(String command, int seconds) {
+                commands.add(command);
+                if (command.startsWith("pm list packages"))
+                    return new ResetPipeline.Result(0, "package:com.sec.android.app.launcher\n");
+                if (command.startsWith("am start -W"))
+                    return new ResetPipeline.Result(0, ++starts == 1 ? "Status: ok" : "Status: timeout");
+                if (command.equals(ResetPipeline.WIDGET_QUERY))
+                    return new ResetPipeline.Result(0, "Widgets:\n provider=ProviderId{cmp:ComponentInfo{com.widget/.Widget}}\nHosts:\n");
+                return new ResetPipeline.Result(0, "Success");
+            }
+        };
+        ResetPipeline pipeline = new ResetPipeline(fake, p -> {}, Set.of());
+        assertThrows(IOException.class, () -> pipeline.step(15, "ja-JP", "SM-S918N"));
+        assertTrue(fake.commands.contains("pm disable-user --user 0 'com.widget'"));
+        assertEquals("pm enable --user 0 'com.widget'", fake.commands.get(fake.commands.size() - 1));
+        assertTrue(pipeline.pending.isEmpty());
+    }
+    @Test public void wallpaperRequiresNewHomeAndLockWithActiveEngines() throws Exception {
+        String home = "mLastWallpaper state:\n User 0: id=41\n  mName=WallpaperSetter\n     mDisplayId=0\n     mEngine=proxy\n";
+        String lock = "mLastLockWallpaper state:\n User 0: id=42\n  mName=WallpaperSetter\n     mDisplayId=0\n     mEngine=proxy\n";
+        String otherUser = " User 10: id=51\n  mName=WallpaperSetter\n     mDisplayId=0\n     mEngine=proxy\n";
+        ResetPipeline.WallpaperState before = ResetPipeline.wallpaperState(home + lock);
+        String newHome = home.replace("id=41", "id=43");
+        String newLock = lock.replace("id=42", "id=44");
+        assertFalse(ResetPipeline.wallpaperState(newHome + lock).replaced(before));
+        assertFalse(ResetPipeline.wallpaperState(newHome + newLock.replace("mEngine=proxy", "mEngine=null")
+            + otherUser).replaced(before));
+        assertFalse(ResetPipeline.wallpaperState(newHome + newLock.replace("mDisplayId=0", "mDisplayId=1")).replaced(before));
+        assertTrue(ResetPipeline.wallpaperState(newHome + newLock).replaced(before));
+        assertThrows(IOException.class, () -> ResetPipeline.wallpaperState("wallpaper state unavailable"));
     }
     @Test public void androidCompatibleAccountParserHandlesIndentedEntries() {
         assertEquals(1, ResetPipeline.nonSamsungAccounts("Accounts: 2\n  Account {name=contains}brace, type=com.google}\n  Account {name=s, type=com.samsung}\n"));
@@ -358,6 +438,30 @@ public class ResetPipelineTest {
         assertEquals(-1,p.finalAccountCount);assertFalse(p.warnings.isEmpty());
         assertFalse(p.summaryText.contains("남은 비삼성 계정: 0개"));
     }
+    @Test public void finalVerificationUsesFreshBatchAndStillRejectsDisabledApp() throws Exception {
+        List<String> requiredPackages = List.of("com.nhn.android.nmap", "com.alphainventor.filemanager",
+            ResetPipeline.SELF, ResetPipeline.SHIZUKU, ResetPipeline.LOCARORA, ResetPipeline.LANGUAGE);
+        FinalFake fake = new FinalFake() {
+            @Override public ResetPipeline.Result run(String cmd, int seconds) {
+                if (cmd.equals("pm list packages --show-versioncode --user 0") || cmd.equals("pm list packages -e --user 0")) {
+                    commands.add(cmd);
+                    StringJoiner list = new StringJoiner("\n");
+                    for (String pkg : requiredPackages) {
+                        if (cmd.contains("--show-versioncode")) list.add("package:" + pkg + " versionCode:999999999");
+                        else if (!pkg.equals(ResetPipeline.LOCARORA)) list.add("package:" + pkg);
+                    }
+                    return new ResetPipeline.Result(0, list.toString());
+                }
+                return super.run(cmd, seconds);
+            }
+        };
+        ResetPipeline pipeline = new ResetPipeline(fake, p -> {}, Set.of());
+        pipeline.step(17, "ko-KR", "SM-S918N");
+        assertEquals(3L, fake.commands.stream().filter(c -> c.startsWith("pm list packages")).count());
+        assertEquals(1, pipeline.warnings.size());
+        assertTrue(pipeline.warnings.get(0).contains(ResetPipeline.LOCARORA));
+        assertTrue(pipeline.warnings.get(0).contains("활성 상태"));
+    }
 
     @Test public void languageInstallProvisionsPermissionsAndDoesNotReinstallCurrentVersion() throws Exception {
         FinalFake fake = new FinalFake() {
@@ -413,7 +517,7 @@ public class ResetPipelineTest {
                 if (command.contains("RecentTasksCleaner") || command.contains("LanguageHomePlacement")
                         || command.startsWith("pm path")) {
                     commands.add(command);
-                    if (command.contains("RecentTasksCleaner")) return new ResetPipeline.Result(0, "SUCCESS:RECENTS");
+                    if (command.contains("RecentTasksCleaner")) return new ResetPipeline.Result(0, "SUCCESS:RECENTS_EMPTY");
                     if (command.startsWith("pm path")) return new ResetPipeline.Result(0, "package:/data/app/test/base.apk");
                     return new ResetPipeline.Result(1, "FAIL:목표 칸이 사용 중입니다.");
                 }
@@ -426,6 +530,22 @@ public class ResetPipelineTest {
         assertTrue(fake.commands.get(fake.commands.size() - 1).contains("LanguageHomePlacement"));
         assertTrue(pipeline.manual);
         assertTrue(pipeline.warnings.stream().anyMatch(warning -> warning.contains("목표 칸")));
+        assertFalse(pipeline.warnings.stream().anyMatch(warning -> warning.contains("최근 앱")));
+    }
+
+    @Test public void unverifiedRecentTaskCleanupStillRunsHomePlacement() throws Exception {
+        FinalFake fake = new FinalFake() {
+            @Override public ResetPipeline.Result run(String command, int seconds) {
+                if (command.contains("RecentTasksCleaner")) return new ResetPipeline.Result(0, "SUCCESS: Removed 1 recent tasks");
+                if (command.startsWith("pm path")) return new ResetPipeline.Result(0, "package:/data/app/test/base.apk");
+                if (command.contains("LanguageHomePlacement")) return new ResetPipeline.Result(0, "SUCCESS:MAIN_HOME_LAYOUT");
+                return super.run(command, seconds);
+            }
+        };
+        ResetPipeline pipeline = new ResetPipeline(fake, p -> {}, Set.of());
+        pipeline.step(18, "ja-JP", "SM-S918N");
+        assertEquals(List.of("최근 앱 목록이 비어 있는지 확인 필요"), pipeline.warnings);
+        assertTrue(pipeline.notes.stream().anyMatch(note -> note.contains("메인 홈 1페이지 확인")));
     }
 
 }

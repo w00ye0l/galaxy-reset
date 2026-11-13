@@ -16,48 +16,39 @@ public class RecentTasksCleaner {
             // getRecentTasks → ParceledListSlice를 반환하므로 getList()로 변환
             Method getTasks = am.getClass().getMethod(
                 "getRecentTasks", int.class, int.class, int.class);
-            Object result = getTasks.invoke(am, 100, 0, 0);
-
-            List<?> tasks;
-            if (result instanceof List) {
-                tasks = (List<?>) result;
-            } else {
-                // ParceledListSlice → getList()
-                Method getList = result.getClass().getMethod("getList");
-                tasks = (List<?>) getList.invoke(result);
-            }
-
-            if (tasks == null || tasks.isEmpty()) {
-                System.out.println("SUCCESS: No recent tasks to remove");
-                return;
-            }
-
-            int removed = 0;
-            for (Object task : tasks) {
-                int taskId = task.getClass().getField("persistentId").getInt(task);
-                if (taskId <= 0) continue;
-
-                try {
-                    Method removeTask = am.getClass().getMethod("removeTask", int.class);
-                    removeTask.invoke(am, taskId);
-                    removed++;
-                } catch (Exception e) {
+            List<?> tasks = recentTasks(getTasks, am);
+            for (int attempt = 0; attempt < 2 && !tasks.isEmpty(); attempt++) {
+                for (Object task : tasks) {
+                    int taskId = task.getClass().getField("persistentId").getInt(task);
+                    if (taskId <= 0) continue;
                     try {
-                        Method removeTask2 = am.getClass().getMethod(
-                            "removeTask", int.class, int.class);
-                        removeTask2.invoke(am, taskId, 0);
-                        removed++;
-                    } catch (Exception e2) {
-                        System.err.println("SKIP: taskId=" + taskId + " " + e2.getMessage());
+                        am.getClass().getMethod("removeTask", int.class).invoke(am, taskId);
+                    } catch (Exception e) {
+                        try {
+                            am.getClass().getMethod("removeTask", int.class, int.class).invoke(am, taskId, 0);
+                        } catch (Exception fallback) {
+                            System.err.println("SKIP: taskId=" + taskId + " " + fallback.getClass().getSimpleName());
+                        }
                     }
                 }
+                tasks = recentTasks(getTasks, am);
             }
-
-            System.out.println("SUCCESS: Removed " + removed + " recent tasks");
+            if (!tasks.isEmpty()) {
+                System.err.println("FAIL:RECENTS_REMAIN:" + tasks.size());
+                System.exit(1);
+            }
+            System.out.println("SUCCESS:RECENTS_EMPTY");
         } catch (Exception e) {
             System.err.println("FAIL: " + e.getMessage());
             e.printStackTrace();
             System.exit(1);
         }
     }
+    private static List<?> recentTasks(Method query, Object manager) throws Exception {
+        Object result = query.invoke(manager, 100, 0, 0);
+        if (result != null && !(result instanceof List)) result = result.getClass().getMethod("getList").invoke(result);
+        if (!(result instanceof List)) throw new IllegalStateException("Recent task inventory unavailable");
+        return (List<?>) result;
+    }
+
 }

@@ -1160,76 +1160,20 @@ def delete_esim_profiles(serial):
     logging.info('[%s] e-SIM 프로필 확인 시작...', serial)
 
     if not push_dex_if_needed(serial, 'esim_manager.dex'):
-        logging.warning('[%s] esim_manager.dex 없음 — e-SIM 처리 건너뜀', serial)
-        return
+        raise RuntimeError('e-SIM 확인 도구를 기기에 복사하지 못했습니다.')
 
-    # DEX로 e-SIM 프로필 비활성화 + 삭제
     result = run_command([
-        'adb', '-s', serial, 'shell',
-        'CLASSPATH=/data/local/tmp/esim_manager.dex',
+        'adb', '-s', serial, 'shell', 'CLASSPATH=/data/local/tmp/esim_manager.dex',
         'app_process', '/system/bin', 'EsimManager', 'delete-all'
-    ])
-
-    stdout = result.stdout if hasattr(result, 'stdout') else ''
-    stderr = result.stderr if hasattr(result, 'stderr') else ''
-    esim_found = False
-    all_deleted = False
-    all_disabled = False
-    delete_failed = False
-
-    for line in stdout.splitlines():
-        line = line.strip()
-        if line.startswith('ESIM:'):
-            esim_found = True
-            parts = line.split(':', 6)
-            if len(parts) >= 4:
-                logging.info('[%s] e-SIM 발견: subId=%s iccId=%s 캐리어=%s',
-                            serial, parts[1], parts[2], parts[3])
-        elif line.startswith('SUCCESS:NO_ESIM'):
-            logging.info('[%s] e-SIM 프로필 없음', serial)
+    ], timeout=300)
+    lines = (result.stdout or '').splitlines() + (result.stderr or '').splitlines()
+    if result.returncode == 0 and not any(line.startswith('FAIL:') for line in lines):
+        if any(line.startswith(('SUCCESS:NO_ESIM:', 'SUCCESS:ALL_ESIM_DELETED:')) for line in lines):
+            logging.info('[%s] 남은 e-SIM 프로필 없음 확인', serial)
             return
-        elif line.startswith('OK:ESIM_DISABLED'):
-            logging.info('[%s] e-SIM 비활성화 완료: %s', serial, line.split(':', 2)[-1])
-        elif line.startswith('SUCCESS:ALL_ESIM_DISABLED'):
-            all_disabled = True
-            logging.info('[%s] 모든 e-SIM 프로필 비활성화 완료', serial)
-        elif line.startswith('OK:ESIM_DELETED'):
-            logging.info('[%s] e-SIM 삭제 완료: %s', serial, line.split(':', 2)[-1])
-        elif line.startswith('SUCCESS:ALL_ESIM_DELETED'):
-            all_deleted = True
-            logging.info('[%s] 모든 e-SIM 프로필 삭제 완료', serial)
-        elif line.startswith('FAIL:ESIM_DELETE'):
-            delete_failed = True
-            logging.warning('[%s] e-SIM 삭제 실패: %s', serial, line.split(':', 2)[-1])
-        elif line.startswith('FAIL:ESIM_DISABLE'):
-            logging.warning('[%s] e-SIM 비활성화 실패: %s', serial, line.split(':', 2)[-1])
-        elif line.startswith('FAIL:ALL_ESIM_DELETE_FAILED'):
-            delete_failed = True
-            logging.warning('[%s] 모든 e-SIM 삭제 실패', serial)
-        elif line.startswith('DISABLE_METHOD:') or line.startswith('DELETE_METHOD:'):
-            logging.info('[%s] %s', serial, line)
-
-    if stderr:
-        for line in stderr.splitlines():
-            line = line.strip()
-            if line:
-                logging.warning('[%s] [stderr] %s', serial, line)
-
-    # 삭제 실패시에만 수동 안내
-    if esim_found and delete_failed and not all_deleted:
-        run_command([
-            'adb', '-s', serial, 'shell',
-            'am', 'start', '-a', 'android.telephony.euicc.action.MANAGE_EMBEDDED_SUBSCRIPTIONS'
-        ])
-        # 진행률 화면(전용 버퍼) 위에 print()가 겹쳐 쓰이면 깨지고 곧 지워져
-        # 보이지 않는다 — 진행률 행의 노란 표시 + 종료 후 공지로 전달한다.
-        if PROGRESS:
-            PROGRESS.note(serial, 'e-SIM 수동 삭제 필요 — 기기에서 SIM 관리자 확인')
-        add_post_run_notice('[%s] e-SIM 수동 삭제 필요 — SIM 관리자 > eSIM 선택 > 삭제 '
-                            '(기기에 화면을 열어두었습니다)' % serial)
-        logging.warning('[%s] ⚠ e-SIM 수동 삭제 필요 — SIM 관리자 화면을 열었습니다.', serial)
-
-    logging.info('[%s] e-SIM 프로필 처리 완료', serial)
+    run_command(['adb', '-s', serial, 'shell', 'am', 'start', '-a',
+                 'android.telephony.euicc.action.MANAGE_EMBEDDED_SUBSCRIPTIONS'])
+    raise RuntimeError('e-SIM 잔여 프로필 확인 필요 · 기기의 SIM 관리자에서 확인하세요.')
 
 
 def clear_logs_and_cache(serial):
@@ -1258,21 +1202,16 @@ def clear_recent_tasks(serial):
     """최근 앱 목록을 제거합니다 (app_process + DEX 방식)."""
     logging.info('[%s] 최근 앱 목록 제거 중...', serial)
     if not push_dex_if_needed(serial, 'recent_tasks_cleaner.dex'):
-        logging.error('[%s] recent_tasks_cleaner.dex 없음 — 최근 앱 제거 불가', serial)
-        return
+        raise RuntimeError('최근 앱 확인 도구를 기기에 복사하지 못했습니다.')
 
     result = run_command([
-        'adb', '-s', serial, 'shell',
-        'CLASSPATH=/data/local/tmp/recent_tasks_cleaner.dex',
+        'adb', '-s', serial, 'shell', 'CLASSPATH=/data/local/tmp/recent_tasks_cleaner.dex',
         'app_process', '/system/bin', 'RecentTasksCleaner'
     ])
-
-    stdout = result.stdout if hasattr(result, 'stdout') else ''
-    if 'SUCCESS' in stdout:
-        logging.info('[%s] %s', serial, stdout.strip())
-    else:
-        stderr = result.stderr if hasattr(result, 'stderr') else ''
-        logging.warning('[%s] 최근 앱 제거 결과 불확실: %s %s', serial, stdout.strip(), stderr.strip())
+    lines = (result.stdout or '').splitlines() + (result.stderr or '').splitlines()
+    if result.returncode != 0 or 'SUCCESS:RECENTS_EMPTY' not in lines or any(line.startswith('FAIL:') for line in lines):
+        raise RuntimeError('최근 앱 목록이 비어 있는지 확인 필요')
+    logging.info('[%s] 최근 앱 목록 비어 있음 확인', serial)
 
 
 def place_home_apps(serial):
@@ -1292,7 +1231,18 @@ def place_home_apps(serial):
 
 
 def finish_home_setup(serial):
-    clear_recent_tasks(serial)
+    try:
+        clear_recent_tasks(serial)
+    except DeviceLostError:
+        raise
+    except RuntimeError as recents_error:
+        try:
+            place_home_apps(serial)
+        except DeviceLostError:
+            raise
+        except RuntimeError as home_error:
+            raise RuntimeError(f'{recents_error} · {home_error}') from home_error
+        raise
     place_home_apps(serial)
 
 

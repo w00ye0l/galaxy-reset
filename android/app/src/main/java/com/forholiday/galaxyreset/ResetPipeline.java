@@ -68,7 +68,10 @@ final class ResetPipeline {
         return r;
     }
     Result required(String command) throws Exception {
-        Result result = raw(command, 120);
+        return required(command, 120);
+    }
+    Result required(String command, int seconds) throws Exception {
+        Result result = raw(command, seconds);
         if (result.code != 0 || result.truncated || result.output.contains("SecurityException") || result.output.contains("Error:") ||
             (command.startsWith("dumpsys") && result.output.trim().isEmpty())) throw new IOException("조회 실패: " + command);
         return result;
@@ -76,6 +79,38 @@ final class ResetPipeline {
     boolean installed(String pkg) throws Exception {
         Result r = required("pm list packages --user 0 " + quote(pkg));
         return Arrays.asList(r.output.split("\\R")).contains("package:" + pkg);
+    }
+    private record PackageState(Map<String, Long> versions, Set<String> enabled) {}
+
+    private PackageState readPackageState() throws Exception {
+        try {
+            Map<String, Long> versions = new HashMap<>();
+            Pattern version = Pattern.compile("package:([A-Za-z0-9_.]+)\\s+versionCode:(\\d+)");
+            for (String line : required("pm list packages --show-versioncode --user 0").output.split("\\R")) {
+                if (line.isBlank()) continue;
+                Matcher entry = version.matcher(line.strip());
+                if (!entry.matches() || versions.put(entry.group(1), Long.parseLong(entry.group(2))) != null)
+                    throw new IOException("앱 버전 목록 형식 확인 필요");
+            }
+            Set<String> enabled = new HashSet<>();
+            for (String line : required("pm list packages -e --user 0").output.split("\\R")) {
+                if (line.isBlank()) continue;
+                if (!line.matches("package:[A-Za-z0-9_.]+")) throw new IOException("활성 앱 목록 형식 확인 필요");
+                enabled.add(line.substring("package:".length()));
+            }
+            if (!versions.containsKey(SELF) || enabled.isEmpty() || !versions.keySet().containsAll(enabled))
+                throw new IOException("설치·활성 앱 목록 확인 필요");
+            return new PackageState(versions, enabled);
+        } catch (ConnectionLost e) {
+            throw e;
+        } catch (IOException | NumberFormatException e) {
+            return null; // Keep per-package checks when the device cannot supply a complete inventory.
+        }
+    }
+
+    private boolean packageCurrent(PackageState state, String pkg, long minimum) throws Exception {
+        return state == null ? installed(pkg) && packageVersion(pkg) >= minimum
+            : state.versions().getOrDefault(pkg, -1L) >= minimum;
     }
     long packageVersion(String pkg) throws Exception {
         // Full dumpsys output can exceed the Binder output cap (66 KB on a field S23).
@@ -103,8 +138,11 @@ final class ResetPipeline {
             throw new IOException("네이버 지도 분할 APK 설치 실패: "+result.output.substring(0,Math.min(180,result.output.length())));
     }
     void prepareNmap() throws Exception {
+        prepareNmap(null);
+    }
+    private void prepareNmap(PackageState state) throws Exception {
         String pkg="com.nhn.android.nmap";
-        if(!installed(pkg)||packageVersion(pkg)<BuildConfig.NMAP_VERSION_CODE){
+        if(!packageCurrent(state,pkg,BuildConfig.NMAP_VERSION_CODE)){
             String session=null;boolean committed=false;
             try{
                 for(String asset:BuildConfig.NMAP_APKS)bridge.copy(asset,TMP+asset);
@@ -119,9 +157,10 @@ final class ResetPipeline {
                 if(session!=null&&!committed)try{raw("pm install-abandon "+session,30);}catch(Exception ignored){}
                 for(String asset:BuildConfig.NMAP_APKS)try{raw("rm -f "+quote(TMP+asset),30);}catch(Exception ignored){}
             }
+            state = null;
+            if(!packageCurrent(null,pkg,BuildConfig.NMAP_VERSION_CODE))throw new IOException("네이버 지도 설치 버전 확인 실패");
         }
-        if(!installed(pkg)||packageVersion(pkg)<BuildConfig.NMAP_VERSION_CODE)throw new IOException("네이버 지도 설치 버전 확인 실패");
-        ensureEnabled(pkg);
+        if (state == null || !state.enabled().contains(pkg)) ensureEnabled(pkg);
         notes.add("네이버 지도 설치·버전·활성 상태 확인 완료");
     }
     void commands(String... commands) throws Exception { for (String c : commands) checked(c, 120); }
@@ -139,6 +178,57 @@ final class ResetPipeline {
                 { failedClears.add(pkg); throw new IOException("삭제 결과 확인 필요"); }
             cleared.add(pkg);failedClears.remove(pkg);
         });
+    }
+    private void clearCleanupPackages(List<String> packages) throws Exception {
+        Set<String> targets = new LinkedHashSet<>(packages);
+        targets.removeAll(cleared);
+        if (targets.isEmpty()) return;
+
+        Set<String> installed = new HashSet<>();
+        try {
+            for (String line : required("command -v timeout >/dev/null && pm list packages --user 0").output.split("\\R")) {
+                if (line.isBlank()) continue;
+                if (!line.matches("package:[A-Za-z0-9_.]+")) throw new IOException("잘못된 앱 목록");
+                installed.add(line.substring("package:".length()));
+            }
+            if (installed.isEmpty()) throw new IOException("설치 앱 목록이 비어 있습니다.");
+        } catch (ConnectionLost e) {
+            throw e;
+        } catch (IOException e) {
+            clear(targets.toArray(new String[0]));
+            return;
+        }
+        for (String pkg : targets) {
+            if (!installed.contains(pkg)) failedClears.remove(pkg);
+        }
+        targets.retainAll(installed);
+        if (targets.isEmpty()) return;
+
+        // Keep package clears sequential. Report each result so a failed clear cannot be
+        // mistaken for success or prevent later packages from being cleared.
+        StringJoiner arguments = new StringJoiner(" ");
+        for (String pkg : targets) arguments.add(quote(pkg));
+        String command = "for pkg in " + arguments + "; do "
+            + "if result=$(timeout 120 pm clear --user 0 \"$pkg\" 2>&1) && [ \"$result\" = Success ]; then "
+            + "printf 'CLEARED:%s\\n' \"$pkg\"; else printf 'CLEAR_FAILED:%s\\n' \"$pkg\"; fi; done";
+        failedClears.addAll(targets);
+        Result batch = raw(command, 600);
+        Set<String> confirmed = new HashSet<>();
+        Set<String> failed = new HashSet<>();
+        if (batch.code == 0 && !batch.truncated) {
+            for (String line : batch.output.split("\\R")) {
+                if (line.startsWith("CLEARED:")) confirmed.add(line.substring("CLEARED:".length()));
+                if (line.startsWith("CLEAR_FAILED:")) failed.add(line.substring("CLEAR_FAILED:".length()));
+            }
+        }
+        for (String pkg : targets) {
+            if (confirmed.contains(pkg) && !failed.contains(pkg)) {
+                cleared.add(pkg);
+                failedClears.remove(pkg);
+            } else {
+                warnings.add("앱 데이터 초기화 실패: " + pkg + " · 삭제 결과 확인 필요");
+            }
+        }
     }
     Result dex(String file, String main, String... args) throws Exception {
         bridge.copy(file, TMP + file);
@@ -192,8 +282,9 @@ final class ResetPipeline {
     }
     static final String WIDGET_QUERY = "dump=$(dumpsys appwidget) || exit $?; printf '%s\\n' \"$dump\" | sed -n '/^[[:space:]]*Widgets:/,/^[[:space:]]*Hosts:/p'";
     Set<String> queryWidgetProviders() throws Exception {
-        Result result = required(WIDGET_QUERY);
-        if (!result.output.contains("Widgets:")) throw new IOException("위젯 영역 조회 실패");
+        Result result = required(WIDGET_QUERY, 3);
+        if (!result.output.contains("Widgets:") || !result.output.contains("Hosts:"))
+            throw new IOException("위젯 영역 조회 실패");
         return widgetProviders(result.output);
     }
     static int remainingUserFiles(String listing) {
@@ -207,6 +298,37 @@ final class ResetPipeline {
         return count;
     }
     void pause(long milliseconds) throws InterruptedException { Thread.sleep(milliseconds); }
+    private void awaitMediaProvider() throws Exception {
+        // A zero-row query checks the same provider and volume without reading user files.
+        long deadline = System.nanoTime() + 2_000_000_000L;
+        do {
+            Result response = raw("content query --user 0 --uri content://media/external/file "
+                + "--projection _id --where '1=0'", 2);
+            if (response.code == 0 && !response.truncated && response.output.trim().equals("No result found.")) return;
+            if (System.nanoTime() >= deadline) break;
+            pause(200);
+        } while (true);
+        warnings.add("미디어 저장소 응답 확인 필요");
+    }
+
+    private void deleteMediaRows() throws Exception {
+        List<String> endpoints = List.of("images/media", "video/media", "audio/media", "file");
+        String command = "command -v timeout >/dev/null || exit 127; for path in "
+            + String.join(" ", endpoints)
+            + "; do output=$(timeout 120 content delete --user 0 --uri \"content://media/external/$path\" 2>&1); "
+            + "status=$?; case \"$output\" in *SecurityException*|*Error:*|*Exception*|*Failure*|*Failed*) status=1;; esac; "
+            + "printf '%s:%s\\n' \"$path\" \"$status\"; done";
+        Result result = raw(command, 500);
+        if (result.code == 127 && !result.truncated && result.output.isBlank()) {
+            for (String path : endpoints) checked("content delete --user 0 --uri content://media/external/" + path, 120);
+            return;
+        }
+        Set<String> completed = new HashSet<>(Arrays.asList(result.output.split("\\R")));
+        for (String path : endpoints) {
+            if (result.code != 0 || result.truncated || !completed.contains(path + ":0"))
+                warnings.add("미디어 스토어 삭제 결과 확인 필요: " + path);
+        }
+    }
     void wipeInternalStorage() throws Exception {
         for (int attempt = 0; attempt < 2; attempt++) {
             // rm can report a directory recreated by a running system app. Verify files
@@ -227,9 +349,43 @@ final class ResetPipeline {
             warnings.add("내부 저장소 잔여 파일 " + remaining + "개 · 자동 재시도 후에도 남음 · 수동 확인 필요");
         }
     }
-    void restartLauncher() throws Exception {
-        commands("am force-stop com.sec.android.app.launcher"); pause(1000);
-        commands("am start --user 0 -n " + LAUNCHER);
+    private void startLauncher() throws Exception {
+        if (!required("am start -W --user 0 -n " + LAUNCHER, 15).output.contains("Status: ok"))
+            throw new IOException("삼성 런처 시작 확인 필요");
+    }
+    private Set<String> awaitWidgets(boolean removing) throws Exception {
+        long deadline = System.nanoTime() + (removing ? 12_000_000_000L : 4_000_000_000L);
+        Set<String> previous = null;
+        long stableSince = 0;
+        while (true) {
+            Set<String> current = queryWidgetProviders();
+            long now = System.nanoTime();
+            if (!current.equals(previous)) stableSince = now;
+            if (current.isEmpty() == removing && now - stableSince >= 1_000_000_000L) return current;
+            if (now >= deadline) {
+                // An empty list just after launch can precede delayed default widget registration.
+                if (!removing) return current;
+                throw new IOException("런처 위젯 제거 완료를 확인하지 못했습니다.");
+            }
+            previous = current;
+            pause(250);
+        }
+    }
+    private void resetLauncher() throws Exception {
+        clear("com.sec.android.app.launcher");
+        startLauncher();
+        Set<String> providers = awaitWidgets(false);
+        if (providers.isEmpty()) return;
+        try {
+            disableTemporarily(providers);
+            required("am force-stop com.sec.android.app.launcher", 15);
+            startLauncher();
+            required("input keyevent KEYCODE_HOME", 10);
+            awaitWidgets(true);
+        } finally {
+            restorePending();
+        }
+        if (!queryWidgetProviders().isEmpty()) throw new IOException("위젯 앱 복구 후 홈 위젯이 남아 있습니다.");
     }
     void disableTemporarily(Collection<String> packages) throws Exception {
         for (String pkg : packages) {
@@ -296,9 +452,10 @@ final class ResetPipeline {
             }
             case 3 -> {
                 Result result = dex("esim_manager.dex", "EsimManager", "delete-all");
-                boolean done = result.output.contains("SUCCESS:NO_ESIM") || result.output.contains("SUCCESS:ALL_ESIM_DELETED");
-                if (!done || result.output.contains("FAIL:ESIM_DELETE") || result.output.contains("FAIL:ALL_ESIM_DELETE_FAILED")) {
-                    manual = true; warnings.add("e-SIM 수동 삭제 필요 · SIM 관리자에서 확인하세요.");
+                boolean verified = result.code == 0 && !result.truncated && !result.output.contains("FAIL:")
+                    && (result.output.contains("SUCCESS:NO_ESIM:") || result.output.contains("SUCCESS:ALL_ESIM_DELETED:"));
+                if (!verified) {
+                    manual = true; warnings.add("e-SIM 잔여 프로필 확인 필요 · SIM 관리자에서 확인하세요.");
                     commands("am start -a android.telephony.euicc.action.MANAGE_EMBEDDED_SUBSCRIPTIONS");
                 }
             }
@@ -325,35 +482,34 @@ final class ResetPipeline {
                 catch (ConnectionLost e) { throw e; }
                 catch (Exception e) { result = new Result(1, "PERMISSION_DENIED:CONTACTS\nPERMISSION_DENIED:SMS"); }
                 String output = result.output;
+                List<String> packages = new ArrayList<>();
                 if (output.contains("PERMISSION_DENIED:CALL_LOG") || output.contains("PERMISSION_DENIED:CONTACTS") ||
-                    output.contains("FALLBACK:CALL_LOG") || output.contains("FALLBACK:CONTACTS")) clear("com.android.providers.contacts");
-                if (output.contains("PERMISSION_DENIED:SMS") || output.contains("FALLBACK:SMS")) clear("com.android.providers.telephony");
+                    output.contains("FALLBACK:CALL_LOG") || output.contains("FALLBACK:CONTACTS")) packages.add("com.android.providers.contacts");
+                if (output.contains("PERMISSION_DENIED:SMS") || output.contains("FALLBACK:SMS")) packages.add("com.android.providers.telephony");
                 if (output.contains("FAIL:") || (!output.contains("SUCCESS:") && !output.contains("PARTIAL:") && !output.contains("PERMISSION_DENIED:") && !output.contains("FALLBACK:"))) warnings.add("통화/SMS/주소록 삭제 결과 확인 필요");
-                clear("com.samsung.android.messaging", "com.samsung.android.providers.contacts", "com.samsung.android.app.contacts",
+                packages.addAll(List.of("com.samsung.android.messaging", "com.samsung.android.providers.contacts", "com.samsung.android.app.contacts",
                     "com.samsung.android.dsms", "com.android.mms.service", "com.sec.android.gallery3d", "com.sec.android.themestore",
-                    "com.sec.android.app.vepreload", "com.samsung.android.app.clipboardedge", "com.samsung.android.honeyboard");
+                    "com.sec.android.app.vepreload", "com.samsung.android.app.clipboardedge", "com.samsung.android.honeyboard"));
+                clearCleanupPackages(packages);
             }
             case 6 -> {
                 commands("am force-stop com.sec.android.gallery3d", "am force-stop com.sec.android.app.myfiles");
-                List<String> paths = new ArrayList<>(List.of(
+                List<String> paths = List.of(
                     "/sdcard/Android/data/com.sec.android.gallery3d/files/Trash", "/sdcard/Android/data/com.sec.android.gallery3d/files/.Trash",
                     "/sdcard/Android/data/com.sec.android.gallery3d/cache", "/sdcard/Android/data/com.sec.android.app.myfiles/files/Trash",
                     "/sdcard/Android/data/com.sec.android.app.myfiles/files/.Trash", "/sdcard/Android/data/com.sec.android.app.vepreload/files/Trash",
                     "/storage/emulated/0/Android/.Trash", "/sdcard/.Trash", "/sdcard/.Trash-0", "/sdcard/Recycle",
                     "/sdcard/Android/data/com.sec.android.gallery3d/files/.thumbnails", "/sdcard/Android/data/com.android.chrome/cache",
-                    "/sdcard/Android/data/dji.mimo/cache", "/sdcard/Android/data/com.nhn.android.nmap/cache"));
-                for (String path : paths) checked("rm -rf " + quote(path), 120);
-                clear("com.sec.android.gallery3d", "com.sec.android.app.myfiles", "com.samsung.android.providers.media",
-                    "com.samsung.android.providers.trash", "com.android.providers.media", "com.google.android.providers.media.module");
+                    "/sdcard/Android/data/dji.mimo/cache", "/sdcard/Android/data/com.nhn.android.nmap/cache");
+                checked("rm -rf -- " + String.join(" ", paths.stream().map(ResetPipeline::quote).toArray(String[]::new)), 600);
+                clearCleanupPackages(List.of("com.sec.android.gallery3d", "com.sec.android.app.myfiles", "com.samsung.android.providers.media",
+                    "com.samsung.android.providers.trash", "com.android.providers.media", "com.google.android.providers.media.module"));
                 Result r = raw("am broadcast -a android.intent.action.MEDIA_MOUNTED -d file:///sdcard", 120);
                 if (r.code != 0 || r.output.contains("SecurityException"))
                     commands("am force-stop com.android.providers.media", "am force-stop com.google.android.providers.media.module");
-                pause(2000);
+                awaitMediaProvider();
             }
-            case 7 -> {
-                for (String uri : List.of("images/media", "video/media", "audio/media", "file"))
-                    checked("content delete --user 0 --uri content://media/external/" + uri, 120);
-            }
+            case 7 -> deleteMediaRows();
             case 8 -> { for (String folder : FOLDERS) checked("rm -rf /sdcard/" + folder + "/.thumbnails", 120); }
             case 10 -> clear("com.sec.android.app.camera", "com.samsung.android.app.cameraassistant");
             case 11 -> {
@@ -377,37 +533,37 @@ final class ResetPipeline {
                     commands("pm enable --user 0 " + quote(pkg));
                 }
             }
-            case 15 -> {
-                clear("com.sec.android.app.launcher"); pause(1000);
-                commands("am start --user 0 -n " + LAUNCHER); pause(4000);
-                Set<String> providers = queryWidgetProviders();
-                try {
-                    disableTemporarily(providers);
-                    if (!providers.isEmpty()) { restartLauncher(); pause(4000); commands("input keyevent KEYCODE_HOME"); pause(8000); }
-                } finally { restorePending(); }
-            }
+            case 15 -> resetLauncher();
             case 17 -> verifyFinalState(model);
             case 16 -> wallpaper(model);
             case 13 -> {
-                attempt("네이버 지도 준비 실패", this::prepareNmap);
-                attempt("파일 관리자 설치·버전 확인 실패", this::prepareFileManager);
-                attempt("언어 앱 설치·권한 설정 실패", this::prepareLanguageApp);
-                attempt("LOCARORA 설치·버전 확인 실패", this::prepareLocaroraApp);
+                PackageState state = readPackageState();
+                attempt("네이버 지도 준비 실패", () -> prepareNmap(state));
+                attempt("파일 관리자 설치·버전 확인 실패", () -> prepareFileManager(state));
+                attempt("언어 앱 설치·권한 설정 실패", () -> prepareLanguageApp(state));
+                attempt("LOCARORA 설치·버전 확인 실패", () -> prepareLocaroraApp(state));
                 attempt("초기화 앱 설정 권한 확인 실패", () -> commands("pm grant --user 0 " + SELF + " android.permission.WRITE_SECURE_SETTINGS"));
                 for (String pkg : List.of(SELF, SHIZUKU)) attempt("실행 기반 앱 확인 실패: " + pkg, () -> {
+                    if (state != null && state.enabled().contains(pkg)) return;
                     if (!installed(pkg)) throw new IOException("필수 앱 없음");
                     ensureEnabled(pkg);
                 });
             }
             case 18 -> {
-                success(dex("recent_tasks_cleaner.dex", "RecentTasksCleaner"), "SUCCESS", "최근 앱 삭제 확인 필요");
+                Result recents = dex("recent_tasks_cleaner.dex", "RecentTasksCleaner");
+                if (recents.code != 0 || recents.truncated || recents.output.contains("FAIL:")
+                        || !Arrays.asList(recents.output.split("\\R")).contains("SUCCESS:RECENTS_EMPTY"))
+                    warnings.add("최근 앱 목록이 비어 있는지 확인 필요");
                 placeHomeIcons();
             }
             default -> throw new IllegalArgumentException("잘못된 단계");
         }
     }
     void prepareLanguageApp() throws Exception {
-        prepareBundledApp(LANGUAGE, "language.apk", BuildConfig.LANGUAGE_VERSION_CODE);
+        prepareLanguageApp(null);
+    }
+    private void prepareLanguageApp(PackageState state) throws Exception {
+        prepareBundledApp(state, LANGUAGE, "language.apk", BuildConfig.LANGUAGE_VERSION_CODE);
         required("pm grant --user 0 " + LANGUAGE + " android.permission.CHANGE_CONFIGURATION");
         required("cmd appops set --user 0 " + LANGUAGE + " WRITE_SETTINGS allow");
         verifyLanguagePermission();
@@ -415,12 +571,15 @@ final class ResetPipeline {
     }
 
     void prepareLocaroraApp() throws Exception {
-        prepareBundledApp(LOCARORA, "locarora.apk", BuildConfig.LOCARORA_VERSION_CODE);
+        prepareLocaroraApp(null);
+    }
+    private void prepareLocaroraApp(PackageState state) throws Exception {
+        prepareBundledApp(state, LOCARORA, "locarora.apk", BuildConfig.LOCARORA_VERSION_CODE);
         notes.add("LOCARORA 설치·버전·활성 상태 확인 완료");
     }
 
-    private void prepareBundledApp(String pkg, String asset, long minimumVersion) throws Exception {
-        if (!installed(pkg) || packageVersion(pkg) < minimumVersion) {
+    private void prepareBundledApp(PackageState state, String pkg, String asset, long minimumVersion) throws Exception {
+        if (!packageCurrent(state, pkg, minimumVersion)) {
             String path = TMP + asset;
             try {
                 bridge.copy(asset, path);
@@ -433,9 +592,10 @@ final class ResetPipeline {
             } finally {
                 try { raw("rm -f " + quote(path), 15); } catch (Exception ignored) {}
             }
+            state = null;
+            if (!packageCurrent(null, pkg, minimumVersion)) throw new IOException("앱 설치·버전 확인 필요: " + pkg);
         }
-        if (!installed(pkg) || packageVersion(pkg) < minimumVersion) throw new IOException("앱 설치·버전 확인 필요: " + pkg);
-        ensureEnabled(pkg);
+        if (state == null || !state.enabled().contains(pkg)) ensureEnabled(pkg);
     }
 
     private void verifyLanguagePermission() throws Exception {
@@ -479,8 +639,11 @@ final class ResetPipeline {
         if (cleared.contains("com.google.android.apps.tachyon")) notes.add("Google Meet 로그인 세션·저장 데이터 초기화 확인");
     }
     void prepareFileManager() throws Exception {
+        prepareFileManager(null);
+    }
+    private void prepareFileManager(PackageState state) throws Exception {
         String pkg = "com.alphainventor.filemanager", asset = "filemanager.apk";
-        if (!installed(pkg) || packageVersion(pkg) < BuildConfig.FILEMANAGER_VERSION_CODE) {
+        if (!packageCurrent(state, pkg, BuildConfig.FILEMANAGER_VERSION_CODE)) {
             try {
                 bridge.copy(asset, TMP + asset);
                 Result installed = raw("pm install -r --user 0 " + quote(TMP + asset), 300);
@@ -488,10 +651,11 @@ final class ResetPipeline {
                     (installed.code != 0 || installed.truncated || !installed.output.contains("Success")))
                     throw new IOException("파일 관리자 설치 결과 확인 필요");
             } finally { try { raw("rm -f " + quote(TMP + asset), 30); } catch (Exception ignored) {} }
+            state = null;
+            if (!packageCurrent(null, pkg, BuildConfig.FILEMANAGER_VERSION_CODE))
+                throw new IOException("파일 관리자 설치·버전 확인 실패");
         }
-        if (!installed(pkg) || packageVersion(pkg) < BuildConfig.FILEMANAGER_VERSION_CODE)
-            throw new IOException("파일 관리자 설치·버전 확인 실패");
-        try { ensureEnabled(pkg); }
+        try { if (state == null || !state.enabled().contains(pkg)) ensureEnabled(pkg); }
         catch (ConnectionLost e) { throw e; }
         catch (Exception e) {
             String note = "파일 관리자 설치 유지 · 딥 슬립/활성 상태 확인 필요 (초기화 계속)";
@@ -519,9 +683,12 @@ final class ResetPipeline {
             if (!finalUserAppsClear) throw new IOException("삭제 대상 앱 잔존: " + String.join(", ", remaining));
         });
         attempt("최종 언어 조회 실패", () -> result.append("실제 언어 목록: ").append(required("settings get system system_locales").output.trim()).append('\n'));
+        PackageState state = readPackageState();
         for (String pkg : List.of("com.nhn.android.nmap", "com.alphainventor.filemanager", SELF, SHIZUKU, LOCARORA)) {
             attempt("필수 앱 최종 확인 실패: " + pkg, () -> {
-                if (!installed(pkg)) { result.append(pkg).append(": 없음\n"); throw new IOException("필수 앱 없음"); }
+                if (!(state == null ? installed(pkg) : state.versions().containsKey(pkg))) {
+                    result.append(pkg).append(": 없음\n"); throw new IOException("필수 앱 없음");
+                }
                 long minimum = switch (pkg) {
                     case "com.nhn.android.nmap" -> BuildConfig.NMAP_VERSION_CODE;
                     case "com.alphainventor.filemanager" -> BuildConfig.FILEMANAGER_VERSION_CODE;
@@ -529,16 +696,20 @@ final class ResetPipeline {
                     case LOCARORA -> BuildConfig.LOCARORA_VERSION_CODE;
                     default -> 1086;
                 };
-                if (packageVersion(pkg) < minimum) throw new IOException("필수 앱 버전 부족");
+                if ((state == null ? packageVersion(pkg) : state.versions().get(pkg)) < minimum)
+                    throw new IOException("필수 앱 버전 부족");
                 result.append(pkg).append(": 설치됨\n");
                 if (!pkg.equals("com.alphainventor.filemanager")) {
-                    if (!Arrays.asList(required("pm list packages -e --user 0 " + quote(pkg)).output.split("\\R")).contains("package:" + pkg))
+                    boolean enabled = state == null
+                        ? Arrays.asList(required("pm list packages -e --user 0 " + quote(pkg)).output.split("\\R")).contains("package:" + pkg)
+                        : state.enabled().contains(pkg);
+                    if (!enabled)
                         throw new IOException("필수 앱 활성 상태 확인 필요");
                 }
             });
         }
         attempt("언어 앱 최종 확인 실패", () -> {
-            if (!installed(LANGUAGE) || packageVersion(LANGUAGE) < BuildConfig.LANGUAGE_VERSION_CODE)
+            if (!packageCurrent(state, LANGUAGE, BuildConfig.LANGUAGE_VERSION_CODE))
                 throw new IOException("Language 설치·버전 확인 필요");
             verifyLanguagePermission();
             result.append(LANGUAGE).append(": 설치됨\n");
@@ -554,23 +725,84 @@ final class ResetPipeline {
     void settings(String... entries) throws Exception { for (String entry : entries) checked("settings --user 0 put " + entry, 120); }
     void cleanLive() throws Exception {
         for (String pkg : LIVE) commands("am force-stop " + pkg);
-        clear(LIVE); pause(3000);
+        clear(LIVE);
+    }
+    static final String WALLPAPER_STATE_QUERY = "set -o pipefail; dumpsys -t 2 wallpaper | awk '"
+        + "/^mLast(Lock)?Wallpaper state:/ { state = 1; print; next } "
+        + "/^[^[:space:]]/ { state = 0 } "
+        + "state && /^[[:space:]]+(User [[:digit:]]+: id=|mName=|mDisplayId=|mEngine=)/ { print }'";
+    private static final String HOME_WALLPAPER_STATE = "mLastWallpaper state:";
+    private static final String LOCK_WALLPAPER_STATE = "mLastLockWallpaper state:";
+    private static final Pattern OWNER_WALLPAPER = Pattern.compile(
+        "(?ms)^\\h*User 0: id=(\\d+)\\b[^\\n]*\\n(.*?)(?=^\\h*User \\d+:|\\z)");
+    private static final Pattern WALLPAPER_NAME = Pattern.compile("(?m)^\\h*mName=WallpaperSetter\\h*$");
+    private static final Pattern WALLPAPER_ENGINE = Pattern.compile(
+        "(?m)^\\h*mDisplayId=0\\h*\\R\\h*mEngine=(?!null\\b)\\S+");
+    record WallpaperSlot(long id, boolean applied) {
+        boolean replaced(WallpaperSlot before) { return applied && id > 0 && (before == null || id != before.id); }
+    }
+    record WallpaperState(WallpaperSlot home, WallpaperSlot lock) {
+        boolean replaced(WallpaperState before) {
+            return home != null && lock != null && home.replaced(before.home) && lock.replaced(before.lock);
+        }
+    }
+    static WallpaperState wallpaperState(String dump) throws IOException {
+        WallpaperSlot home = null;
+        WallpaperSlot lock = null;
+        boolean recognized = false;
+        for (String section : dump.split("(?m)(?=^mLast(?:Lock)?Wallpaper state:)")) {
+            boolean isHome = section.startsWith(HOME_WALLPAPER_STATE);
+            if (!isHome && !section.startsWith(LOCK_WALLPAPER_STATE)) continue;
+            recognized = true;
+            Matcher user = OWNER_WALLPAPER.matcher(section);
+            if (!user.find()) continue;
+            String details = user.group(2);
+            boolean applied = WALLPAPER_NAME.matcher(details).find() && WALLPAPER_ENGINE.matcher(details).find();
+            WallpaperSlot slot = new WallpaperSlot(Long.parseLong(user.group(1)), applied);
+            if (isHome) home = slot;
+            else lock = slot;
+        }
+        if (!recognized) throw new IOException("홈·잠금 배경 상태 조회 실패");
+        return new WallpaperState(home, lock);
+    }
+    private WallpaperState queryWallpaperState() throws Exception {
+        return wallpaperState(required(WALLPAPER_STATE_QUERY, 3).output);
+    }
+    private boolean awaitWallpaper(WallpaperState before) throws Exception {
+        long deadline = System.nanoTime() + 5_000_000_000L;
+        WallpaperState previous = null;
+        do {
+            try {
+                WallpaperState current = queryWallpaperState();
+                if (current.replaced(before) && current.equals(previous)) return true;
+                previous = current;
+            } catch (ConnectionLost e) {
+                throw e;
+            } catch (IOException e) {
+                previous = null; // A transient dump failure cannot confirm a wallpaper.
+            }
+            if (System.nanoTime() >= deadline) return false;
+            pause(250);
+        } while (true);
     }
     void wallpaper(String model) throws Exception {
         String file = series(model) + ".png", path = "/sdcard/DCIM/ForHoliday/" + file;
         bridge.copy(file, path);
         commands("am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d " + quote("file://" + path));
-        cleanLive();
-        Result result = dex("wallpaper_setter.dex", "WallpaperSetter", path);
-        if (result.output.contains("FAIL")) { cleanLive(); result = dex("wallpaper_setter.dex", "WallpaperSetter", path); }
-        success(result, "SUCCESS", "홈/잠금 배경화면 설정 실패");
-        pause(5000);
-        String dump = required("dumpsys wallpaper").output;
-        if (liveOverride(dump)) {
-            cleanLive(); success(dex("wallpaper_setter.dex", "WallpaperSetter", path), "SUCCESS", "배경화면 재설정 실패");
-            pause(5000);
-            if (liveOverride(required("dumpsys wallpaper").output)) warnings.add("라이브 배경이 다시 적용됨 · 수동 확인 필요");
+        for (int attempt = 0; attempt < 2; attempt++) {
+            cleanLive();
+            WallpaperState before;
+            try { before = queryWallpaperState(); }
+            catch (ConnectionLost e) { throw e; }
+            catch (IOException e) { before = null; }
+            Result result = dex("wallpaper_setter.dex", "WallpaperSetter", path);
+            if (before != null && result.code == 0 && !result.truncated && result.output.contains("SUCCESS:WALLPAPER_SET:")
+                    && !result.output.contains("FAIL:") && awaitWallpaper(before)) {
+                notes.add("새 홈·잠금 배경 적용 확인");
+                return;
+            }
         }
+        warnings.add("홈·잠금 배경 적용 완료를 확인하지 못했습니다.");
     }
     static boolean liveOverride(String dump) {
         return (dump.contains("InfinityWallpaper") || dump.contains("wallpaper.live")) && !dump.contains("mName=WallpaperSetter");

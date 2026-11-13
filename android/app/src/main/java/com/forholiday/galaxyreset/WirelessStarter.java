@@ -17,7 +17,9 @@ final class WirelessStarter {
     static final WirelessStarter INSTANCE=new WirelessStarter();
     final AtomicBoolean busy=new AtomicBoolean();
     volatile String status="";
-    private long retryAt;
+    private volatile long retryAt;
+    private boolean lastWifi;
+    private boolean lastWirelessDebugging;
     private final Handler main=new Handler(Looper.getMainLooper());
     interface Completion { void finish(String error); }
     boolean configured(Context context){return context.getSharedPreferences("wireless_start",Context.MODE_PRIVATE).getBoolean("paired",false);}
@@ -44,8 +46,17 @@ final class WirelessStarter {
         },"local-adb-pair").start();
     }
     void start(Context context,boolean force){
-        if(!WirelessPolicy.shouldStart(configured(context),Shizuku.pingBinder(),busy.get(),SystemClock.elapsedRealtime(),retryAt,force))return;
-        if(!wifi(context)){status="자동 시작 대기 · Wi-Fi에 연결해주세요.";return;}
+        boolean paired=configured(context), running=Shizuku.pingBinder(), connecting=busy.get();
+        if(!paired||running||connecting)return;
+        boolean wifiAvailable=wifi(context);
+        boolean debuggingEnabled=Settings.Global.getInt(context.getContentResolver(),"adb_wifi_enabled",0)==1;
+        if(wifiAvailable!=lastWifi||debuggingEnabled!=lastWirelessDebugging){
+            retryAt=0;
+            lastWifi=wifiAvailable;
+            lastWirelessDebugging=debuggingEnabled;
+        }
+        if(!wifiAvailable){status="자동 시작 대기 · Wi-Fi에 연결해주세요.";return;}
+        if(!WirelessPolicy.shouldStart(paired,running,connecting,SystemClock.elapsedRealtime(),retryAt,force))return;
         if(!busy.compareAndSet(false,true))return;
         Context app=context.getApplicationContext();retryAt=SystemClock.elapsedRealtime()+30000;status="Shizuku 자동 시작 중…";
         new Thread(()->{
@@ -53,40 +64,44 @@ final class WirelessStarter {
             ScheduledExecutorService watchdog=Executors.newSingleThreadScheduledExecutor();
             try {
                 if(Settings.Global.getInt(app.getContentResolver(),"adb_wifi_enabled",0)!=1){
-                    if(app.checkSelfPermission(android.Manifest.permission.WRITE_SECURE_SETTINGS)!=PackageManager.PERMISSION_GRANTED)
-                        throw new IOException("개발자 옵션에서 무선 디버깅을 켜주세요. 최초 PC 설정이 필요할 수 있습니다.");
-                    Settings.Global.putInt(app.getContentResolver(),"adb_wifi_enabled",1);
+                    if(app.checkSelfPermission(android.Manifest.permission.WRITE_SECURE_SETTINGS)!=PackageManager.PERMISSION_GRANTED
+                            || !Settings.Global.putInt(app.getContentResolver(),"adb_wifi_enabled",1)
+                            || Settings.Global.getInt(app.getContentResolver(),"adb_wifi_enabled",0)!=1)
+                        throw new IOException("무선 디버깅이 꺼져 있습니다. 개발자 옵션을 켜고 무선 디버깅을 허용해주세요.");
                 }
                 manager=new LocalAdbConnection(app);
                 if(!manager.connectTls(app,12000))throw new IOException("무선 디버깅 연결을 확인해주세요.");
                 AdbConnection connection=manager.getAdbConnection();
                 watchdog.schedule(()->{try{connection.close();}catch(Exception ignored){}},30,TimeUnit.SECONDS);
-                if(!command(manager,"id -u").trim().equals("2000"))throw new IOException("무선 디버깅 shell 권한 확인 실패");
                 ApplicationInfo info=app.getPackageManager().getApplicationInfo(ResetPipeline.SHIZUKU,0);
-                command(manager,"settings put global adb_allowed_connection_time 0");
-                command(manager,ResetPipeline.quote(info.nativeLibraryDir+"/libshizuku.so")+" --apk="+ResetPipeline.quote(info.sourceDir));
+                String starter=ResetPipeline.quote(info.nativeLibraryDir+"/libshizuku.so")+" --apk="+ResetPipeline.quote(info.sourceDir);
+                String startup=command(manager,"if [ \"$(id -u)\" = 2000 ]; then "
+                    +"settings put global adb_allowed_connection_time 0 && "
+                    +"{ pidof shizuku_server >/dev/null || "+starter+"; }; "
+                    +"else printf GALAXY_INVALID_UID; fi");
+                if(startup.equals("GALAXY_INVALID_UID"))throw new IOException("무선 디버깅 shell 권한 확인 실패");
                 boolean started=false;
-                for(int i=0;i<20&&!started;i++){
-                    try{started=command(manager,"pidof shizuku_server").trim().matches("[0-9\\s]+");}catch(IOException notYetStarted){if(i==19)throw notYetStarted;}
-                    if(!started)Thread.sleep(500);
+                for(int i=0;i<40&&!started;i++){
+                    if(Shizuku.pingBinder()){started=true;break;}
+                    try{started=command(manager,"pidof shizuku_server").trim().matches("[0-9\\s]+");}catch(IOException notYetStarted){if(i==39)throw notYetStarted;}
+                    if(!started)Thread.sleep(250);
                 }
                 if(!started)throw new IOException("Shizuku 시작을 확인하지 못했습니다.");
-                for(int i=0;i<8&&!Shizuku.pingBinder();i++)Thread.sleep(250);
                 if(!Shizuku.pingBinder()) {
                     // The server may miss the UID that was already foreground before it
                     // started. A separate transparent activity produces a fresh process event.
                     status="Shizuku 앱 권한 연결 중…";
-                    main.post(()->{
+                    main.postDelayed(()->{
                         try {
                             // If the operator left the app, do not bring it to the foreground.
-                            if(context instanceof android.app.Activity activity && !activity.isFinishing()
+                            if(!Shizuku.pingBinder() && context instanceof android.app.Activity activity && !activity.isFinishing()
                                     && !activity.isDestroyed() && activity.hasWindowFocus())
                                 activity.startActivity(new Intent(activity,ConnectionRefreshActivity.class)
                                     .addFlags(Intent.FLAG_ACTIVITY_NO_ANIMATION));
                         } catch(Exception ignored) { /* The bounded binder wait below reports failure. */ }
-                    });
+                    },250);
                 }
-                for(int i=0;i<32&&!Shizuku.pingBinder();i++)Thread.sleep(250);
+                for(int i=0;i<40&&!Shizuku.pingBinder();i++)Thread.sleep(250);
                 if(!Shizuku.pingBinder())throw new IOException("Shizuku는 시작됐으나 앱 권한 연결을 확인하지 못했습니다. 연결 버튼을 눌러주세요.");
                 status="Shizuku 자동 시작 완료";retryAt=0;
             }catch(Exception failure){

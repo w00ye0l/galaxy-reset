@@ -30,11 +30,15 @@ public class EsimManager {
                 case "delete-all":
                     deleteAllProfiles();
                     break;
+                case "verify-empty":
+                    int count = findEsimProfiles(getISubProxy()).size();
+                    System.out.println("ESIM_COUNT:" + count);
+                    break;
                 case "debug":
                     debugEuiccServices();
                     break;
                 default:
-                    System.err.println("Usage: EsimManager [list|disable-all|delete-all|debug]");
+                    System.err.println("Usage: EsimManager [list|disable-all|delete-all|verify-empty|debug]");
                     System.exit(1);
             }
         } catch (Exception e) {
@@ -147,25 +151,17 @@ public class EsimManager {
         // 비활성화 후 안정화 대기
         try { Thread.sleep(3000); } catch (InterruptedException ignored) {}
 
-        // Step 2: 모든 eSIM 프로필 삭제
-        int deletedCount = 0;
-        for (EsimInfo esim : esims) {
-            boolean deleted = deleteSubscription(esim);
-            if (deleted) {
-                deletedCount++;
-                System.out.println("OK:ESIM_DELETED:subId=" + esim.subId + ":iccId=" + esim.iccId);
-            } else {
-                System.out.println("FAIL:ESIM_DELETE:subId=" + esim.subId + ":iccId=" + esim.iccId);
-            }
+        // Re-read installed profiles, including disabled ones, after each attempt.
+        int initialCount = esims.size();
+        for (int attempt = 0; attempt < 2 && !esims.isEmpty(); attempt++) {
+            for (EsimInfo esim : esims) deleteSubscription(esim);
+            esims = findEsimProfiles(isub);
         }
-
-        if (deletedCount == esims.size()) {
-            System.out.println("SUCCESS:ALL_ESIM_DELETED:" + deletedCount + " profiles deleted");
-        } else if (deletedCount > 0) {
-            System.out.println("PARTIAL_DELETE:" + deletedCount + "/" + esims.size() + " profiles deleted");
-        } else {
-            System.out.println("FAIL:ALL_ESIM_DELETE_FAILED:0/" + esims.size());
+        if (!esims.isEmpty()) {
+            System.out.println("FAIL:ESIM_DELETE:remaining=" + esims.size());
+            System.exit(1);
         }
+        System.out.println("SUCCESS:ALL_ESIM_DELETED:" + initialCount + " profiles verified absent");
     }
 
     // ────────────────────────────────────────────
@@ -189,35 +185,25 @@ public class EsimManager {
     }
 
     private static List<EsimInfo> findEsimProfiles(Object isub) throws Exception {
+        Object result;
+        try {
+            result = isub.getClass().getMethod("getAvailableSubscriptionInfoList", String.class, String.class)
+                .invoke(isub, "com.android.shell", null);
+        } catch (NoSuchMethodException e) {
+            result = isub.getClass().getMethod("getAvailableSubscriptionInfoList", String.class)
+                .invoke(isub, "com.android.shell");
+        }
+        if (!(result instanceof List)) throw new IllegalStateException("Installed eSIM inventory unavailable");
         List<EsimInfo> esims = new ArrayList<>();
-        List<?> allSubs = getActiveSubscriptions(isub);
-
-        if (allSubs == null || allSubs.isEmpty()) {
-            return esims;
+        for (Object sub : (List<?>) result) {
+            if (!Boolean.TRUE.equals(sub.getClass().getMethod("isEmbedded").invoke(sub))) continue;
+            int subId = getInt(sub, "getSubscriptionId", "getSubId");
+            String iccId = getString(sub, "getIccId");
+            int cardId = getInt(sub, "getCardId");
+            if (subId < 0 || cardId < 0 || iccId == null || iccId.isEmpty())
+                throw new IllegalStateException("Incomplete eSIM profile");
+            esims.add(new EsimInfo(subId, iccId, null, cardId, sub));
         }
-
-        for (Object sub : allSubs) {
-            try {
-                Method isEmbedded = sub.getClass().getMethod("isEmbedded");
-                boolean embedded = (boolean) isEmbedded.invoke(sub);
-                if (!embedded) continue;
-
-                int subId = getInt(sub, "getSubscriptionId", "getSubId");
-                String iccId = getString(sub, "getIccId");
-                String carrier = getString(sub, "getCarrierName", "getDisplayName");
-                int cardId = getInt(sub, "getCardId");
-
-                System.out.println("ESIM:" + subId + ":"
-                    + (iccId != null ? iccId : "N/A") + ":"
-                    + (carrier != null ? carrier : "Unknown")
-                    + ":cardId=" + cardId);
-
-                esims.add(new EsimInfo(subId, iccId, carrier, cardId, sub));
-            } catch (Exception e) {
-                System.err.println("WARN:Sub check failed: " + e.getMessage());
-            }
-        }
-
         return esims;
     }
 
@@ -341,11 +327,6 @@ public class EsimManager {
 
         // 시도 2: EuiccCardManager (direct APDU-level deletion)
         if (tryDeleteViaEuiccCardManager(esim)) {
-            return true;
-        }
-
-        // 시도 3: SubscriptionManager.removeSubscriptionsFromGroup
-        if (tryRemoveSubscription(esim)) {
             return true;
         }
 
@@ -482,38 +463,6 @@ public class EsimManager {
             }
         } catch (Exception e) {
             System.err.println("EuiccCardManager approach failed: " + e.getMessage());
-        }
-        return false;
-    }
-
-    private static boolean tryRemoveSubscription(EsimInfo esim) {
-        try {
-            Object isub = getISubProxy();
-
-            // removeSubInfo — ISub 내부 메서드
-            try {
-                Method m = isub.getClass().getMethod("removeSubInfo",
-                    String.class, int.class);
-                m.invoke(isub, esim.iccId, 1); // 1 = SIM_EMBEDDED
-                System.out.println("DELETE_METHOD:ISub.removeSubInfo");
-                try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
-                return true;
-            } catch (Exception e) {
-                System.err.println("removeSubInfo failed: " + e.getMessage());
-            }
-
-            // setSubscriptionProperty로 프로필 무효화
-            try {
-                Method m = isub.getClass().getMethod("setSubscriptionProperty",
-                    int.class, String.class, String.class);
-                m.invoke(isub, esim.subId, "is_embedded", "0");
-                System.out.println("ATTEMPT:setSubscriptionProperty(is_embedded=0)");
-            } catch (Exception e) {
-                System.err.println("setSubscriptionProperty(is_embedded) failed: " + e.getMessage());
-            }
-
-        } catch (Exception e) {
-            System.err.println("removeSubscription approach failed: " + e.getMessage());
         }
         return false;
     }

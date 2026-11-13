@@ -17,7 +17,12 @@ public class UpdateInstallReceiver extends BroadcastReceiver {
         }else{
             AppUpdater.INSTANCE.installPending=false;
             if(status==PackageInstaller.STATUS_SUCCESS)AppUpdater.apkFile(context).delete();
-            String message=status==PackageInstaller.STATUS_SUCCESS?"앱 업데이트가 완료됐습니다.":status==PackageInstaller.STATUS_FAILURE_ABORTED?"앱 업데이트 설치가 취소됐습니다.":"앱 업데이트 설치 실패 · Android 설치 안내를 확인하세요.";
+            String message=switch(status){
+                case PackageInstaller.STATUS_SUCCESS->"앱 업데이트가 완료됐습니다.";
+                case PackageInstaller.STATUS_FAILURE_ABORTED->"앱 업데이트 설치가 취소됐습니다.";
+                case PackageInstaller.STATUS_FAILURE_BLOCKED->"Android가 업데이트 APK 설치를 차단했습니다. 이 출처의 앱 설치 권한, 삼성 자동 차단기, 기기 관리 정책을 확인해주세요.";
+                default->"앱 업데이트 설치 실패 · Android 설치 안내를 확인하세요.";
+            };
             context.getSharedPreferences("updates",Context.MODE_PRIVATE).edit().putString("install_result",message).apply();
             AppUpdater.INSTANCE.status=message;
         }
